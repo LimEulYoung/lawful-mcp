@@ -1,5 +1,4 @@
-# PlayMCP in KC 용 얇은 패스스루 MCP 프록시.
-# 무거운 자원(harness.db·키)은 담지 않는다 — 실제 실행은 업스트림(mcp.crow-tit.com)이 처리.
+# lawful-mcp — 한국 법률 리서치·문서작성 MCP 서버.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -13,7 +12,7 @@ RUN pip install --no-cache-dir \
 
 COPY proxy_mcp.py .
 
-# PlayMCP/KC 가 PORT 를 주입하면 그 값을 사용(없으면 8080).
+# 런타임이 PORT 를 주입하면 그 값을 사용(없으면 8080).
 ENV PORT=8080 HOST=0.0.0.0
 EXPOSE 8080
 
