@@ -60,6 +60,10 @@ async def _call_tool(name: str, arguments: dict | None):
             getattr(c, "text", "") for c in result.content if getattr(c, "text", "")
         )
         raise RuntimeError(text or f"upstream tool '{name}' failed")
+    # 도구가 outputSchema 를 광고하면 structuredContent 까지 함께 돌려줘야
+    # 출력 검증을 통과한다(텍스트만 반환 시 'no structured output' 에러).
+    if result.structuredContent is not None:
+        return result.content, result.structuredContent
     return result.content
 
 
