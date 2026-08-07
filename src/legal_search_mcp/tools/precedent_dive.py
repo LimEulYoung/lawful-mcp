@@ -1,10 +1,13 @@
-"""precedent_dive — 단건 판례 본문 격리 sub-agent 위임.
+"""Read one judgment body in a sub-agent and answer a question about it.
 
-본문을 메인 LLM 컨텍스트에 넣지 않고 sub-agent에 prompt로 전달. sub-agent 모델은
-`HarnessDeps.dive_subagent`로 주입되어 swap 가능.
+A Korean judgment runs to tens of thousands of characters, and the caller
+usually wants one fact out of it. Putting the body in the caller's context
+spends that budget on text nobody reads twice, so the body goes to a
+sub-agent instead and only its answer comes back. The sub-agent is injected
+through ``HarnessDeps.dive_subagent``, so the model behind it is swappable.
 
-`content_md`만 sub-agent에 주입 — `summary`/`generated_summary`는 대법원 outlier
-(max 17K chars)에서 token 한계 압박, 정보도 본문과 중복이 커서 제외.
+Only ``content_md`` is sent. The stored summaries duplicate the body closely
+enough that adding them cost context without improving answers.
 """
 from __future__ import annotations
 
@@ -19,27 +22,22 @@ from ._coerce import coerce_int, coerce_str
 from ._dedup import dedup_guard
 
 
-# 본문 truncation — sub-agent 컨텍스트 outlier 방어선 (max 2.4M chars 케이스 존재).
-# content_md에만 적용. summaries는 짧아서 truncation 불필요.
-# 한국 판결문은 주문(형량 명시)이 본문 끝에 있어 tail 필수.
-# dive 모델 = DeepSeek V4 Flash (1M-token context) → 컨텍스트는 사실상 무제약.
-# 실제 제약은 prefill 비용·레이턴시뿐이라 head 40K + tail 20K chars 로 설정:
-# prec_cases 165K건 본문 길이 분포 p99=27K·p99.9=84K → 60K threshold 면 99.8% 무손실.
-# worst prefill ~44K tokens (한국어 worst 1.36 chars/token, 1M 컨텍스트의 4% ·
-# input $0.14/M → ~$0.006/call). 극단 outlier(최대 2.4M chars)만 head/tail 로 방어.
-# (이전: Gemma max_model_len=16384 대응 head 12K + tail 6K. M31 DeepSeek 마이그레이션 후 상향.)
+# Body truncation, head and tail. Judgment length is heavily skewed: p99 is
+# 27K characters and p99.9 is 84K, but the longest run to 2.4M. A 60K
+# threshold therefore passes 99.8% of judgments through untouched and only
+# clips the extreme tail of the distribution.
+#
+# The tail half matters as much as the head: a Korean judgment states its
+# disposition — the sentence actually imposed — at the very end, so a
+# head-only clip would drop the one fact most questions are about.
 DIVE_TEXT_HEAD = 40_000
 DIVE_TEXT_TAIL = 20_000
 DIVE_THRESHOLD = DIVE_TEXT_HEAD + DIVE_TEXT_TAIL
 DIVE_QUESTION_MAX_CHARS = 1_000
 
-# question 은 선택된 공개 판례 내부에서 확인할 추출 항목이다. 무엇을 넣지 말아야 하는지는
-# 이 도구의 docstring 이 모델에게 말한다 — 정규식 치환 층은 두지 않는다(2026-08-05 제품 결정).
-# 길이 상한만 코드가 본다.
-
 
 def _clip_question(question: str) -> str:
-    """추출 질문 길이 상한 — 폭주한 프롬프트가 서브에이전트 입력을 삼키지 않게 한다."""
+    """Bound the question so a runaway prompt cannot crowd out the judgment."""
     q = question or ""
     if len(q) <= DIVE_QUESTION_MAX_CHARS:
         return q
@@ -47,7 +45,11 @@ def _clip_question(question: str) -> str:
 
 
 def _cap_summary(summary: str) -> str:
-    """구조화 스키마 밖의 대체 모델을 주입해도 응답 경계에서 길이 계약을 보장."""
+    """Enforce the length contract at the boundary.
+
+    The schema already caps it, but a substituted sub-agent may not go
+    through that schema, so the response path checks again.
+    """
     if len(summary) <= DIVE_SUMMARY_MAX_CHARS:
         return summary
     return summary[: DIVE_SUMMARY_MAX_CHARS - 1].rstrip() + "…"
@@ -60,11 +62,7 @@ def _truncate_for_dive(text: str) -> str:
 
 
 def _build_body_sections(case: Any) -> tuple[list[str], list[str], bool]:
-    """case row → (sections, sources_used, text_truncated).
-
-    content_md만 주입 — summary/generated_summary는 outlier(대법원 max 17K)에서
-    token 한계 압박 + content_md와 정보 중복이 커서 dive 정확도 향상이 미미했음.
-    """
+    """Case row -> (sections, sources_used, text_truncated)."""
     sections: list[str] = []
     sources: list[str] = []
     truncated = False
@@ -79,13 +77,14 @@ def _build_body_sections(case: Any) -> tuple[list[str], list[str], bool]:
 
 
 def _format_response_md(resp: dict[str, Any]) -> str:
-    """precedent_dive 응답 dict → markdown-KV 문자열 (usage·sources·null/false 메타 omit)."""
+    """Response dict -> markdown-KV string, omitting null and false metadata."""
     status = resp.get("status", "ok")
     lines: list[str] = [f"## status: {status}"]
     if resp.get("message"):
         lines.append(f"- message: {resp['message']}")
 
-    # case 메타 (status=missing이거나 case_id만 있을 때도 표시)
+    # Case metadata, emitted even for a miss so the caller can see which id
+    # it asked about.
     case_id = resp.get("case_id")
     case_no = resp.get("case_number")
     case_name = resp.get("case_name")
@@ -104,7 +103,8 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append(f"- court: {court_level or ''} {year or ''}".rstrip())
         if resp.get("reference_statute"):
             lines.append(f"- statute: {resp['reference_statute']}")
-    # body truncated flag — 본문 잘렸을 때만 표시 (LLM이 dive 신뢰성 판단)
+    # Only flagged when the body was actually clipped. It changes what a
+    # negative answer means, so the caller has to be able to see it.
     if resp.get("text_truncated"):
         lines.append("## text_truncated: true")
         lines.append(f"- retained_text: 원문 앞 {DIVE_TEXT_HEAD}자 + 뒤 {DIVE_TEXT_TAIL}자")
@@ -114,8 +114,9 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append("- not_in_text_conclusive: false")
             lines.append("- note: 중간 원문이 생략되어 보존 구간에 없다는 뜻일 뿐, 전체 원문 부재를 확정하지 못함")
     if resp.get("summary"):
-        # 종전에는 같은 사실을 네 번 적었다 — 절 제목 `(생성 추출 요약)` + `summary_provenance`
-        # + `quote_eligible: false` + `quotation_status: not_verbatim`. 표지 하나로 합친다.
+        # One marker, not four. The heading says the summary is generated and
+        # cannot be quoted verbatim; repeating that in separate metadata
+        # fields spent tokens saying the same thing again.
         lines.append("## summary — AI 생성 요약(직접인용 불가)")
         lines.append(resp["summary"])
 

@@ -1,23 +1,31 @@
-"""양형기준 권고 형량범위 결정 함수.
+"""Recommended sentencing range under the Sentencing Commission guidelines.
 
-양형위가 정한 누진 룰을 결정론적 함수로 구현. `harness/prompts.py:39-40` 의
-자연어 룰을 코드화한 것. 평가에서 *gold range* 를 만들어 LLM 의 점 예측
-과 비교 (`judge_in_range`, `within_range_position`).
+The guidelines state their rules in prose; this is that prose as a
+deterministic function. Given the guideline leaf a case falls under and the
+factors a court found, it returns the range the guidelines recommend.
 
-룰 (양형기준 [공통원칙]):
+The rules, from the guidelines' common principles:
 
-1) 권고영역 결정
-   - 행위 인자 (kind ∈ {행위, 행위_공통, 행위_미수}) 의 특별가중·특별감경 net
-   - 행위자/기타 인자 (kind == 행위자_기타) 의 특별가중·특별감경 net
-   - 둘 다 0 → 기본
-   - 부호 일치 → 그 방향 (양수 가중, 음수 감경)
-   - 부호 불일치 → 행위 인자 net 우월
+1) Pick the band (mitigated / basic / aggravated)
+   - Net special factors among conduct factors
+     (kind in {행위, 행위_공통, 행위_미수})
+   - Net special factors among offender and other factors (행위자_기타)
+   - Both zero -> basic
+   - Same sign -> that direction (positive aggravates, negative mitigates)
+   - Opposite signs -> the conduct net wins
 
-2) 형량범위 특별 조정
-   - 가중영역 + (특별가중 - 특별감경 ≥ 2) → 상한 1/2 가중
-   - 감경영역 + (특별감경 - 특별가중 ≥ 2) → 하한 1/2 감경
+2) Special adjustment of the range
+   - Aggravated band, and (special aggravating - special mitigating) >= 2
+     -> raise the upper bound by half
+   - Mitigated band, and (special mitigating - special aggravating) >= 2
+     -> halve the lower bound
 
-일반양형인자는 영역 결정에 영향 없음 (선고형 결정 단계의 참작 사유).
+Ordinary factors do not move the band. They are weighed later, when the
+court fixes the sentence within the range.
+
+Terms in the data stay Korean because they are values in the corpus, not
+labels chosen here: 특별/일반 (special/ordinary), 가중/감경 (aggravating/
+mitigating), 행위/행위자_기타 (conduct / offender and other).
 """
 from __future__ import annotations
 
@@ -29,41 +37,42 @@ from typing import Literal, Sequence
 Level = Literal["감경", "기본", "가중"]
 _ACT_KINDS = {"행위", "행위_공통", "행위_미수"}
 
-# DEPRECATED (M6, 2026-05-22) — 카테고리 단위 법정형 floor 는 *대표 본조 근사* 라
-# 카테고리 내 본조별 법정형 편차 큰 case (마약 §58~§61, 강도 §333~§337 등) 에 부정확.
-# `compute_sentencing_range` 는 이제 `charge_legal_map.stat_imp_min_months` (본조별)
-# 를 사용. 본 dict 는 호환성 유지용 빈 dict — 외부 script (`scripts/decompose_gap.py`)
-# 에서 import 깨지지 않도록 두되, 실제 값은 비움.
+# Deprecated and intentionally empty. A statutory floor per guideline
+# category was only ever an approximation from a representative article, and
+# it is wrong wherever articles inside one category carry different statutory
+# ranges (narcotics and robbery both do). The floor now comes per-article
+# from the charge-to-penalty map. Kept as an empty dict so an outside import
+# does not break.
 LEGAL_FLOOR_MONTHS: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
 class AppliedFactor:
-    scope: Literal["특별", "일반"]
-    kind: str  # 행위 / 행위_공통 / 행위_미수 / 행위자_기타
-    direction: Literal["가중", "감경"]
+    scope: Literal["특별", "일반"]      # special / ordinary
+    kind: str                           # 행위 / 행위_공통 / 행위_미수 / 행위자_기타
+    direction: Literal["가중", "감경"]  # aggravating / mitigating
     text: str = ""
 
 
 @dataclass(frozen=True)
 class RecommendedRange:
     level: Level
-    min_months: int | None  # None: 하한 없음 (is_open_low)
-    max_months: int | None  # None: 상한 없음 (is_unbounded_high or has_life)
+    min_months: int | None  # None means no lower bound
+    max_months: int | None  # None means no upper bound, or life is available
     has_life: bool
-    is_special_adjusted: bool  # 2차 특별조정 적용 여부
+    is_special_adjusted: bool  # whether the second-stage adjustment applied
     raw_text: str
 
 
 def _net(counts: dict[tuple[str, str], int], kinds: set[str]) -> int:
-    """주어진 kind 집합 안에서 (특별가중 합) - (특별감경 합)."""
+    """(special aggravating) - (special mitigating) within a set of kinds."""
     agg = sum(counts.get((k, "가중"), 0) for k in kinds)
     mit = sum(counts.get((k, "감경"), 0) for k in kinds)
     return agg - mit
 
 
 def _select_level(factors: Sequence[AppliedFactor]) -> Level:
-    """1차: 권고영역 결정."""
+    """Stage one: pick the band."""
     special = [f for f in factors if f.scope == "특별"]
     counts: dict[tuple[str, str], int] = {}
     for f in special:
@@ -78,7 +87,7 @@ def _select_level(factors: Sequence[AppliedFactor]) -> Level:
         return "가중"
     if act_net <= 0 and actor_net <= 0 and (act_net < 0 or actor_net < 0):
         return "감경"
-    # 부호 불일치 → 행위 인자 우월
+    # Signs disagree: the conduct factors decide.
     if act_net > 0:
         return "가중"
     if act_net < 0:
@@ -87,7 +96,7 @@ def _select_level(factors: Sequence[AppliedFactor]) -> Level:
 
 
 def _special_adjusted(level: Level, factors: Sequence[AppliedFactor]) -> bool:
-    """2차: 특별조정 적용 여부 (상한 1/2 가중 OR 하한 1/2 감경)."""
+    """Stage two: does the range get the half-step adjustment?"""
     sp_agg = sum(1 for f in factors if f.scope == "특별" and f.direction == "가중")
     sp_mit = sum(1 for f in factors if f.scope == "특별" and f.direction == "감경")
     if level == "가중" and sp_agg - sp_mit >= 2:
@@ -114,17 +123,18 @@ def determine_range(
     legal_floor_months: int | None = None,
     is_attempted: bool = False,
 ) -> RecommendedRange | None:
-    """leaf + 적용 factor → 양형위 권고 형량범위.
+    """Guideline leaf plus applied factors -> the recommended range.
 
-    `legal_floor_months`: 카테고리 법정형 하한. 권고 영역 하한이 floor 미만이면
-    양형기준 [공통원칙] §02 ("권고가 처단형을 벗어나면 처단형이 기준") 에 따라
-    floor 로 끌어올림. None 이면 보정 없음 (default).
+    ``legal_floor_months``: the statutory minimum. Where the recommended
+    range would fall below it, the guidelines defer to the statute, so the
+    floor is raised. None disables the correction.
 
-    `is_attempted`: 미수 권고감경 룰은 sg_categories.attempt_recommend_discount
-    (JSON {"low":[n,d],"high":[n,d]}) 에서 읽어 적용 — 현재 살인범죄군(cat 24)만
-    하한 ×1/3·상한 ×2/3 (`24_살인범죄.md` line 29). 나머지 cat 은 NULL = 기수와 동일 권고.
+    ``is_attempted``: the discount for an attempt is data, not code. Which
+    offence groups get one, and by how much, is read from
+    ``sg_categories.attempt_recommend_discount``.
 
-    `sg_ranges` row 가 없는 leaf (벌금형 전용 등) 는 None.
+    Returns None for a leaf with no range row — a fine-only leaf, for
+    instance.
     """
     level = _select_level(factors)
     base = _fetch_range_row(conn, leaf_id, level)
@@ -146,13 +156,11 @@ def determine_range(
         elif level == "감경" and not open_low and lo is not None:
             lo = lo // 2
 
-    # M22 — 미수 권고감경 (코드=로직, *대상군·비율은 DB*). 양형군별 룰을
-    # sg_categories.attempt_recommend_discount(JSON)에서 읽는다 — 현재 살인범죄군
-    # (cat 24)만 하한 ×1/3·상한 ×2/3 (24_살인범죄.md line 29):
-    #   "살인미수범죄의 권고 형량범위는 하한을 1/3, 상한을 2/3로 각 감경. 단, '무기'는
-    #    '20년 이상'으로, '무기 이상'은 '20년 이상, 무기'로 각 감경하여 적용."
-    # 단순 imp 범위(닫힘·life=False·unbounded=False)만 적용. '무기'/'무기이상' 포함 row
-    # 는 별도 보강 대상 — 아래 가드로 제외.
+    # Attempt discount. The ratio is stored per offence group as JSON
+    # ({"low": [n, d], "high": [n, d]}), so adding a group is a data change.
+    # Applied only to a plainly bounded term range: where the guideline text
+    # reads "life" or "life or more", the discount is expressed in words
+    # rather than a ratio, so those rows are excluded here.
     if is_attempted and lo is not None and hi is not None and not has_life and not unbounded_high:
         disc_row = conn.execute(
             "SELECT c.attempt_recommend_discount FROM sg_subtypes s "
@@ -169,7 +177,7 @@ def determine_range(
     final_min = None if open_low else lo
     final_max = None if unbounded_high else hi
 
-    # 법정형 floor 적용 — 권고 영역이 floor 보다 아래로 내려가면 floor 가 강제 하한
+    # The statutory floor wins over a recommendation that falls below it.
     if legal_floor_months is not None:
         if final_min is None or final_min < legal_floor_months:
             final_min = legal_floor_months
@@ -187,7 +195,7 @@ def determine_range(
 
 
 def in_range(months: float, r: RecommendedRange) -> bool:
-    """선고 형량(개월) 이 권고 영역 안인지."""
+    """Is a sentence, in months, inside the recommended range?"""
     if r.min_months is not None and months < r.min_months:
         return False
     if r.max_months is not None and months > r.max_months:
@@ -196,7 +204,7 @@ def in_range(months: float, r: RecommendedRange) -> bool:
 
 
 def within_range_position(months: float, r: RecommendedRange) -> float | None:
-    """영역 안에서의 상대 위치 [0, 1]. 하한/상한 open 이면 None."""
+    """Relative position in the range, 0 to 1. None if either end is open."""
     if r.min_months is None or r.max_months is None:
         return None
     span = r.max_months - r.min_months
@@ -205,67 +213,65 @@ def within_range_position(months: float, r: RecommendedRange) -> float | None:
     return max(0.0, min(1.0, (months - r.min_months) / span))
 
 
-# ---------- self-check ----------
+# Worked examples. Run this module directly to check the rules against the
+# corpus: `python -m legal_search_mcp.eval.recommended_range`.
 
 if __name__ == "__main__":
-    from harness.deps import open_db
+    from ..deps import open_db
 
     conn = open_db()
 
-    # Case 1: 살인 보통동기 (leaf 216), 2018고합281
-    # 특별감경: 피해자 유발(강함) 1 (행위_공통/감경)
-    # 특별가중: 0
-    # → 감경영역 [84, 144], 특별조정 X
-    # 실제 144개월 → in_range=True, position=1.0 (상한)
-    살인_factors = [
+    # Murder, ordinary motive (leaf 216).
+    # One special mitigating conduct factor, no aggravating ones
+    # -> mitigated band [84, 144], no special adjustment.
+    murder_factors = [
         AppliedFactor("특별", "행위_공통", "감경", "피해자 유발(강함)"),
         AppliedFactor("일반", "행위자_기타", "감경", "진지한 반성"),
     ]
-    r = determine_range(conn, 216, 살인_factors)
-    print(f"살인 216: level={r.level} range=[{r.min_months}, {r.max_months}]"
-          f" adj={r.is_special_adjusted}")
+    r = determine_range(conn, 216, murder_factors)
+    print(f"murder (leaf 216): level={r.level} range=[{r.min_months}, {r.max_months}]"
+          f" adjusted={r.is_special_adjusted}")
     assert r.level == "감경", r.level
     assert (r.min_months, r.max_months) == (84, 144), (r.min_months, r.max_months)
     assert not r.is_special_adjusted
     assert in_range(144, r)
     assert within_range_position(144, r) == 1.0
 
-    # Case 2: 사기 일반/1억-5억 (leaf 188), 2017고단384
-    # 특별가중: 반복 행위 + 심각한 피해 (행위) + 동종 누범 (행위자) = 3
-    # 특별감경: 0
-    # → 가중영역 [30, 72], 특별조정: 가중-감경=3 ≥ 2 → 상한 1/2 → [30, 108]
-    # 실제 36개월 → in_range=True, position ~ 0.077 (하한 근처)
-    사기_factors = [
+    # Fraud, 100M-500M won (leaf 188).
+    # Three special aggravating factors, none mitigating -> aggravated band
+    # [30, 72]; the difference is 3, so the upper bound rises by half to 108.
+    fraud_factors = [
         AppliedFactor("특별", "행위", "가중", "반복적 범행"),
         AppliedFactor("특별", "행위", "가중", "심각한 피해"),
         AppliedFactor("특별", "행위자_기타", "가중", "동종 누범"),
         AppliedFactor("일반", "행위자_기타", "감경", "진지한 반성"),
     ]
-    r = determine_range(conn, 188, 사기_factors)
-    print(f"사기 188: level={r.level} range=[{r.min_months}, {r.max_months}]"
-          f" adj={r.is_special_adjusted}")
+    r = determine_range(conn, 188, fraud_factors)
+    print(f"fraud (leaf 188): level={r.level} range=[{r.min_months}, {r.max_months}]"
+          f" adjusted={r.is_special_adjusted}")
     assert r.level == "가중", r.level
     assert (r.min_months, r.max_months) == (30, 108), (r.min_months, r.max_months)
     assert r.is_special_adjusted
     assert in_range(36, r)
     pos = within_range_position(36, r)
-    print(f"  pos(36) = {pos:.3f}")
+    print(f"  position of 36 months = {pos:.3f}")
     assert pos is not None and pos < 0.1
 
-    # Case 3: 모두 0 → 기본
+    # No factors at all -> basic band.
     r = determine_range(conn, 188, [])
     assert r.level == "기본"
     assert (r.min_months, r.max_months) == (12, 48), (r.min_months, r.max_months)
 
-    # Case 4: 부호 불일치 (행위 우월). 사기 188 — 행위 특별가중 1 / 행위자 특별감경 1
+    # Signs disagree: one aggravating conduct factor against one mitigating
+    # offender factor. Conduct wins, and a difference of 0 is below the
+    # threshold for the special adjustment.
     mixed = [
         AppliedFactor("특별", "행위", "가중", "반복적 범행"),
         AppliedFactor("특별", "행위자_기타", "감경", "처벌불원"),
     ]
     r = determine_range(conn, 188, mixed)
-    # 행위 net=+1, 행위자 net=-1 → 행위 우월 → 가중
     assert r.level == "가중", r.level
-    assert not r.is_special_adjusted  # 차이 0 < 2
+    assert not r.is_special_adjusted
 
     print("\nall self-checks passed.")
     conn.close()

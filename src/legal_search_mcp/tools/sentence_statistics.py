@@ -1,24 +1,29 @@
-"""sentence_statistics — 그 죄명 하나만 유죄인 피고인(다른 죄명 없음)의 1심 선고 분포 + 비교/사례.
+"""Observed first-instance sentencing distribution for a single charge.
 
-풀 정의(v2, 2026-07-06 — 표본 설계 원칙: 애매하면 통계를 내지 말고 원자료를 보여준다):
-  - **1심 전용**: `prec_sentences.instance='1심'` (추출 시 사건번호 고합/고단/고정 술어로
-    스탬프). 소스(source) 불문 — scourt takeover 로 prec_cases.source 가 바뀌어도 표본 불변
-    (구 STATS_SOURCES 소스 리스트 방식은 takeover 로 표본 65% 증발 — 폐지).
-    2심(노)은 영구 제외: 감경 경향 + 파기자판만 선별 시 계통 편향.
-  - **통계 = 단일 죄명 전용**: `prec_defendants.n_charges=1`(죄명 "종류" 1개 — 같은 죄명
-    여러 건[동종경합]은 포함, 다른 죄명과의 경합[이종경합]은 제외: 형이 여러 죄를 포괄해 오염).
-    서로 다른 죄명의 단독 관측분포를 합산·가중해 경합범 분포로 만들 수 없다. 형법 제38조의
-    가중 상한은 법정 처단형 규칙일 뿐 경험적 선고분포의 결합 공식이 아니다.
-  - n >= MIN_N_STATS(30): 통계(mean/std/집유율) + severity 11분위 comparable.
-  - n <  MIN_N_STATS: **통계 미산출**(소표본 mean/std 가 anchor 로 오용되는 것 차단) →
-    단일 죄명 개별 사례만 나열. 경합 사례는 하나의 형이 여러 죄를 포괄해 귀속할 수 없으므로
-    표본 보충에도 쓰지 않는다.
+What a court actually imposed, from the corpus, for defendants convicted of
+one charge and nothing else. The sampling rules exist to keep that sentence
+attributable:
 
-평가셋(judgments_499 499건 + 원본 950건 cross-source) leak 는
-`HarnessDeps.exclude_case_ids` frozenset 으로 차단 — `_fetch_samples` 가
-`pd.case_id NOT IN (...)` 로 자동 제외(prod deps 엔 속성 없음 → 빈 set).
+- **First instance only.** Appellate decisions skew lenient and only reach
+  the corpus selectively, which would bias the distribution systematically.
+- **One charge type per defendant.** Several counts of the same charge stay
+  in; a defendant also convicted of a different charge is excluded, because
+  the single sentence imposed covers all of them and cannot be attributed to
+  one. This is also why distributions for different charges must not be
+  added, averaged or scaled into a combined-offence distribution: the
+  Criminal Act's aggravation rule is a ceiling on the processed range, not a
+  formula for combining observed sentences.
+- **Below MIN_N_STATS, no statistics are computed at all.** A mean over a
+  handful of cases reads as an anchor whether or not it deserves to, so a
+  small sample returns the individual cases instead and lets the reader see
+  what it is made of.
 
-다중 피고인 case 는 *피고인 단위 row* 가 표본 — 한 case 의 A·B 가 양형 다르면 둘 다.
+The unit of observation is the defendant, not the case: where codefendants
+in one judgment received different sentences, each is a sample.
+
+``HarnessDeps`` may optionally carry an ``exclude_case_ids`` frozenset, which
+is subtracted from every sample query — useful when the corpus overlaps an
+evaluation set. Absent, nothing is excluded.
 """
 from __future__ import annotations
 
@@ -35,20 +40,23 @@ from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
 from ._dedup import dedup_guard
 
-# ---------- 상수 ----------
+# ---------- constants ----------
 
 STATS_INSTANCE = "1심"
 
-# 통계 산출 최소 표본 — 미만이면 그리드 모드(통계 미산출)
+# Below this many samples the tool reports individual cases instead of
+# computing a distribution.
 MIN_N_STATS = 30
 
-GRID_MAX = 15            # 단일 charge 입력 시 그리드 최대 행
-GRID_MULTI_MAX = 5       # 다중 charge 입력 시 죄명당 그리드 최대 행
-RELATED_MAX = 15         # family '관련 죄명' 표시 상한(n 내림차순; 강간·상해 등 큰 계열)
-CATEGORY_MIN_POOLS = 5   # category 진입점 최소 pool(이하 잡동 category 는 미노출)
+GRID_MAX = 15            # case rows to list for a single charge
+GRID_MULTI_MAX = 5       # case rows per charge when several are listed
+RELATED_MAX = 15         # related charges to surface, largest sample first
+CATEGORY_MIN_POOLS = 5   # a category with fewer pools is not offered as an entry point
 
-# 구어·속어·상위어 → 표준 질의(카테고리·base·family 로 재해석). 소규모 수기 시드(§6-2).
-# 값은 다시 리졸버 체인을 타므로 category명/base_crime/family 키 중 무엇이든 가능.
+# Everyday words for offences, mapped to what the corpus calls them. People
+# ask about "voice phishing" or "hidden camera"; judgments say fraud and
+# unlawful filming. Values re-enter the resolver chain, so a mapping may
+# point at a category, a base crime or a charge name.
 _ALIAS = {
     "마약": "마약범죄", "마약류": "마약범죄", "마약사범": "마약범죄", "필로폰": "마약범죄",
     "히로뽕": "마약범죄", "대마": "마약범죄", "대마초": "마약범죄", "뽕": "마약범죄",
@@ -57,11 +65,12 @@ _ALIAS = {
     "중고사기": "사기", "대포통장": "전자금융거래법위반", "성폭력": "성범죄",
     "음주운전": "도로교통법위반(음주운전)", "음주": "도로교통법위반(음주운전)",
     "뺑소니": "도주", "성매수": "성매매", "성구매": "성매매",
-    # 3차 확충(2026-07-09 2세션) — 매치처 존재 검증분(canonical/base/charge_norm/family)
+    # Each mapping below was checked to resolve to something in the corpus.
     "무면허운전": "도로교통법위반(무면허운전)", "음주측정거부": "도로교통법위반(음주측정거부)",
     "통매음": "통신매체이용음란",
-    # ⚠ law_base(§Task3) 가 특별법 죄명을 법률명 base 로 흡수 → bare 죄명은 미해결.
-    #   촬영물 협박/반포는 canonical(성폭력특례법(...)) 로 직행해야 resolve=pool.
+    # Special-act offences resolve under their statute name, so the bare
+    # everyday word has to point at the full canonical charge or it will not
+    # reach a sample pool.
     "몸캠": "성폭력범죄의처벌등에관한특례법위반(촬영물등이용협박)",
     "몸캠피싱": "성폭력범죄의처벌등에관한특례법위반(촬영물등이용협박)",
     "리벤지포르노": "성폭력범죄의처벌등에관한특례법위반(카메라등이용촬영물반포등)",
@@ -78,17 +87,19 @@ _GUIDANCE_CONCURRENT = (
 )
 _GUIDANCE_RECALL = "비교 case 11분위가 필요하면 charges 를 죄명 하나로 재호출하세요."
 
-# ---------- 정규화 ----------
-# 공통 모듈 — eval.metrics + scripts/build_sentences.py도 동일 import.
+# ---------- normalisation ----------
+# Shared with the indexer that builds the sentencing tables, so a charge is
+# keyed the same way at write time and at read time.
 
 
-# ---------- 통계 ----------
+# ---------- statistics ----------
 
 def _percentile(sorted_vals: list[int], p: float) -> int | None:
-    """이미 정렬된 list에서 percentile 값 — R-7 linear interpolation (numpy 기본).
+    """Percentile of an already-sorted list, R-7 linear interpolation.
 
-    표본 작을 때 `int(n*p)` 식은 결과가 상위로 한 칸씩 밀려 분포가 과대평가됨
-    (예: n=10, p=0.9 → max). 양형 분포에 그대로 노출되면 LLM의 형량 추정이 위로 편향.
+    The naive `int(n*p)` index rounds up on small samples — at n=10, the 90th
+    percentile lands on the maximum — which inflates the whole distribution.
+    Read as a sentencing range, that bias points one way: too severe.
     """
     n = len(sorted_vals)
     if n == 0:
@@ -103,9 +114,10 @@ def _percentile(sorted_vals: list[int], p: float) -> int | None:
 
 
 def _imprisonment_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
-    """imprisonment 분포 통계 — deciles에 없는 형종별 mean/std/집유 정보만.
+    """Custodial statistics: mean, spread and suspension rate.
 
-    분위수(p10~p90)는 severity-united deciles가 대체 (중복 토큰 제거).
+    Percentiles are left out because the severity-ordered deciles already
+    carry the shape of the distribution.
     """
     months = [r["sentence_months"] for r in rows if r["sentence_months"] is not None]
     if not months:
@@ -128,7 +140,7 @@ def _imprisonment_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
 
 
 def _fine_stats(rows: list[sqlite3.Row]) -> dict[str, Any]:
-    """벌금 분포 통계 — deciles에 없는 mean만 (분위수는 deciles가 대체)."""
+    """Fine statistics: the mean only, since the deciles carry the shape."""
     amounts = [r["fine_amount"] for r in rows if r["fine_amount"] is not None]
     if not amounts:
         return {}
@@ -144,17 +156,19 @@ def _by_type(rows: list[sqlite3.Row]) -> dict[str, int]:
     return out
 
 
-# ---------- 비슷한 예시 (stratified) ----------
+# ---------- comparable cases, spread across the distribution ----------
 
 def _severity_key(row: sqlite3.Row) -> tuple[int, int]:
-    """severity 순서: life > imprisonment > fine > not_guilty. 형종 내에선 형량 오름차순."""
+    """Severity order: life > custodial > fine > acquittal, then by amount."""
     st = row["sentence_type"]
     if st == "life":
         return (3, 999_999)  # 무기징역/사형 — 가장 무거움
     if st == "imprisonment":
         return (2, row["sentence_months"] or 0)
     if st == "fine":
-        # 벌금 1000만원 ≒ 징역 1개월 정도의 무게로 환산 (very rough)
+        # Order fines alongside custodial sentences on one severity scale.
+        # The exchange rate is rough by nature: it exists to sort a mixed
+        # list, not to claim a fine equals so many months.
         return (1, (row["fine_amount"] or 0) // 1_000_000)
     return (0, 0)  # not_guilty
 
@@ -164,14 +178,16 @@ def _stratified_sample(
     *,
     reference_year: int | None = None,
 ) -> list[tuple[int, sqlite3.Row]]:
-    """severity 정렬 후 11분위(q=0/10/.../100) 절단점에서 row 1건씩 추출.
+    """Pick one case at each decile of the severity-sorted samples.
 
-    각 q에 대해 ``idx = round((q/100) * (n-1))``의 row를 잡는다. 동률
-    (severity_key 동일) row가 여러 개일 때 ``reference_year`` 가까운 row가
-    secondary key로 우선 선택된다.
+    Eleven cutpoints (0, 10, ... 100), each taking the row at
+    ``round((q/100) * (n-1))``. Where several cases tie on severity, the one
+    nearest ``reference_year`` wins, so the examples sit near the period the
+    caller asked about.
 
-    row 수 ≤ 11이면 정렬 그대로 반환 + q는 idx 위치 비율로 추정. 분위 절단점에
-    같은 case가 중복 등장하면 가장 낮은 q만 유지 (case 중복 토큰 절약).
+    With eleven rows or fewer, every row is returned and its percentile is
+    inferred from position. A case landing on two cutpoints is shown once,
+    at the lower one.
     """
     if not rows:
         return []
@@ -210,7 +226,7 @@ def _stratified_sample(
 def _grid_sort(
     rows: list[sqlite3.Row], reference_year: int | None
 ) -> list[sqlite3.Row]:
-    """그리드(사례 나열)용 정렬 — 기준연도 근접순, 없으면 최신순."""
+    """Order cases for listing: nearest the reference year, else most recent."""
     if reference_year is not None:
         return sorted(
             rows,
@@ -222,7 +238,7 @@ def _grid_sort(
     return sorted(rows, key=lambda r: -(r["decision_year"] or 0))
 
 
-# ---------- row 직렬화 ----------
+# ---------- row serialisation ----------
 
 REASON_MAX = 160  # sentencing_reason 표시 캡 — 히스토리 재생 절단(MAX_TOOL_OUTPUT) 여유 확보
 
@@ -244,7 +260,11 @@ def _sentence_str(row: sqlite3.Row) -> str:
 
 
 def _short_case_no(case_number: str | None) -> str:
-    """병합 사건번호(콤마 나열, ~100자)는 첫 번호 + 병합 수로 축약 — 전체는 url 페이지에."""
+    """Abbreviate a consolidated case number to the first plus a count.
+
+    Consolidated matters list every joined number and run to about a hundred
+    characters; the full list is one click away on the linked page.
+    """
     parts = [p.strip() for p in (case_number or "").split(",") if p.strip()]
     if not parts:
         return "?"
@@ -259,10 +279,11 @@ def _case_lines(
     *,
     concurrent: bool = False,
 ) -> list[str]:
-    """comparable/grid 공용 case 본문 라인(들여쓰기 키:값).
+    """Render one case as indented key: value lines.
 
-    토큰 절약: case_id 별도 라인 없음(url 말미가 id), 사건번호·연도·피고인 = 한 줄,
-    charges 라인은 경합(concurrent) 행에만 — 단독범 행은 질의 죄명과 항상 동일해 생략.
+    Compact on purpose: the id is already the tail of the url, and the charge
+    line appears only for multi-charge rows — for single-charge rows it would
+    repeat the charge that was queried.
     """
     lines = [
         f"  case: {_short_case_no(row['case_number'])} ({row['decision_year']}) · def {row['defendant_id']}",
@@ -282,19 +303,21 @@ def _case_lines(
     return lines
 
 
-# ---------- markdown 직렬화 ----------
+# ---------- markdown serialisation ----------
 
 def _format_response_md(resp: dict[str, Any]) -> str:
-    """응답 dict → markdown-KV 문자열. LLM 토큰 효율 ↑ (JSON 대비 ~25% 절감).
+    """Response dict -> markdown-KV string.
 
-    구조: `## section`별 헤더 + `- key: value` 들여쓰기. charge_blocks 는 죄명당
-    `## charge:` 헤더 하나. 사례(comparable/grid)는 `- q:`/`- case:` 블록 단위.
+    `## section` headers with `- key: value` lines under them. Measured about
+    25% cheaper in tokens than the equivalent JSON, which is why the tools
+    answer in this shape rather than a serialised object.
     """
     lines: list[str] = [f"## status: {resp.get('status', 'ok')}"]
     if resp.get("mode"):
         lines.append(f"## mode: {resp['mode']}")
 
-    # 후보 목록(status=candidates) — 죄명 선택지, charge_id 로 재호출
+    # Candidate list: not statistics, but the charges the query could mean.
+    # The caller picks one and calls back with its id.
     if resp.get("status") == "candidates":
         lines.append(f"## query: {resp.get('query', '')}")
         if resp.get("note"):
@@ -387,10 +410,11 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# ---------- 메인 도구 ----------
+# ---------- the tool ----------
 
 def _coerce_single_str(x: Any) -> str | None:
-    """스칼라 기대 — 정상 스칼라는 무경고. list/JSON배열 문자열이면 첫 값만(경합은 개별 호출)."""
+    """Take a scalar. A list yields its first element: charges are queried
+    one at a time, never combined."""
     if x is None:
         return None
     if isinstance(x, (list, tuple)):
@@ -411,7 +435,7 @@ def _coerce_single_str(x: Any) -> str | None:
 
 
 def _coerce_single_int(x: Any) -> int | None:
-    """스칼라 기대 — 정상 int 는 무경고. list/JSON배열 문자열이면 첫 정수만."""
+    """Take a scalar integer; a list yields its first element."""
     if x is None:
         return None
     if isinstance(x, (list, tuple)):
@@ -489,45 +513,50 @@ def sentence_statistics(
         exclude_ids = getattr(ctx.deps, "exclude_case_ids", None) or frozenset()
         tax = _tax_available(conn)
 
-        # ── charge_id 모드(조회): 특정 pool 통계 (하나) ──
-        #    경합도 죄명별 단독 관측분포만 조회 — 리스트/자동선택·분포 결합 없음.
+        # By id: the distribution for exactly one pool. Even for a
+        # multi-charge matter this returns single-charge distributions only;
+        # it never picks charges for the caller or combines distributions.
         if cid is not None:
             return _format_response_md(_blocks_from_pools(
                 conn, [cid], year_from=year_from, year_to=year_to,
                 exclude_ids=exclude_ids, reference_year=reference_year))
 
-        # ── 텍스트 charges 모드 (하나) ──
+        # By text: resolve what the words refer to.
         assert q_raw and qnorm
 
-        # 접미 '죄' 제거 — '사기죄'→'사기'(일반 사용자 최빈 입력). 죄명(base/canonical/
-        # charge_norm)은 '죄'로 끝나는 게 taxonomy 에 0건이라 안전. ⚠ category 는 전부
-        # '…범죄'로 끝나므로 음의 lookbehind 로 보존('성범죄'→'성범' 파괴 방지, §6-2 진입점).
+        # Strip the trailing 죄 ("the offence of"), which people add and
+        # judgments do not: 사기죄 -> 사기. No charge name in the corpus ends
+        # that way, so nothing legitimate is damaged. Category names do end
+        # in 범죄, hence the negative lookbehind — without it 성범죄 (sexual
+        # offences) would be mangled into a word that matches nothing.
         qnorm = re.sub(r"(?<!범)죄$", "", qnorm) or qnorm
 
-        # taxonomy 부재 → 레거시 exact-match 경로
+        # No taxonomy in this corpus: fall back to exact matching.
         if not tax:
             return _format_response_md(_legacy_stats(
                 conn, [qnorm], qnorm != q_raw, year_from=year_from,
                 year_to=year_to, exclude_ids=exclude_ids,
                 reference_year=reference_year))
 
-        # ⓪ alias 재작성 (구어·상위어 → 표준 질의: category/base/family)
+        # 0. Rewrite everyday words into corpus vocabulary.
         qnorm = _ALIAS.get(qnorm, qnorm)
 
-        # ① bare 법률명(괄호 없는 '…법위반') → 그 법률 subtype 후보 완전 나열
+        # 1. A statute name with no qualifier ("violation of the Road
+        #    Traffic Act") lists every offence under that statute.
         law_c = _lawname_candidates(conn, qnorm, year_from, year_to, exclude_ids)
         if law_c:
             return _format_response_md(
                 {"status": "candidates", "query": qnorm, "candidates": law_c,
                  "note": f"'{qnorm}' 법률의 죄명 후보(괄호 subtype)"})
 
-        # ② 상위계열(family) — "사기" → 직접(base=사기) + 관련(컴퓨터등사용사기·보험사기…)
+        # 2. A family name returns direct matches plus its relatives:
+        #    "fraud" also surfaces computer fraud, insurance fraud, and so on.
         if _is_family(conn, qnorm):
             direct = _candidates_for_base(
                 conn, qnorm, year_from, year_to, exclude_ids)
             related = _family_related(
                 conn, qnorm, year_from, year_to, exclude_ids)
-            # dedup: 한 charge_id 가 base 불일치 행으로 양쪽에 잡히는 것 방지(직접 우선)
+            # One charge can match both lists; keep the direct hit.
             direct_ids = {c["charge_id"] for c in direct}
             related = [c for c in related if c["charge_id"] not in direct_ids]
             if direct or related:
@@ -535,7 +564,7 @@ def sentence_statistics(
                     {"status": "candidates", "query": qnorm,
                      "candidates": direct, "related": related})
 
-        # ③ taxonomy 해석: base/charge_norm/canonical
+        # 3. Resolve through the taxonomy: base crime, charge name, canonical.
         kind, payload = _resolve_one(conn, qnorm)
         if kind == "candidates":
             cands = _candidates_for_base(
@@ -547,7 +576,7 @@ def sentence_statistics(
                 conn, [payload], year_from=year_from, year_to=year_to,
                 exclude_ids=exclude_ids, reference_year=reference_year))
 
-        # ④ category 명 → 그 계열 대표 pool 후보(표본 상위)
+        # 4. A category name returns its best-sampled pools.
         if _is_category(conn, qnorm):
             cats = _category_candidates(
                 conn, qnorm, year_from, year_to, exclude_ids)
@@ -556,7 +585,7 @@ def sentence_statistics(
                     {"status": "candidates", "query": qnorm, "candidates": cats,
                      "note": f"'{qnorm}' 계열 대표 죄명(표본 상위) — 좁혀 재검색 가능"})
 
-        # ⑤ 미매치 → suggestions
+        # 5. Nothing matched: suggest near misses rather than return empty.
         return _format_response_md(
             {"status": "no_data",
              "unmatched_charges": [
@@ -572,11 +601,13 @@ def sentence_statistics(
 def _subtype_siblings(
     conn: sqlite3.Connection, charge: str, limit: int = 4
 ) -> list[str]:
-    """bare 법률명 하위의 괄호 subtype 죄명 top N(빈도 ↓순) — 좁혀 재호출 힌트용.
+    """Offences under a bare statute name, most frequent first.
 
-    특별법은 괄호 안이 실체 죄명이라(폭력행위등처벌에관한법률위반(공동재물손괴등) ≠ (공동상해))
-    법률명만 매칭되면 subtype 별 양형이 뒤섞인 것처럼 오해될 수 있어, 존재하는 subtype 을
-    보여 특정 죄명으로 재호출하도록 유도한다. subtype 이 3종 미만이면(진짜 단일 죄명) 빈 list.
+    In a special act the parenthesised qualifier is the offence, and they
+    sentence differently. Matching on the statute name alone would present
+    them as one population, so the caller is shown the qualifiers that exist
+    and asked to pick. Returns nothing when the statute really does define
+    only a couple of offences.
     """
     rows = conn.execute(
         "SELECT charge_norm, COUNT(*) cnt FROM prec_defendant_charges "
@@ -595,13 +626,12 @@ def _subtype_siblings(
 def _suggest_canonical_charges(
     conn: sqlite3.Connection, charge: str, limit: int = 5
 ) -> list[str]:
-    """비슷한 정형 charge_norm top N (빈도 ↓순) — 후보로 LLM self-correct 유도.
+    """Charge names close to the query, most frequent first.
 
-    2단계: ① **접두 매치 우선** — 특별법 죄명이 괄호 subtype 을 갖도록 정규화(2026-07-09)
-    되면서, 모델이 subtype 없는 bare 법률명(예: '폭력행위등처벌에관한법률위반')을 넘기면
-    정확매치가 실패한다. 이때 그 법률명으로 시작하는 실제 subtype(공동재물손괴등/공동상해/…)
-    을 우선 반환해 좁혀 재호출하게 한다. ② 접두 후보가 limit 미달이면 3-gram substring 매치로
-    보충(의역 표기 '청소년유해약물등판매' → '청소년보호법위반' 류 교정).
+    Two passes. Prefix matches come first: a caller who passes a statute name
+    without its qualifier gets the real offences under it rather than an
+    empty result. Trigram substring matches then top the list up, which
+    catches a paraphrase of an offence rather than its formal name.
     """
     if not charge or len(charge) < 3:
         return []
@@ -609,9 +639,10 @@ def _suggest_canonical_charges(
     out: list[str] = []
     seen: set[str] = set()
 
-    # ① 접두 매치 — 법률명 → 괄호 subtype 나열 (빈도 ↓순).
-    #   input 전체로 먼저(bare 법률명 케이스), 이어서 괄호 앞 법률명만으로(틀린 subtype
-    #   케이스: '폭처법(공동재물손괴)' → '등' 누락 등 → 법률명 subtype 형제 제시).
+    # 1. Prefix match, most frequent first. Try the whole input, then just
+    #    the statute name before the parenthesis — a caller who gets the
+    #    qualifier slightly wrong still gets the sibling offences under that
+    #    statute rather than nothing.
     prefixes = [charge]
     if "(" in charge:
         base = charge.split("(", 1)[0]
@@ -633,7 +664,7 @@ def _suggest_canonical_charges(
     if len(out) >= limit:
         return out[:limit]
 
-    # ② 3-gram substring 보충
+    # 2. Fill out with trigram substring matches.
     grams = list({charge[i : i + 3] for i in range(len(charge) - 2)})
     placeholders = " OR ".join(["charge_norm LIKE ?"] * len(grams))
     params = [f"%{g}%" for g in grams]
@@ -653,7 +684,7 @@ def _suggest_canonical_charges(
 def _check_charges_match(
     conn: sqlite3.Connection, normalized: list[str]
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """각 정규화 charge에 대해 DB 정확 매치 확인 → (matched, unmatched_with_suggested)."""
+    """Split charges into those the corpus knows and those it can only suggest for."""
     matched: list[str] = []
     unmatched: list[dict[str, Any]] = []
     for c in normalized:
@@ -679,11 +710,12 @@ def _fetch_samples(
     year_to: int | None,
     exclude_case_ids: frozenset[int] | None = None,
 ) -> list[sqlite3.Row]:
-    """피고인 단위 **단독범** row 조회 — instance='1심' + n_charges=1 고정.
+    """Single-charge, first-instance defendant rows — the sample, defined once.
 
-    charge_norms 는 단일 문자열 또는 **charge_norm 리스트**(taxonomy pool — 오타·구법
-    변형 병합). 통계와 low-n 그리드 모두 이 helper만 사용하며 경합 사례 보충 경로는 없다.
-    DISTINCT 로 pool 변형 중복 피고인을 제거한다.
+    ``charge_norms`` may be one name or a taxonomy pool: the spelling
+    variants and superseded forms that mean the same offence. Both the
+    statistics path and the small-sample listing come through here, so there
+    is no route by which a multi-charge defendant enters either.
     """
     norms = [charge_norms] if isinstance(charge_norms, str) else list(charge_norms)
     if not norms:
@@ -721,10 +753,10 @@ def _fetch_samples(
     return conn.execute(sql, params).fetchall()
 
 
-# ---------- charge_taxonomy (pool 식별자 + query 해석) ----------
+# ---------- charge taxonomy: pool identity and query resolution ----------
 
 def _tax_available(conn: sqlite3.Connection) -> bool:
-    """charge_taxonomy 테이블 존재 여부 — 부재 시 레거시 exact-match 경로."""
+    """Does this corpus carry the taxonomy? Without it, exact matching only."""
     try:
         conn.execute("SELECT 1 FROM charge_taxonomy LIMIT 1")
         return True
@@ -740,7 +772,7 @@ def _pool_label(canonical: str | None, modality: str | None, role: str | None) -
 
 
 def _pool_norms(conn: sqlite3.Connection, charge_id: int) -> dict[str, Any] | None:
-    """charge_id → {charge_id, label, category, norms[]} (오타·변형 병합된 charge_norm 들)."""
+    """Pool id -> its label, category, and every charge name that maps to it."""
     rows = conn.execute(
         "SELECT charge_norm, canonical_id, modality, role, category "
         "FROM charge_taxonomy WHERE charge_id=? AND is_noise=0", (charge_id,)).fetchall()
@@ -756,7 +788,7 @@ def _candidates_for_base(
     conn: sqlite3.Connection, base: str,
     year_from: int | None, year_to: int | None, exclude: frozenset[int],
 ) -> list[dict[str, Any]]:
-    """base_crime 패밀리의 pool 후보 [{charge_id,label,category,n}] — 단독범 n 내림차순."""
+    """Pools under one base crime, largest sample first."""
     ids = [r["charge_id"] for r in conn.execute(
         "SELECT DISTINCT charge_id FROM charge_taxonomy "
         "WHERE base_crime=? AND is_noise=0 AND charge_id IS NOT NULL", (base,))]
@@ -774,10 +806,10 @@ def _candidates_for_base(
 
 
 def _resolve_one(conn: sqlite3.Connection, qnorm: str) -> tuple[str, Any]:
-    """텍스트 죄명 → ('candidates', base_crime) | ('pool', charge_id) | ('none', None).
+    """Resolve a charge name to a pool, to a set of candidates, or to nothing.
 
-    base_crime 이 2+ pool 을 가지면(사기·강도 등 패밀리) 후보 제시, 특정 죄명(charge_norm/
-    canonical 정확매치)이면 그 pool 로 직행.
+    A base crime covering more than one pool returns candidates for the
+    caller to choose between; an exact charge name goes straight to its pool.
     """
     base_ids = [r["charge_id"] for r in conn.execute(
         "SELECT DISTINCT charge_id FROM charge_taxonomy "
@@ -801,12 +833,13 @@ def _resolve_one(conn: sqlite3.Connection, qnorm: str) -> tuple[str, Any]:
     return ("none", None)
 
 
-# ---------- 상위계열(family) — 발견성 레이어 (§6-3) ----------
-# "사기" → 직접(base=사기) + 관련(컴퓨터등사용사기·보험사기…). canonical_id 로 정의된
-# charge_family 테이블 참조(build_charge_families.py). 통계 pool 은 분리 유지, 발견성만 보강.
+# ---------- families: a discovery layer ----------
+# Asking about "fraud" should surface computer fraud and insurance fraud too.
+# Families only widen what the caller is shown; the sample pools stay
+# separate, so nothing here merges distributions.
 
 def _is_family(conn: sqlite3.Connection, qnorm: str) -> bool:
-    """qnorm 이 상위계열 키인지 — charge_family 부재 시 graceful False(family 미적재 환경)."""
+    """Is this a family name? False when the corpus has no family table."""
     try:
         return conn.execute(
             "SELECT 1 FROM charge_family WHERE family=? LIMIT 1", (qnorm,)
@@ -819,9 +852,10 @@ def _family_related(
     conn: sqlite3.Connection, family: str,
     year_from: int | None, year_to: int | None, exclude: frozenset[int],
 ) -> list[dict[str, Any]]:
-    """family 소속 pool 중 base_crime≠family 인 것(관련 죄명) [{charge_id,label,category,n}].
+    """Relatives of a family: its pools other than the direct matches.
 
-    base==family 는 직접(_candidates_for_base)이 담당 → 여기선 제외(중복 방지). n=0 제외.
+    The direct ones are listed separately, so excluding them here keeps a
+    charge from appearing twice. Pools with no samples are dropped.
     """
     canons = [r["canonical_id"] for r in conn.execute(
         "SELECT canonical_id FROM charge_family WHERE family=?", (family,))]
@@ -845,13 +879,13 @@ def _family_related(
     return out
 
 
-# ---------- alias / category / bare 법률명 진입점 (§6-1·6-2) ----------
+# ---------- entry points: alias, category, bare statute name ----------
 
 def _pool_counts(
     conn: sqlite3.Connection, charge_ids: list[int],
     yf: int | None, yt: int | None, exclude: frozenset[int],
 ) -> dict[int, int]:
-    """charge_id 리스트 → {charge_id: 단독범 1심 n} 일괄(1쿼리) — 대량 pool 집합(category)용."""
+    """Sample count per pool, in one query — a category can hold many pools."""
     ids = list(dict.fromkeys(charge_ids))
     if not ids:
         return {}
@@ -880,7 +914,7 @@ def _pool_counts(
 
 
 def _pool_meta(conn: sqlite3.Connection, charge_ids: list[int]) -> dict[int, tuple[str, str | None]]:
-    """charge_id → (label, category) 일괄(1쿼리)."""
+    """Label and category per pool, in one query."""
     ids = list(dict.fromkeys(charge_ids))
     if not ids:
         return {}
@@ -899,7 +933,7 @@ def _cands_batch(
     conn: sqlite3.Connection, ids: list[int],
     yf: int | None, yt: int | None, exclude: frozenset[int], *, cap: int,
 ) -> list[dict[str, Any]]:
-    """charge_id 리스트 → 후보(n>0·n내림차순·cap). 일괄 카운트(category/bare 법률명 대량용)."""
+    """Pools with at least one sample, largest first, capped."""
     counts = _pool_counts(conn, ids, yf, yt, exclude)
     meta = _pool_meta(conn, ids)
     out = []
@@ -914,7 +948,8 @@ def _cands_batch(
 
 
 def _is_category(conn: sqlite3.Connection, q: str) -> bool:
-    """q 가 category 명인지(잡동 '기타' 제외, 최소 pool 이상). 부재 graceful False."""
+    """Is this a category name? The catch-all category is not an entry point,
+    and a category too small to be useful is not offered either."""
     if q == "기타":
         return False
     try:
@@ -930,7 +965,7 @@ def _category_candidates(
     conn: sqlite3.Connection, q: str,
     yf: int | None, yt: int | None, exclude: frozenset[int],
 ) -> list[dict[str, Any]]:
-    """category 명 → 그 계열 대표 pool 후보(표본 상위 RELATED_MAX)."""
+    """Category -> its best-sampled pools."""
     ids = [r["charge_id"] for r in conn.execute(
         "SELECT DISTINCT charge_id FROM charge_taxonomy "
         "WHERE category=? AND is_noise=0 AND charge_id IS NOT NULL", (q,))]
@@ -941,10 +976,11 @@ def _lawname_candidates(
     conn: sqlite3.Connection, q: str,
     yf: int | None, yt: int | None, exclude: frozenset[int],
 ) -> list[dict[str, Any]]:
-    """bare 법률명(괄호 없는 '…법위반') → 그 법률의 괄호 subtype 후보(완전 나열, cap).
+    """A statute name with no qualifier -> every offence under that statute.
 
-    성폭력특례법 등은 subtype 마다 base 가 흔들려 base 매치로는 일부만 잡힘 → canonical
-    prefix 로 전체 subtype 을 후보로. 단일 죄명 법률명(subtype<2)은 미발동(정상 경로 위임).
+    Base-crime matching only finds some of them, because the base varies
+    between qualifiers within one act; matching on the canonical prefix finds
+    all. Statutes defining a single offence fall through to the normal path.
     """
     if "(" in q or not (q.endswith("법위반") or q.endswith("법률위반")):
         return []
@@ -956,7 +992,7 @@ def _lawname_candidates(
     return _cands_batch(conn, ids, yf, yt, exclude, cap=RELATED_MAX)
 
 
-# ---------- 블록/응답 빌더 (charge_id·텍스트·레거시 공용) ----------
+# ---------- response builders, shared by every resolution path ----------
 
 def _build_block(
     conn: sqlite3.Connection, label: str, norms: list[str], *,
@@ -964,7 +1000,7 @@ def _build_block(
     multi: bool, reference_year: int | None,
     warnings: list[str],
 ) -> tuple[dict[str, Any], bool, bool]:
-    """pool(norms) → 통계/그리드 블록. (blk, is_stats, is_grid) 반환."""
+    """Build one pool's block: statistics if the sample allows, else cases."""
     grid_cap = GRID_MULTI_MAX if multi else GRID_MAX
     singles = _fetch_samples(conn, norms, year_from, year_to, exclude_ids)
     blk: dict[str, Any] = {"charge": label, "n": len(singles)}
@@ -1025,7 +1061,7 @@ def _blocks_from_pools(
     year_from: int | None, year_to: int | None, exclude_ids: frozenset[int],
     reference_year: int | None,
 ) -> dict[str, Any]:
-    """charge_id 리스트 → pool 별 통계 블록 → 응답 dict."""
+    """Assemble the response from one block per pool."""
     pools = [p for p in (_pool_norms(conn, i) for i in dict.fromkeys(charge_ids)) if p]
     if not pools:
         return {"status": "no_data", "warnings": ["해당 charge_id pool 없음"]}
@@ -1049,7 +1085,7 @@ def _legacy_stats(
     year_from: int | None, year_to: int | None, exclude_ids: frozenset[int],
     reference_year: int | None,
 ) -> dict[str, Any]:
-    """taxonomy 부재 시 — 기존 exact charge_norm 매치 경로(+subtype 힌트)."""
+    """Fallback for a corpus without the taxonomy: exact matching only."""
     matched, unmatched = _check_charges_match(conn, normalized)
     if not matched:
         return {"status": "no_data", "unmatched_charges": unmatched,
