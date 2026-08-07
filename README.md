@@ -16,8 +16,8 @@ Five read-only tools:
 | `sentence_statistics` | Observed first-instance sentencing distribution for a charge |
 | `compute_sentencing_range` | Statutory range → processed range → guideline range → verification |
 
-This is the production system behind [법률AI](https://lawful.crow-tit.com), and
-the descendant of the research prototype in
+This is the production system behind [로풀 (Lawful)](https://lawful.crow-tit.com),
+a free Korean legal-AI service, and the descendant of the research prototype in
 [`legal_mcp`](https://github.com/LimEulYoung/legal_mcp) — see [Paper](#paper).
 
 ## Quick start — hosted
@@ -137,8 +137,9 @@ in research, please cite the paper ([`CITATION.cff`](CITATION.cff)).
 
 - **Legal Search API** — one question in, a grounded answer out, in Anthropic
   Messages format. [crow-tit.com](https://crow-tit.com)
-- **법률AI** — the free consumer service: chat, search, labour calculators,
-  legal document drafting. [lawful.crow-tit.com](https://lawful.crow-tit.com)
+- **로풀 (Lawful)** — the free consumer service, 법률AI: chat, search, labour
+  calculators, legal document drafting.
+  [lawful.crow-tit.com](https://lawful.crow-tit.com)
 
 ## Notes
 
