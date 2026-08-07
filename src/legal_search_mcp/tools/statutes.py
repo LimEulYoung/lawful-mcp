@@ -1,12 +1,25 @@
-"""statute_lookup — 법령(`st_statutes`) + 고시(`st_notices`) 통합 조회.
+"""Look up statutes and administrative rules, current or as of a date.
 
-3 모드 (chapter 7 §3, chapter 8 §4):
-  A) `query` 또는 `kind`만        → 목록 (statute별 1줄 + preview)
-  B) `statute_id`만              → 조문 개요 (article_no + title)
-  C) `statute_id` + `articles`   → 조문 본문
+Three modes, chosen by which arguments arrive:
+  - a query or a kind      -> a list of matching laws, one line each
+  - a statute id           -> that law's article outline
+  - a statute id + article numbers -> the article text
 
-검색은 FTS5 trigram + 법령명 substring (dense는 노이즈만 추가, chapter 8 §3.1).
-`statute_id`는 int만 (DB primary key).
+Retrieval is lexical: trigram full text over article bodies, plus substring
+matching on law names. Dense retrieval was tried and only added noise here —
+statute text is short, formulaic and shares vocabulary across acts.
+
+**Statutes have versions, and that is the hard part of this module.** A law
+exists as a series of amendments, each stored as its own row, and asking
+"what does article 347 say" has no answer without a date. The default is
+today; passing an offence date returns the text as it stood then, which is
+what a criminal matter actually turns on.
+
+Two consequences run through the code below. A version row usually holds
+only the articles that amendment changed, so the full text of a law lives in
+its consolidated snapshot rather than in the latest row. And a search that
+matched several versions of one law must fold them to one result, or the
+same law fills the page.
 """
 from __future__ import annotations
 
@@ -25,17 +38,15 @@ from ._morph import kiwi as _kiwi
 
 NOTICE_KINDS = {"고시", "admrul"}
 
-# 한 호출에 articles 인자로 받을 수 있는 조문 수 cap. 컨텍스트 다이어트 — 1~79조
-# 통째 dump로 16K 토큰 limit 초과한 케이스 방어.
+# Articles per call. Without a cap a caller asks for a range like 1-79 and
+# the response alone exceeds the context it was meant to inform.
 ARTICLES_MAX = 8
 
-# 검색 결과 수 cap. **호출자가 준 값을 그대로 SQL 에 넣으면 안 된다** — `_search_statutes`
-# 가 `max(limit * 8, 80)` 을 `LIMIT ?` 에 쓰고, 그 뒤 `_fold_versions`·`_is_repealed_as_of`
-# 가 **law_id 마다 추가 질의**를 한다. 상한이 없으면 `limit=1_000_000` 한 번이
-# `LIMIT 8_000_000` + 그만큼의 per-row 질의가 된다.
-# ⚠ 이 도구는 MCP 에도 상시 등록되고 그 프로세스에는 rate limit 이 없다
-# (`mcp_server` 가 그렇게 적어 뒀다) — 즉 **무인증 외부 호출로 닿는다.**
-# 응답은 이미 관련도 순이라 실사용은 10 안쪽이고, 50 은 넉넉한 여유다.
+# Search results. The caller's limit must not reach SQL unbounded: the
+# search oversamples it eightfold, and version folding then issues a further
+# query per law. A limit of a million would become a scan of eight million
+# rows plus eight million follow-up queries. Results are relevance-ordered,
+# so real use stays under ten and 50 is already generous.
 LIMIT_MAX = 50
 
 # Statute page URLs, same shape as the `url` field of the precedent tools:
@@ -45,19 +56,21 @@ LIMIT_MAX = 50
 NOTICE_URL_PREFIX = "admrul-"   # law_id namespace for administrative rules
 
 
-# ---------- 헬퍼 ----------
+# ---------- helpers ----------
 
 from ._fts import safe_fts_query
 
 
-# ---------- 법령명 정규화 (약칭 + 형태소 토큰) ----------
-# 한국어 법령명은 띄어쓰기 없는 합성어가 많아("광업제조업자") trigram FTS·substring 으로
-# 못 잡는다. 형태소로 명사 토큰을 쪼개 법령명 부분매칭(LIKE)에 쓰고, 통칭은 약칭맵으로
-# 정식명에 매핑한다. 채팅 statute_lookup·웹 search_statutes(harness_repo) 공용 단일 출처.
+# ---------- law names: abbreviations and morpheme tokens ----------
+# Korean law names run words together without spaces, so neither substring
+# nor trigram matching finds the part a caller typed. Splitting the name
+# into noun morphemes gives usable pieces to match on. Common abbreviations
+# do not decompose that way at all and are mapped explicitly.
 
-# 통칭/약칭 → 정식 법령명 (공백 제거 기준 키). value 는 DB 법령명과 글자까지 일치해야
-# 한다(검증 완료). 형태소 토큰화로 안 풀리는 통칭(예: '산재'는 '산업재해보상보험법' 이름에
-# 글자가 없음)을 매핑. 운영하며 점진 확장.
+# Everyday and abbreviated names -> the official name, keyed without
+# spaces. Values must match the stored name exactly. These are the cases
+# morpheme splitting cannot reach: 산재, the ordinary word for a workplace
+# injury claim, shares no characters with the act that governs it.
 _STATUTE_ALIASES = {
     "헌법": "대한민국헌법",
     "산재": "산업재해보상보험법",
@@ -69,15 +82,15 @@ _STATUTE_ALIASES = {
     "개보법": "개인정보 보호법",
     "최임법": "최저임금법",
     "남녀고용평등법": "남녀고용평등과 일ㆍ가정 양립 지원에 관한 법률",
-    # 개명 구법 → 현행명 (같은 계보의 명칭 변경 — 판례 reference_statute 미앵커 상위.
-    # 키는 공백·가운뎃점 제거 형태)
+    # Renamed acts: the same law under its former title, which is how older
+    # judgments cite it.
     "조세감면규제법": "조세특례제한법",
     "총포도검화약류등단속법": "총포ㆍ도검ㆍ화약류 등의 안전관리에 관한 법률",
     "학원의설립운영에관한법률": "학원의 설립ㆍ운영 및 과외교습에 관한 법률",
-    # 한자 표기 (옛 판례 참조조문)
+    # Hanja spellings, as they appear in older judgments.
     "憲法": "대한민국헌법",
     "憲法裁判所法": "헌법재판소법",
-    # 판례 관용 약칭 (본문 추출 미앵커 상위 — 정의구 없이도 쓰이는 통용 약칭)
+    # Abbreviations judgments use without ever defining them.
     "상증세법": "상속세 및 증여세법",
     "공익사업법": "공익사업을 위한 토지 등의 취득 및 보상에 관한 법률",
     "공선법": "공직선거법",
@@ -93,10 +106,9 @@ _STATUTE_ALIASES = {
 }
 
 
-# 가운뎃점 변형 — DB 법령명엔 U+318D 'ㆍ'(아래아)가 들어있고('초ㆍ중등교육법'), 사용자는
-# 점 없이('초중등교육법') 치거나 U+00B7 '·' 등 시각적으로 동일한 다른 코드포인트로 입력한다.
-# 매칭 시 양쪽(질의·저장명)에서 *제거* 해 셋을 동일 취급한다. _STATUTE_ALIASES value 에도
-# 'ㆍ'가 있으나 alias 키는 점 없는 통칭이라 영향 없음.
+# Interpunct variants. Stored law names use U+318D; a caller types the name
+# with no dot at all, or with one of several visually identical code points.
+# Removing the dot from both sides makes all of them match.
 _DOT_CHARS = ("ㆍ", "·", "‧", "∙", "・", "․")  # U+318D U+00B7 U+2027 U+2219 U+30FB U+2024
 
 
@@ -107,7 +119,7 @@ def _strip_dots(s: str) -> str:
 
 
 def _name_norm_sql(col: str) -> str:
-    """법령명 매칭용 정규화 SQL 식 — 공백 + 가운뎃점 변형 제거(_strip_dots 와 동형)."""
+    """SQL expression normalising a stored name the same way `_strip_dots` does."""
     expr = col
     for ch in (" ", *_DOT_CHARS):
         expr = f"REPLACE({expr},'{ch}','')"
@@ -115,16 +127,17 @@ def _name_norm_sql(col: str) -> str:
 
 
 def _statute_name_tokens(query: str) -> tuple[str, list[str]]:
-    """법령명 매칭용 (정규화 질의, 명사 토큰) 반환. 약칭 정규화 후 형태소 분해.
+    """Return (normalised query, noun tokens) for matching a law name.
 
-    예) '광업제조업자' → ('광업제조업자', ['광업','제조','업자'])
-        '헌법'         → ('대한민국헌법', ['대한민국','헌법'])   # 약칭 정규화
-    토큰은 합성어를 쪼개 법령명 LIKE 커버리지에만 쓴다(본문 FTS 엔 미사용 — 흔한 조각이
-    노이즈를 유발). kiwipiepy 미설치/실패 시 빈 토큰 → 호출부가 정규화 질의로 폴백.
+    광업제조업자 -> ['광업', '제조', '업자'], and 헌법 resolves through the
+    alias table to the constitution's full name before being split.
+
+    Tokens widen name matching only. With no analyser available the token
+    list is empty and the caller falls back to the whole query.
     """
     raw = (query or "").strip()
-    # alias 조회·토큰화 전에 가운뎃점 변형 제거 — '초·중등교육법'/'초중등교육법' 모두 점 없는
-    # 형태로 통일해 DB('초ㆍ중등교육법' → SQL 측도 _name_norm_sql 로 점 제거)와 맞춘다.
+    # Strip dots before anything else, so every spelling reaches the alias
+    # table and the database in the same shape.
     raw = _strip_dots(raw)
     normalized = _STATUTE_ALIASES.get(raw.replace(" ", ""), raw)
     try:
@@ -143,16 +156,14 @@ def _fts_query_ok(q: str) -> bool:
 def _parse_articles(
     spec: list[str | int] | None,
 ) -> list[tuple[int, int | None]] | None:
-    """`articles` 파라미터 → `(article_no_num, branch | None)` 튜플 리스트.
+    """Parse article references into (number, branch) pairs.
 
-    LLM 이 자연스럽게 쓰는 한국어 조문 표기를 폭넓게 흡수한다 — 같은 조문을 모두
-    동일 spec 으로 정규화:
-      - `"347"` / `"제347조"` / `"347조"`              → `(347, None)` — 본조 + 모든 가지(의2 ...)
-      - `"347-2"` / `"347의2"` / `"제347조의2"`         → `(347, 2)`    — 제347조의2만 콕
-      - 연속 범위는 list로 풀어서: `["3","4","5","6","7"]`
+    An article number alone selects the article and every branch under it;
+    a number with a branch selects just that branch. A range is passed as a
+    list of numbers rather than as a range expression.
 
-    숫자를 못 찾은 토큰은 무시(graceful). 단 *모든* 토큰이 무시돼 빈 list 가 되면
-    호출부(`_statute_lookup_impl`)가 fail-loud 로 형식 안내를 돌려준다(침묵 금지).
+    Unparseable tokens are skipped. If that leaves nothing at all, the
+    caller returns a format hint rather than silently searching for nothing.
     """
     if spec is None:
         return None
@@ -161,8 +172,9 @@ def _parse_articles(
 
     out: list[tuple[int, int | None]] = []
     for token in spec:
-        # '제76조의2'·'76조의2'·'76의2'·'76-2'·'제76조'·'76' 모두 → (76, 2)/(76, None).
-        # '-'(가지 구분)를 '의'로 통일한 뒤 '제…조…의N' 패턴에서 본조번호·가지번호만 추출.
+        # Accept every way an article gets written: 제76조의2, 76조의2,
+        # 76의2, 76-2, 제76조, 76. Normalise the hyphen form first, then
+        # pull the article number and its branch out of the rest.
         s = str(token).replace("-", "의")
         m = re.search(r"(\d+)\s*조?\s*(?:의\s*(\d+))?", s)
         if not m:
@@ -199,25 +211,29 @@ def _notice_meta(conn: sqlite3.Connection, nid: int) -> dict[str, Any] | None:
 
 
 
-# ---------- 시점 lookup helper (M28 연혁 적재 활용) ----------
+# ---------- resolving a law as of a date ----------
 
 def _today_iso() -> str:
-    """오늘 날짜 'YYYYMMDD'. offense_date 미지정 시 '현행' = *오늘 시점 시행본*
-    판정 기준. 시행예정(미래 eff>today) 자동 제외 + 시간축 라벨 오류(stale
-    '시행예정') 도 날짜로 교정."""
+    """Today, as YYYYMMDD.
+
+    "Current" means in force today, decided by date rather than by the
+    status label on a row: that excludes amendments not yet in force, and
+    corrects rows whose label was never updated after their date passed.
+    """
     return datetime.date.today().strftime('%Y%m%d')
 
 
 
-# 편/장/절/관 구조 제목 row 판별 — '제22장 성풍속에 관한 죄', '제1편 총칙' 등.
-# 이 row 들은 title=NULL 로 적재되며 *바로 뒤 조문의 article_no_num 을 공유*해서
-# (예: '제22장'→num 241), 조문 본문 조회 시 엉뚱하게 잡힌다. 조문 본문은 항상
-# '제<번호>조' 로 시작하므로 [편장절관] 로 구분.
+# Structural headings — "Part 1, General Provisions", "Chapter 22, Offences
+# Against Public Morals" — are stored as rows too, and they carry the
+# article number of whatever follows them. Asking for that article can
+# therefore return the heading instead. Article text always begins with
+# 제<number>조; a heading names a part, chapter, section or subsection.
 _HEADING_RE = re.compile(r'^\s*제\s*\d+\s*[편장절관]')
 
 
 def _is_structural_heading(text: str | None) -> bool:
-    """article_text 가 편/장/절/관 구조 제목이면 True (조문 아님 → 조회서 제외)."""
+    """True for a structural heading rather than an article."""
     return bool(text and _HEADING_RE.match(text))
 
 
@@ -228,17 +244,17 @@ def _get_historic_article(
     art_br: int | None,
     offense_iso: str,
 ) -> dict[str, Any] | None:
-    """같은 law_id + 조문 spec + offense_iso → *행위시점 이전 최후 버전* 조문 본문.
+    """The article as it read on a given date: the last version in force by then.
 
-    M37(f) — 종전엔 `article_changed='Y'`(변경분) row 만 대상이라, *한 번도 개정 안 된*
-    조문(baseline 스냅샷 status=None·changed=None 에만 존재 — 형법 §1·§2 등 多)을
-    전부 놓쳤다. as_of 이전 *최후 버전*(변경분이든 baseline 이든) 을 채택. 동일
-    effective_date 면 변경분('Y') 우선. (offense_date 무영향: 과거 행위는 recent
-    baseline 이 effective_date<=offense 에서 자연 제외, 변경분 row 가 그대로 채택됨.)
+    Takes the last version in force by that date, whether it comes from an
+    amendment or from the baseline snapshot. Looking only at amended rows
+    would miss every article that has never been amended — which includes
+    much of the general part of the Criminal Code. Where both exist on the
+    same date, the amendment wins.
 
-    편/장/절/관 구조 제목 row(`_is_structural_heading`)는 건너뜀 — 같은 num 을
-    공유해 LIMIT 1 로 잡으면 '제22장 …' 같은 장 제목이 §241 본문으로 반환된다.
-    제목을 건너뛰면 삭제 조문은 '제N조 삭제 <…>' 마커가 자연 채택된다.
+    Structural headings are skipped: they share an article number with what
+    follows, so taking the first row would return a chapter title as the
+    text of an article. Repealed articles still return their repeal marker.
     """
     art_br = art_br or 0
     rows = conn.execute(
@@ -258,16 +274,19 @@ def _get_historic_article(
 
 
 def _pick_current_version(conn: sqlite3.Connection, group: list, as_of_iso: str) -> dict | None:
-    """같은 law_id 시점본 group 중 *as_of 시점 현행* 1개 select.
+    """Pick the one version of a law that was current on a given date.
 
-    우선순위:
-      1. eff <= as_of 시행본만 (없으면 group 전체 — 미래본만 적재된 법령 구제)
-      2. 폐지(change_kind '폐지') 비선호 — 있으면 직전 시행본
-      3. **통합본(full snapshot) 우선** — 연혁/일부개정 row 는 변경분(delta)만 적재돼
-         조문이 1~몇 개뿐이다. 최신 amendment 가 lsHistory 에서 '현행' 라벨을 달면
-         history_status 만으론 통합본과 구분 안 돼 eff 최신 delta 가 뽑혀 '조문 1개'
-         법령으로 깨진다(실측 101개 law_id — 행정소송법 등). → pool 에서 **조문 수가
-         가장 많은(=통합본)** 을 최우선, mst NULL(eflaw 풀스냅샷) 차순, 동급이면 최신 eff.
+    In order: keep versions in force by that date (or all of them, for a
+    law whose only rows are future amendments); prefer one that has not been
+    repealed; then prefer the consolidated snapshot.
+
+    That last step is the one that matters. An amendment row holds only the
+    articles it changed — sometimes a single article — and the status label
+    does not distinguish it from a consolidated text. Choosing by label
+    alone therefore yields a "law" with one article in it, which was
+    measured on 101 laws. Choosing the row with the most articles finds the
+    consolidated text instead; full-snapshot origin and then recency break
+    the remaining ties.
     """
     if not group:
         return None
@@ -292,7 +311,7 @@ def _pick_current_version(conn: sqlite3.Connection, group: list, as_of_iso: str)
 def _resolve_current_statute_id(
     conn: sqlite3.Connection, law_id: str, as_of_iso: str,
 ) -> int | None:
-    """law_id → as_of 시점 현행 statute_id (`_pick_current_version` 규칙)."""
+    """Law -> the id of the version current on that date."""
     group = conn.execute(
         "SELECT id, effective_date, history_status, change_kind, mst "
         "FROM st_statutes WHERE law_id=?",
@@ -305,9 +324,11 @@ def _resolve_current_statute_id(
 def _is_repealed_as_of(
     conn: sqlite3.Connection, law_id: str | None, as_of_iso: str,
 ) -> bool:
-    """law_id 가 as_of 시점에 폐지 상태인지 — eff<=as_of *최신본* 의 change_kind
-    가 '폐지'(타법폐지·폐지)면 True. 폐지 후 같은 law_id 로 재제정되면 최신본이
-    非폐지라 False. 전체 이력 조회 — 검색 부분 group 이 폐지 row 를 누락해도 정확.
+    """Was the law repealed as of that date?
+    Decided from the latest version in force by then. A law repealed and
+    later re-enacted under the same id reads as not repealed, which is
+    correct. The whole history is consulted, so a partial result set cannot
+    hide the repeal.
     """
     if not law_id:
         return False
@@ -321,18 +342,17 @@ def _is_repealed_as_of(
 
 
 def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None) -> list:
-    """search 결과 row 들 중 같은 law_id 면 1개만 select.
+    """Fold search hits so each law appears once.
 
-    - offense_iso 지정: effective_date <= offense_iso 중 최대 (그 시점 유효)
-    - 미지정(현행): `_pick_current_version` — eff<=오늘 중 full snapshot 우선·
-      시행예정(미래본) 제외. *오늘 시점 폐지된 법 자체*의 검색 제외는
-      `_search_statutes`(offense_iso None 분기)에서 수행.
+    With a date, the latest version in force by then. Without one, the
+    version current today. Excluding laws that are themselves repealed is
+    the search path's job, not this one's.
     """
     by_law: dict[str, list] = {}
     for r in rows:
         lid = r['law_id']
         if not lid:
-            # law_id 없는 row (예전 적재) — 단독 group 으로 보존
+            # A row with no law id cannot be grouped; keep it alone.
             by_law.setdefault(f'_solo_{r["id"]}', []).append(r)
         else:
             by_law.setdefault(lid, []).append(r)
@@ -342,21 +362,21 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
         if len(group) == 1 and lid.startswith('_solo_'):
             out.append(group[0])
             continue
-        # 시점 filter
+        # Filter by date.
         if offense_iso:
             candidates = [
                 r for r in group if r['effective_date'] and r['effective_date'] <= offense_iso
             ]
             if not candidates:
-                # 행위시 이전 시점본 없음 — skip (그 시점에 아예 없던 법령)
+                # Nothing in force by then: the law did not yet exist.
                 continue
             chosen = max(candidates, key=lambda r: r['effective_date'])
         else:
-            # offense_date 미지정 = '현행'(오늘 시점). full snapshot 우선 + 시행예정
-            # (미래본) 자동 제외 (`_pick_current_version`).
+            # No date given means current: the consolidated snapshot in
+            # force today, with future amendments excluded.
             chosen = _pick_current_version(conn, group, _today_iso())
         out.append(chosen)
-    # 원래 정렬 순서 유지 (rank 기반) — chosen 의 첫 등장 순으로 정렬
+    # Keep the original ranking order.
     seen = set()
     ordered = []
     for r in rows:
@@ -369,9 +389,9 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
 
 
 def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | None) -> dict | None:
-    """law_id 가 offense_iso 시점 (또는 현재) 폐지·시행종료 상태인지.
+    """Was the law repealed or expired as of that date, or today?
 
-    return: 폐지 정보 {effective_date, change_kind} 또는 None.
+    Returns the repeal's date and kind, or None.
     """
     target_date = offense_iso or '99999999'
     r = conn.execute(
@@ -383,7 +403,7 @@ def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | No
     return dict(r) if r else None
 
 
-# ---------- 모드 A: 목록 검색 ----------
+# ---------- list mode: search for laws ----------
 
 def _search_statutes(
     conn: sqlite3.Connection,
@@ -393,12 +413,12 @@ def _search_statutes(
     *,
     offense_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    """법령명 검색. M28 연혁 적재 후 같은 law_id 의 시점본 다수 row 존재 →
-    folding 으로 law_id 별 1개만 노출.
+    """Search by law name.
 
-    - default (offense_date 없음): 같은 law_id 중
-      *현행* (history_status='현행' 우선, NULL=기존 단일 row fallback) 1개
-    - offense_date 지정: 같은 law_id 중 *그 시점 이전 최후 시점본* 1개. 폐지·연혁 포함
+    Several versions of one law can match,
+    so results are folded to one per law: the current version by default,
+    or the one in force on a given date, including repealed and superseded
+    versions when the date calls for them.
     """
     offense_iso = to_iso_date(offense_date)
     where_parts = []
@@ -407,14 +427,14 @@ def _search_statutes(
         where_parts.append("s.kind = ?")
         params.append(kind)
 
-    # folding buffer — 같은 law_id 의 시점본 다수가 들어와도 1개 select 가능하도록
+    # Oversample so folding versions still leaves enough distinct laws.
     sql_limit = max(limit * 8, 80)
 
     if query:
-        # 약칭 정규화 + 형태소 토큰 — 띄어쓰기 없는 합성어("광업제조업자")를 명사 토큰
-        # (광업/제조/업자)으로 쪼개 법령명 LIKE 커버리지에 쓴다. 토큰이 없으면(kiwipiepy
-        # 미설치 등) 정규화 질의 전체로 폴백. 본문 FTS(아래 MATCH)는 원본 질의 그대로 —
-        # 흔한 토큰 조각을 본문에 뿌리면 노이즈가 커지므로 형태소는 법령명에만 적용.
+        # Morpheme tokens are used for the name match only. Scattering
+        # common fragments across article bodies would match almost
+        # everything, so the full-text query keeps the caller's wording.
+        # With no analyser available, the whole normalised query is used.
         normalized, tokens = _statute_name_tokens(query)
         like_terms = tokens or [normalized]
         name_norm = _name_norm_sql("s.name")
@@ -439,16 +459,17 @@ def _search_statutes(
         """
         safe_q = safe_fts_query(query)
         fts_query_str = safe_q if _fts_query_ok(safe_q) else "x" * 1000
-        # 법령명에 토큰이 하나라도 들거나 본문 FTS hit 가 있으면 후보.
+        # A candidate matches on the name or in the text, not necessarily both.
         where_parts.append(f"(({name_or}) OR h.hits > 0)")
         sql += "WHERE " + " AND ".join(where_parts) + "\n"
-        # 완전일치 최상단 → 법령명 토큰 커버리지(몇 개 토큰이 이름에 들었나) → 이름 길이
-        # → 본문 hit. 합성어는 커버리지로, 통칭은 약칭맵+완전일치로 정확히 위로 온다.
+        # Rank by exact name, then how many query tokens the name covers,
+        # then name length, then text hits. Compound names rise through
+        # coverage; everyday names through the alias table and exact match.
         sql += """
         ORDER BY exact_name DESC, name_cover DESC, length(s.name) ASC, fts_hits DESC
         LIMIT ?
         """
-        # params 순서 = SQL 등장 순: MATCH, cover(SELECT n), exact(=normalized),
+        # Parameter order follows the order they appear in the SQL:
         #               [kind(where_parts[0])], name_or(WHERE n), LIMIT
         params_q = [fts_query_str, *like_params, normalized]
         rows = conn.execute(sql, [*params_q, *params, *like_params, sql_limit]).fetchall()
@@ -461,12 +482,13 @@ def _search_statutes(
         sql += " ORDER BY s.name LIMIT ?"
         rows = conn.execute(sql, [*params, sql_limit]).fetchall()
 
-    # folding — law_id 별 1개 select
+    # Fold to one row per law.
     rows = _fold_versions(conn, rows, offense_iso)
     if offense_iso is None:
-        # 현행 검색 — 오늘 시점 *폐지된 법* 제외. 폐지 직전 버전이 '좀비'로
-        # 노출되던 것 차단 (현행본은 보통 다른 law_id 에 별도 존재). 과거시점
-        # (offense_date) 검색은 그 시점 유효본을 봐야 하므로 미적용.
+        # Current search drops laws that are repealed today, otherwise the
+        # last version before repeal surfaces as though it were live — the
+        # replacement usually exists under a different id. A dated search
+        # keeps them, because on that date they were the law.
         today = _today_iso()
         rows = [r for r in rows if not _is_repealed_as_of(conn, r['law_id'], today)]
     rows = rows[:limit]
@@ -514,9 +536,10 @@ def _search_notices(
     limit: int,
 ) -> list[dict[str, Any]]:
     if query:
-        # 법령명 검색(_search_statutes)과 동일한 형태소 토큰 커버리지 — '개인정보의 안전성
-        # 확보조치 기준' 처럼 이름에 조사('의')·띄어쓰기가 섞여도 토큰(개인/정보/안전)이 몇 개
-        # 포함됐는지(name_cover)로 랭크. 공백만 지운 연속 substring 매칭은 '의' 하나에 깨졌다.
+        # Same token-coverage ranking as the statute search. Names carry
+        # particles and spacing that a substring match cannot survive — one
+        # intervening 의 was enough to break it — so rank by how many of the
+        # query's tokens the name contains.
         normalized, tokens = _statute_name_tokens(query)
         like_terms = tokens or [normalized]
         name_norm = _name_norm_sql("n.name")
@@ -585,38 +608,41 @@ def _search_notices(
 
 
 def _name_cover_key(name: str, q_norm: str, tokens: list[str]):
-    """법령·고시 공통 이름-관련도 정렬 키(작을수록 상위). _search_statutes 의 name_cover/
-    exact_name 와 동일 지표(같은 형태소 토큰·공백무시 substring): 완전일치 > 토큰 커버리지
-    높은 순. 쿼터 없이 법령+고시를 *merit* 으로 인터리브하는 데 쓴다."""
+    """Name-relevance sort key, lower first, shared by laws and rules.
+
+    Having one measure lets the two be interleaved on merit rather than by
+    giving each a fixed share of the results.
+    """
     n = (name or "").replace(" ", "")
     if q_norm and n == q_norm:
-        return (0, 0)                          # 완전일치 최상
+        return (0, 0)                          # exact match sorts first
     if tokens:
         cover = sum(1 for t in tokens if t in n)
-        return (1, len(tokens) - cover)        # 커버리지 높을수록(=결손 적을수록) 상위
+        return (1, len(tokens) - cover)        # fewer missing tokens sorts higher
     return (1, 0) if (q_norm and q_norm in n) else (2, 0)
 
 
 def _merge_law_notice_matches(matches, query, limit, name_of=None):
     """법령+고시 검색결과를 이름 관련도(_name_cover_key)로 인터리브 — **쿼터 없음**. 안정
-    정렬이라 같은 관련도 내에선 입력 순서(법령 먼저·각 코퍼스 내부 랭킹) 유지. 채팅
-    statute_lookup 과 웹 search_statutes 가 공용(name_of 로 dict 키만 달리)."""
+    The sort is stable, so within one relevance tier the input order
+    survives.
+    """
     if name_of is None:
         name_of = lambda m: m.get("name", "")
     normalized, tokens = _statute_name_tokens(query) if query else ("", [])
     return sorted(matches, key=lambda m: _name_cover_key(name_of(m), normalized, tokens))[:limit]
 
 
-# ---------- 모드 B: 조문 개요 ----------
+# ---------- outline mode: a law's article titles ----------
 
 def _outline_statute(
     conn: sqlite3.Connection, sid: int, offense_date: str | None = None,
 ) -> dict[str, Any] | None:
     """statute_id 의 모든 조문 title outline.
 
-    offense_date 지정 시 (M28+M29):
-      - 같은 law_id 의 *행위시점 이전 최후 변경* 조문 title 모음
-      - 폐지된 조문도 *그 시점 유효* 면 노출
+    With a date, the outline is assembled from each article's last version
+    in force by then — including articles since repealed, if they were in
+    force on that date.
     """
     meta = _statute_meta(conn, sid)
     if meta is None:
@@ -624,8 +650,7 @@ def _outline_statute(
 
     offense_iso = to_iso_date(offense_date)
     if offense_iso and meta.get('law_id'):
-        # 시점본 outline — 같은 law_id 의 모든 (art_no, art_branch) 별 행위시점
-        # 최후 변경 row 의 title 모음
+        # Assemble from the last version of each article by that date.
         law_id = meta['law_id']
         rows = conn.execute(
             """SELECT a.article_no, a.article_no_num, a.article_branch, a.title,
@@ -636,7 +661,7 @@ def _outline_statute(
                ORDER BY a.article_no_num, a.article_branch, s.effective_date DESC""",
             (law_id, offense_iso),
         ).fetchall()
-        # (art_no_num, art_branch) 별 최신 1개만 keep (이미 ORDER BY eff_date DESC)
+        # Keep the newest row per article; already ordered by date.
         seen: set[tuple] = set()
         articles: list[dict] = []
         for r in rows:
@@ -661,8 +686,9 @@ def _outline_statute(
             'articles': articles,
         }
 
-    # offense_date 미지정 = 현행(오늘). 넘어온 sid 가 현행본이 아니어도(연혁/시행예정
-    # delta) 오늘 시점 현행 snapshot 으로 redirect — '전체 조문 목록' 보장.
+    # Redirect to today's consolidated snapshot even when the caller passed
+    # the id of an amendment row, so an outline is the whole law rather than
+    # the handful of articles that amendment touched.
     as_of = _today_iso()
     if meta.get('law_id'):
         cur_id = _resolve_current_statute_id(conn, meta['law_id'], as_of)
@@ -670,13 +696,11 @@ def _outline_statute(
             sid = cur_id
             meta = _statute_meta(conn, sid) or meta
 
-    # title IS NOT NULL 로 거르면 *제목이 아예 없는 법령*이 통째 0건이 된다 —
-    # 대한민국헌법('제3조 대한민국의 영토는…'처럼 괄호 제목 없이 조번호로 시작 → 전 조문
-    # title=NULL) 과 단일조항 규정('…법정이율에 관한 규정' = 제목·조번호 없는 본문만,
-    # article_no_num=0) 이 그 예다(둘 다 웹 페이지엔 본문이 보이는데 outline 만 0건).
-    # 웹 SSR(_structured_articles)과 동일하게 **편/장/절/관 구조 헤딩만 제외**하고 실조문은
-    # 제목 유무·조번호 0 여부와 무관하게 노출한다. (헤딩 판정에 article_text 필요 → SELECT
-    # 포함; num>0 은 (조,가지) 중복행 방어 — 헤딩은 다음 조문과 num 을 공유하나 위에서 제외됨)
+    # Filtering on a non-null title would empty out laws that have none:
+    # the constitution numbers its articles without parenthesised titles, and
+    # single-provision regulations have neither a title nor an article number.
+    # Both would return an empty outline while plainly having text. Exclude
+    # structural headings and nothing else.
     rows = conn.execute(
         """
         SELECT article_no, article_no_num, article_branch, title, article_text
@@ -713,11 +737,11 @@ def _outline_statute(
         "agency": meta["issuing_agency"],
     }
 
-    # 무구조 단일 본문 규정 — 제N조 구조 없이 article_no_num=0 의 untitled 본문만 있는
-    # '…에 관한 규정/규칙' 류(소촉법 법정이율·이자제한법 최고이자율 등 35개). outline 의 빈
-    # '- 0:' 만 주면 모델이 본문을 못 가져온다(실측: 모델이 '제1조'로 추측 → detail['1'] →
-    # missing → 답변 실패). 본문(이 클래스는 전부 ≤~650자로 짧음)을 곧장 detail 형태로 실어
-    # 한 번에 답하게 한다 — 웹 페이지가 본문을 바로 렌더하는 것과 동형.
+    # Regulations with no article structure at all — a single untitled body,
+    # such as the statutory interest rate. An outline of these is a blank
+    # entry the caller cannot follow up on: it guesses "article 1", gets a
+    # miss, and gives up. They are short (under about 650 characters), so
+    # return the text itself instead of an outline.
     if articles and not any((a["no_num"] or 0) > 0 for a in articles):
         return {
             "mode": "detail",
@@ -727,7 +751,7 @@ def _outline_statute(
             "note": "제N조 구조가 없는 단일 본문 규정 — 아래가 본문 전문입니다.",
         }
 
-    # 일반 법령 — outline 은 제목 목록만(본문 text 제외).
+    # Ordinary laws: outline is titles only, no article text.
     for a in articles:
         a.pop("text", None)
     return {
@@ -742,8 +766,11 @@ _NOTICE_TITLE_RE = re.compile(r'^\s*제\s*\d+(?:-\d+)?\s*조(?:의\s*\d+)?\s*\((
 
 
 def _notice_article_title(text: str) -> str:
-    """고시 조문 제목 — 고시는 title 컬럼이 없고 제목이 article_text 의 '제N조(제목) …'
-    머리에 들어있다. 괄호 안 제목만 추출(없으면 '')."""
+    """Title of an administrative-rule article.
+
+    These have no title column; the title sits in parentheses at the head of
+    the article text itself.
+    """
     m = _NOTICE_TITLE_RE.match(text or "")
     return m.group(1).strip() if m else ""
 
@@ -763,8 +790,8 @@ def _outline_notice(conn: sqlite3.Connection, nid: int) -> dict[str, Any] | None
             """,
             (nid,),
         ).fetchall()
-        # no = 표시용 조번호(no_str: '1','6의2'). 고시 article_no 는 num*1000+가지 내부값이라
-        # 그대로 노출하면 '1000' 처럼 보인다. 제목은 article_text 머리에서 추출.
+        # Show the natural article number. The stored value packs the branch
+        # into the integer, so article 1 would otherwise display as 1000.
         articles = [
             {
                 "seq": r["article_seq"],
@@ -797,7 +824,7 @@ def _outline_notice(conn: sqlite3.Connection, nid: int) -> dict[str, Any] | None
     }
 
 
-# ---------- 모드 C: 조문 본문 ----------
+# ---------- detail mode: article text ----------
 
 def _detail_statute(
     conn: sqlite3.Connection,
@@ -829,12 +856,13 @@ def _detail_statute(
 
     offense_iso = to_iso_date(offense_date)
 
-    # M37(f) — 현행·시점 본문 통일. 변경분(delta) 적재 DB 에서 "현행 조문" = "최신 시행
-    # 시점의 조문" 이므로, 현행 조회도 offense_date 조회와 *같은* delta-walk
-    # (`_detail_statute_at_date` = 조문별 최후 변경분 후방 추적) 로 푼다. 종전엔 현행만
-    # folding 된 단일 statute_id (= '현행' delta row, 바뀐 조문만 적재) 를 직접 조회해
-    # *최근 개정 안 된 조문* 이 전부 missing 이었다 (86/89 법령). offense_date 없으면
-    # as_of = 최신 *시행* 시점 (시행예정 제외 — 미시행 개정분은 현행 아님).
+    # Current text and dated text resolve the same way. Where amendments are
+    # stored as deltas, "the current article" just means "the article as of
+    # the latest date in force", so both go through the same walk back to
+    # each article's last change. Querying the current version row directly
+    # instead returned nothing for every article that amendment did not
+    # touch — 86 of 89 laws in a check. Amendments not yet in force are
+    # excluded: they are not current.
     law_id = meta.get('law_id')
     if law_id:
         as_of = offense_iso
@@ -848,7 +876,7 @@ def _detail_statute(
         if as_of:
             return _detail_statute_at_date(conn, meta, specs, as_of)
 
-    # fallback — law_id 없거나(예전 solo 적재) 시점 산출 불가 시 단일-id 직접 조회
+    # Fallback for a row with no law id, or when no date can be resolved.
     conditions: list[str] = []
     params: list[Any] = [sid]
     for num, branch in specs:
@@ -871,7 +899,7 @@ def _detail_statute(
         params,
     ).fetchall()
 
-    # missing 판정: spec 별로 매칭 row 있는지
+    # Report which requested articles produced nothing.
     def _matched(spec: tuple[int, int | None]) -> bool:
         num, branch = spec
         if branch is None:
@@ -917,14 +945,14 @@ def _detail_statute_at_date(
     specs: list[tuple[int, int | None]],
     offense_iso: str,
 ) -> dict[str, Any]:
-    """offense_date 시점 본문 응답 — 변경분 적재 row 의 시점 후방 referencing.
+    """Article text as of a date, walking back to each article's last change.
 
-    각 spec 의 *행위시점 이전 최후 변경* 본문 모음. 본조 + 가지 모두 처리.
+    Handles an article and its branches alike.
     """
     law_id = meta['law_id']
-    # 폐지 여부 점검
+    # Check whether the law was repealed by then.
     repealed = _is_repealed_at(conn, law_id, offense_iso)
-    # 같은 law_id 의 *최후 시점본 메타* (시간 축 비대칭 표시용)
+    # Metadata from the latest version, for the time-axis display.
     latest = conn.execute(
         """SELECT effective_date, history_status FROM st_statutes
            WHERE law_id=? ORDER BY effective_date DESC LIMIT 1""",
@@ -934,15 +962,15 @@ def _detail_statute_at_date(
     articles: list[dict] = []
     missing: list[str] = []
     for num, branch in specs:
-        # branch=None (본조 + 가지 모두) → law_id 의 article_no_num=num 의 *모든 branch*
-        # 의 시점 lookup (각 branch 별 최후 변경)
+        # No branch requested: resolve the article and every branch under
+        # it, each at its own last change.
         if branch is None:
-            # 같은 num 의 모든 branch 가능성 — 한번에 lookup
+            # Fetch all branches of this article in one query.
             branches_rows = conn.execute(
                 """SELECT DISTINCT a.article_branch FROM st_articles a
                    JOIN st_statutes s ON s.id=a.statute_id
                    WHERE s.law_id=? AND a.article_no_num=?
-                     AND s.effective_date <= ?""",  # M37(f) — baseline 가지 포함 (Y 필터 제거)
+                     AND s.effective_date <= ?""",  # baseline rows included
                 (law_id, num, offense_iso),
             ).fetchall()
             branches = sorted({r['article_branch'] or 0 for r in branches_rows})
@@ -1006,15 +1034,20 @@ def _detail_notice(
     specs: list[tuple[int, int | None]] | None,
     text_max: int = 10_000,
 ) -> dict[str, Any] | None:
-    """고시 article_no = num*1000 + 가지(제6조의2 = 6002). spec (num, branch) 를 그 인코딩으로
-    변환해 매칭 — outline 이 보여주는 자연 조번호('1','6의2')를 그대로 다시 넘기면 조회된다."""
+    """Look up rule articles, translating to their stored encoding.
+
+    Administrative rules pack an article and its branch into one integer
+    (article 6-2 becomes 6002). Callers pass the natural numbers the outline
+    showed them; the translation happens here.
+    """
     meta = _notice_meta(conn, nid)
     if meta is None:
         return None
     cat = meta["category"]
 
     if cat == "article_form":
-        # branch 지정 시 정확히(num*1000+br), 미지정(본조) 시 그 천단위 블록 전체(본조+모든 가지).
+        # A requested branch matches exactly; without one, take the whole
+        # thousand-block, meaning the article and all its branches.
         conds, params = [], []
         for num, br in (specs or []):
             if br is None:
@@ -1081,7 +1114,7 @@ def _detail_notice(
     }
 
 
-# ---------- markdown 직렬화 ----------
+# ---------- markdown serialisation ----------
 
 def _fmt_article_no(no: Any, branch: Any) -> str:
     """article 번호 표기 — branch 있으면 '347-2' 형태."""
@@ -1089,15 +1122,13 @@ def _fmt_article_no(no: Any, branch: Any) -> str:
 
 
 def _statute_web_url(d: dict[str, Any]) -> str | None:
-    """법령/고시 dict(detail 의 statute 또는 search match) → 법령 페이지 url.
-    법령 = /statutes/{law_id}, 고시 = /statutes/admrul-{st_notices.id}. 해석 불가 시 None.
-    판례 도구의 `url` 필드와 동형 — 모델이 인용할 때 마크다운 링크로 제시한다."""
+    """Page url for a law or an administrative rule, or None if undetermined."""
     if not d:
         return None
     law_id = d.get("law_id")
     if law_id:
         return f"{case_url_base()}/statutes/{law_id}"
-    # 고시: law_id 없음 + category/notice_id 보유. id(detail) 또는 statute_id(match) = st_notices.id
+    # Administrative rules have no law id; they carry a category and rule id.
     if d.get("category") or d.get("notice_id"):
         nid = d.get("id")
         if not isinstance(nid, int):
@@ -1108,9 +1139,10 @@ def _statute_web_url(d: dict[str, Any]) -> str | None:
 
 
 def _statute_article_url(stt: dict[str, Any] | None, art: dict[str, Any]) -> str | None:
-    """법령 조문 단위 페이지 url /statutes/{law_id}/{jo} (jo='750'·'839의2'). 고시(law_id
-    없음)·조번호 결손 시 None — 그땐 법령 단위 url 만 노출. jo 슬러그는 web `_jo_slug` 와 동일
-    규칙(가지 있으면 'N의M', 없으면 'N')."""
+    """Page url for a single article, or None when there is no article to link.
+
+    Falls back to the law-level url in that case.
+    """
     law_id = (stt or {}).get("law_id")
     if not law_id:
         return None
@@ -1196,15 +1228,17 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append("## articles")
             for a in arts:
                 num = _fmt_article_no(a.get("no"), a.get("branch"))
-                # title 이 None 일 수 있음(제목 없는 법령 — 헌법·단일조항 규정). a.get(...,'')
-                # 는 키가 None 값으로 존재하면 'None' 을 그대로 찍으므로 `or ''` 로 정규화.
+                # The title can be None for laws that have none. A default
+                # in .get() would not help: the key exists holding None, so
+                # the string "None" would be printed.
                 lines.append(f"### {num} {a.get('title') or ''}")
                 art_url = _statute_article_url(stt, a)
                 if art_url:
                     lines.append(f"- url: {art_url}")
                 if a.get("text"):
-                    # 조문마다 두 줄(provenance + quote_eligible)이 나가던 것을 표지 하나로 합쳤다.
-                    # 조회 하나가 조문 수십 개를 담으므로 줄당 비용이 그대로 곱해진다.
+                    # One marker rather than two lines per article: a single
+                    # lookup can carry dozens of articles, so per-line cost
+                    # multiplies.
                     lines.append("- text_kind: 공식 조문 원문")
                     lines.append(a["text"])
         if resp.get("body"):  # 고시 other category
@@ -1346,8 +1380,9 @@ def _statute_lookup_impl(
                 offense_date=offense_date,
             )
         else:
-            # 쿼터 없음 — 법령·고시 각각 limit 까지 뽑아 이름 관련도(_merge_law_notice_matches)
-            # 로 인터리브. 이름이 맞는 고시는 위로, 본문만 스친 고시는 법령 아래로 자연 정렬.
+            # No fixed share between laws and rules: take up to the limit
+            # from each and interleave by name relevance. A rule whose name
+            # matches rises; one that merely mentions the words does not.
             stat_matches = _search_statutes(
                 conn, query, None, limit,
                 offense_date=offense_date,
@@ -1359,8 +1394,9 @@ def _statute_lookup_impl(
             "matches": matches,
             "offense_date": to_iso_date(offense_date),
         }
-        # query 와 articles 를 함께 줬는데 statute_id 가 없으면 본문은 못 준다(조문은
-        # 법령-종속). articles 를 *조용히 무시* 하지 않고 two-step 으로 안내(fail-loud).
+        # Article numbers mean nothing without a law — the same number is a
+        # different provision in every act. Rather than ignore them, say so
+        # and describe the two-step call.
         if articles:
             out["note"] = (
                 "본문 조회는 statute_id 가 필요합니다 — 아래 matches 에서 맞는 법령의 "
@@ -1371,8 +1407,9 @@ def _statute_lookup_impl(
     sid = statute_id  # 이미 coerce_int로 정수화됨
     specs = _parse_articles(articles)
 
-    # articles 를 줬는데 한 토큰도 못 읽으면 *침묵 금지* — 빈 detail 로 떨어지면 모델이
-    # 왜 본문이 안 나오는지 단서가 없어 형식을 바꿔가며 헛돈다(실측). 형식 안내로 fail-loud.
+    # If nothing in `articles` parsed, say what the format is. An empty
+    # result gives the caller no clue why, so it retries with variations of
+    # the same unparseable input.
     if articles and not specs:
         return _bad_articles_response(statute_id, articles)
 
