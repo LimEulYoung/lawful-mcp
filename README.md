@@ -22,7 +22,7 @@ the descendant of the research prototype in
 
 ## Quick start — hosted
 
-The full corpus (190k+ judgments, statutes with their amendment history,
+The full corpus (220k+ judgments, statutes with their amendment history,
 administrative rules, sentencing guidelines) is served for you. Get a free
 key at [console.crow-tit.com](https://console.crow-tit.com) and add:
 
@@ -90,7 +90,7 @@ whole thing:
 
 | | Sample (`data/fixture.db`) | Hosted |
 |---|---|---|
-| Judgments | 800 | 190,000+ |
+| Judgments | 800 | 220,000+ |
 | Statutes | 27 core laws, current text | All, with amendment history |
 | Administrative rules | 20 | All |
 | Sentencing guidelines | Complete | Complete |
