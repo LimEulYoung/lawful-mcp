@@ -1,0 +1,22 @@
+# Local working files — never committed (local-only project docs)
+CLAUDE.md
+.claude/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Databases — only the committed fixture ships in the repo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+!data/fixture.db

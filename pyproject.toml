@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "legal-search-mcp"
+version = "0.1.0"
+description = "MCP server for Korean case law, statutes and sentencing data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Eul Young Lim" }]
+keywords = ["mcp", "legal", "korean-law", "case-law", "search"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Natural Language :: Korean",
+]
+dependencies = [
+    "mcp>=1.2",
+    "pydantic>=2.0",
+    "pydantic-ai>=0.0.20",
+    "kiwipiepy>=0.17",   # morphological index; two-syllable terms need it
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+]
+
+[project.optional-dependencies]
+# Embedding + rerank retrieval path (USE_DENSE=1). Off by default.
+dense = ["openai>=1.0", "httpx>=0.27", "sqlite-vec>=0.1"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+legal-search-mcp = "legal_search_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/LimEulYoung/legal-search-mcp"
+"Hosted service" = "https://crow-tit.com"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/legal_search_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
