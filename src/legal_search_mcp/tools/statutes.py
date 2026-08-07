@@ -623,7 +623,8 @@ def _name_cover_key(name: str, q_norm: str, tokens: list[str]):
 
 
 def _merge_law_notice_matches(matches, query, limit, name_of=None):
-    """법령+고시 검색결과를 이름 관련도(_name_cover_key)로 인터리브 — **쿼터 없음**. 안정
+    """Interleave law and rule results by name relevance, with no fixed share.
+
     The sort is stable, so within one relevance tier the input order
     survives.
     """
@@ -638,7 +639,7 @@ def _merge_law_notice_matches(matches, query, limit, name_of=None):
 def _outline_statute(
     conn: sqlite3.Connection, sid: int, offense_date: str | None = None,
 ) -> dict[str, Any] | None:
-    """statute_id 의 모든 조문 title outline.
+    """Outline: the title of every article in a law.
 
     With a date, the outline is assembled from each article's last version
     in force by then — including articles since repealed, if they were in
@@ -1117,7 +1118,7 @@ def _detail_notice(
 # ---------- markdown serialisation ----------
 
 def _fmt_article_no(no: Any, branch: Any) -> str:
-    """article 번호 표기 — branch 있으면 '347-2' 형태."""
+    """Display form of an article number, with its branch if it has one."""
     return f"{no}-{branch}" if branch else f"{no}"
 
 
@@ -1161,7 +1162,7 @@ def _statute_article_url(stt: dict[str, Any] | None, art: dict[str, Any]) -> str
 
 
 def _format_response_md(resp: dict[str, Any]) -> str:
-    """statute_lookup 응답 dict → markdown-KV 문자열."""
+    """Response dict -> markdown-KV string."""
     status = resp.get("status", "ok")
     mode = resp.get("mode")
     lines: list[str] = [f"## status: {status}"]
@@ -1348,7 +1349,7 @@ def statute_lookup(
 
 
 def _bad_articles_response(statute_id: int | None, articles: list[str | int]) -> dict[str, Any]:
-    """articles 토큰을 한 개도 못 읽었을 때의 fail-loud 안내(침묵 금지)."""
+    """Format hint for when nothing in `articles` could be parsed."""
     return {
         "status": "bad_articles",
         "input": {"statute_id": statute_id, "articles": articles},
