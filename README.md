@@ -124,10 +124,10 @@ python scripts/build_sample_db.py --source /path/to/corpus.db \
 
 The retrieval and tool-use design was evaluated on the Korean Bar Examination:
 
-> **Agentic RAG for Legal Question Answering in Civil Law: Evidence from the Korean Bar Examination**
+> **Agentic RAG for Legal Question Answering in Civil Law: Evidence From the Korean Bar Examination**
 > Eul Young Lim and Jihun Park
-
-<!-- Publication link to be added. -->
+> *IEEE Access*, vol. 14, pp. 124441–124458, 2026.
+> [doi:10.1109/ACCESS.2026.3722717](https://doi.org/10.1109/ACCESS.2026.3722717) — open access
 
 Benchmark code, questions and per-model results are archived in
 [`legal_mcp`](https://github.com/LimEulYoung/legal_mcp). If you use this tool

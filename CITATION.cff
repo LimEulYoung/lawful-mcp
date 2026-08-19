@@ -1,0 +1,48 @@
+cff-version: 1.2.0
+title: Legal Search MCP
+abstract: >-
+  Korean case law, statutes and sentencing data as Model Context Protocol
+  tools: statute lookup as of a date, judgment retrieval, single-judgment
+  question answering, sentencing statistics and sentencing-range computation.
+message: >-
+  If you use this software in research, please cite the paper under
+  preferred-citation.
+type: software
+authors:
+  - family-names: Lim
+    given-names: Eul Young
+    orcid: https://orcid.org/0009-0004-0201-1448
+    affiliation: Chungnam National University
+license: MIT
+repository-code: https://github.com/LimEulYoung/legal-search-mcp
+url: https://crow-tit.com
+keywords:
+  - model-context-protocol
+  - legal-information-retrieval
+  - retrieval-augmented-generation
+  - korean-law
+  - case-law
+preferred-citation:
+  type: article
+  title: >-
+    Agentic RAG for Legal Question Answering in Civil Law: Evidence From the
+    Korean Bar Examination
+  authors:
+    - family-names: Lim
+      given-names: Eul Young
+      orcid: https://orcid.org/0009-0004-0201-1448
+      affiliation: Chungnam National University
+    - family-names: Park
+      given-names: Jihun
+      orcid: https://orcid.org/0000-0003-3745-886X
+      affiliation: Chungnam National University
+  journal: IEEE Access
+  publisher:
+    name: Institute of Electrical and Electronics Engineers
+  volume: 14
+  start: 124441
+  end: 124458
+  year: 2026
+  issn: 2169-3536
+  doi: 10.1109/ACCESS.2026.3722717
+  url: https://ieeexplore.ieee.org/document/11648184
