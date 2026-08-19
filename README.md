@@ -1,5 +1,7 @@
 # Legal Search MCP
 
+English | [한국어](README.ko.md)
+
 Korean case law, statutes and sentencing data as [MCP](https://modelcontextprotocol.io)
 tools. Point an AI client at it and the model can look up statute text as it
 stood on a given date, find judgments by the facts of a case, read one
