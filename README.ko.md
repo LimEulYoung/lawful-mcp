@@ -134,8 +134,8 @@ python scripts/build_sample_db.py --source /path/to/corpus.db \
 
 ## 이런 것도 있습니다
 
-- **Legal Search API** — 질문 하나 넣으면 근거가 달린 답이 돌아옵니다. Anthropic
-  Messages 형식 그대로 씁니다. [crow-tit.com](https://crow-tit.com)
+- **Legal Search API** — 질문 하나 넣으면 근거가 달린 답이 돌아옵니다.
+  [crow-tit.com](https://crow-tit.com)
 - **로풀 (Lawful)** — 누구나 무료로 쓰는 법률AI입니다. 챗, 검색, 노무 계산기, 법률
   문서 작성. [lawful.crow-tit.com](https://lawful.crow-tit.com)
 

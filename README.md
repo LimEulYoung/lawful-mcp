@@ -137,8 +137,8 @@ in research, please cite the paper ([`CITATION.cff`](CITATION.cff)).
 
 ## Also available
 
-- **Legal Search API** — one question in, a grounded answer out, in Anthropic
-  Messages format. [crow-tit.com](https://crow-tit.com)
+- **Legal Search API** — one question in, a grounded answer out.
+  [crow-tit.com](https://crow-tit.com)
 - **로풀 (Lawful)** — the free consumer service, 법률AI: chat, search, labour
   calculators, legal document drafting.
   [lawful.crow-tit.com](https://lawful.crow-tit.com)
