@@ -1,5 +1,6 @@
 # Local working files — never committed (local-only project docs)
 CLAUDE.md
+AGENTS.md
 .claude/
 
 # Secrets
