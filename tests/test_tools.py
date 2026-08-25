@@ -183,3 +183,48 @@ def test_precedent_dive_without_model_is_not_registered(monkeypatch):
 
     monkeypatch.delenv("DIVE_API_KEY", raising=False)
     assert build_dive_subagent() is None
+
+
+def test_mcp_layer_lets_a_json_looking_charge_through():
+    """The validation layer must not reject what it just parsed for us.
+
+    A JSON-looking string argument is json.loads-ed before the tool runs, so
+    `charge='[299,298,297]'` becomes a list. A narrow annotation turned that into
+    a validation error and the charge_numeric hint never reached the caller —
+    over MCP only, since the tool itself takes the argument wide.
+    """
+    import anyio
+
+    from legal_search_mcp import server
+
+    async def call(value):
+        return await server.mcp.call_tool(
+            "compute_sentencing_range", {"charge": value})
+
+    assert "charge_numeric" in str(anyio.run(call, "[299,298,297]"))
+    # Shapes that already worked must keep working.
+    assert "charge_numeric" in str(anyio.run(call, "298"))
+    assert "charge_numeric" in str(anyio.run(call, "297의2"))
+
+
+def test_sibling_string_arguments_stay_narrow():
+    """The asymmetry above is a decision, not an oversight — keep it visible."""
+    import anyio
+
+    from legal_search_mcp import server
+
+    schemas = {t.name: t.inputSchema for t in anyio.run(server.mcp.list_tools)}
+
+    def types(tool, field):
+        prop = schemas[tool]["properties"][field]
+        if "anyOf" in prop:
+            return {b["type"] for b in prop["anyOf"] if "type" in b}
+        return {prop["type"]} if "type" in prop else set()
+
+    assert "array" in types("compute_sentencing_range", "charge")
+    for tool, field in (
+        ("precedent_search", "query"),
+        ("sentence_statistics", "charges"),
+        ("compute_sentencing_range", "statute_choice"),
+    ):
+        assert "array" not in types(tool, field), f"{tool}.{field}"

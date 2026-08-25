@@ -233,7 +233,21 @@ def sentence_statistics(
     openWorldHint=False,
 )
 def compute_sentencing_range(
-    charge: str | None = None,
+    # Only this argument also accepts `list`. The MCP layer runs json.loads over
+    # any JSON-looking string argument *before* the tool does (SDK
+    # `func_metadata.pre_parse_json`, applied wherever the annotation is not
+    # exactly `str`), so `charge='[299,298,297]'` arrives as a list and a narrow
+    # `str | None` rejects the value that layer just produced. That is precisely
+    # the shape the charge_numeric hint exists for — article numbers carried over
+    # from a previous tool result — so the hint never reached the caller here,
+    # while `'298'` and `'297의2'` (scalar, non-JSON) always worked. Taking it
+    # wide lets the tool's own coerce_str fold it back to "299, 298, 297" and the
+    # hint fires as intended.
+    # Sibling string arguments stay narrow on purpose: widening only pays off
+    # where a prepared answer exists for the wide value. A list reaching `query`
+    # or `charges` would instead be joined into one comma-separated search term
+    # and searched silently, which is worse than a validation error.
+    charge: str | list | None = None,
     sg_category_id: int | None = None,
     statute_choice: str | None = None,
     branch_key: str | None = None,
