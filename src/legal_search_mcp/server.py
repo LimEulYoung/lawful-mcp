@@ -36,9 +36,9 @@ _EXTRA_HOSTS = [
 ]
 
 _INSTRUCTIONS = (
-    "한국 법률 검색 도구 모음 — 판례·법령·고시·양형기준 corpus 기반. "
+    "한국 법률 검색 도구 모음 — 판례·법령·행정규칙(고시·훈령·예규)·양형기준 corpus 기반. "
     "판례 검색(precedent_search) 후 필요할 때 본문 생성요약(precedent_dive), "
-    "법령·고시 조문(statute_lookup), 양형 분포(sentence_statistics), "
+    "법령·행정규칙 조문(statute_lookup), 양형 분포(sentence_statistics), "
     "양형기준 계산(compute_sentencing_range). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
 
@@ -98,17 +98,22 @@ _DESC_PRECEDENT_SEARCH = (
     "url만 인용 링크로 씁니다. `preview_kind: 원문 발췌`만 직접인용하고 `(직접인용 불가)`가 붙은 요약은 바꿔 쓰세요."
 )
 _DESC_STATUTE_LOOKUP = (
-    "법령·고시 조회 — 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 국면의 기본 도구이며, "
+    "법령·행정규칙 조회 — 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 국면의 기본 도구이며, "
     "죄명·법조 식별 후 조문 본문 확인에도 씁니다. 조문은 개정되므로 현행 본문은 이 도구만 압니다. "
+    "법률·대통령령·부령·규칙과 행정규칙(고시·훈령·예규)을 한 번에 검색합니다 — 종류를 가리는 인자는 없고 "
+    "관련도 순으로 함께 나오며 각 결과에 종류가 붙습니다. "
     "자주 쓰는 법령은 quick-access id로 바로 호출(statute_id+articles): 헌법 468·민법 584·상법 583·민사소송법 581·"
     "형법 578·형사소송법 574·행정기본법 4953·행정절차법 437·행정소송법 386·헌법재판소법 3629. "
     "query 또는 statute_id가 필수. 그 외는 two-step — ① query=법령명으로 후보 id를 받고 ② statute_id+articles로 본문 호출"
     "(조문 번호는 법령마다 달라 법령을 먼저 확정).\n"
-    "Args: query=법령명 또는 본문 키워드(id 모를 때). statute_id=DB primary key(int; 위 목록 밖은 추측 금지 — 예 574는 형사소송법). "
-    "articles=조문 번호 list[str] 최대 8개('347'/'제347조'=본조+가지, '347의2'=가지만, 범위 ['3','4','5']; 미지정 시 outline). "
-    "kind='법률'|'대통령령'|'부령'|'고시'. limit=검색 모드 최대 결과 수(기본 10·최대 50). "
+    "Args: query=법령명·행정규칙명 또는 본문 키워드(id 모를 때). "
+    "statute_id=검색이 준 식별자를 글자 그대로 — 법령은 정수(예 584; 위 목록 밖은 추측 금지 — 574는 형사소송법), "
+    "행정규칙은 'admrul-18060'. **접두사를 떼면 같은 번호의 다른 법령이 조회됩니다.** "
+    "articles=조문 번호 list[str] 최대 8개('347'/'제347조'=본조+가지, '347의2'=가지만, 범위 ['3','4','5']; 미지정 시 outline; "
+    "8개 초과는 앞 8개만 조회하고 나머지를 message로 알림 — 나눠 재호출). "
+    "limit=검색 모드 최대 결과 수(기본 10·최대 50). "
     "offense_date=행위 일자(예 '2013.7.30') 지정 시 행위시점 조문, 미지정 시 현행.\n"
-    "url만 인용 링크로 쓰고, `text_kind: 공식 … 원문`인 조문·고시 본문만 직접인용하세요."
+    "url만 인용 링크로 쓰고, `text_kind: 공식 … 원문`인 조문·행정규칙 본문만 직접인용하세요."
 )
 _DESC_SENTENCE_STATISTICS = (
     "양형 선고 통계 — charges 또는 charge_id 중 하나는 필수. ① charges 하나로 정제된 죄명 후보(charge_id+표본수)를 반환(status=candidates), "
@@ -125,7 +130,9 @@ _DESC_COMPUTE_SENTENCING_RANGE = (
     "charge만=lookup(법정형·양형기준 leaf 후보·가중감경 인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
     "+guideline_leaf_id·guideline_factors=권고형 / +sentence_months·fine_amount(+probation_factors)=final(선고형·집행유예 검증). "
     "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정한 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
-    "Args: charge=판결문형 죄명(예 '살인','도로교통법위반(음주운전)'). offense_date=행위 일자(지정 시 행위시 조문). "
+    "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 숫자·ID 불가"
+    "(조문 번호·sentence_statistics의 charge_id·leaf id 아님; 숫자가 오면 계산 없이 죄명 문자열 재호출 유도[charge_numeric]). "
+    "offense_date=행위 일자(지정 시 행위시 조문). "
     "sg_category_id·statute_choice·branch_key·reference_choice=응답이 모호할 때(ambiguous_* 후보 제공) 명시. "
     "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=형법§56 가중감경 list(lookup enum에서 선택). "
     "guideline_leaf_id·guideline_factors=양형기준 leaf·특별인자(lookup 후보/enum에서). "
@@ -169,7 +176,7 @@ def precedent_search(
 
 @_tool(
     _DESC_STATUTE_LOOKUP,
-    title="법령·고시 조회",
+    title="법령·행정규칙 조회",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -177,9 +184,8 @@ def precedent_search(
 )
 def statute_lookup(
     query: str | None = None,
-    statute_id: int | None = None,
+    statute_id: int | str | None = None,
     articles: list[str] | None = None,
-    kind: str | None = None,
     limit: int = 10,
     offense_date: str | None = None,
 ) -> str:
@@ -188,7 +194,6 @@ def statute_lookup(
         query=query,
         statute_id=statute_id,
         articles=articles,
-        kind=kind,
         limit=limit,
         offense_date=offense_date,
     )

@@ -1,9 +1,13 @@
 """Look up statutes and administrative rules, current or as of a date.
 
 Three modes, chosen by which arguments arrive:
-  - a query or a kind      -> a list of matching laws, one line each
+  - a query                -> a list of matching laws, one line each
   - a statute id           -> that law's article outline
   - a statute id + article numbers -> the article text
+
+Statutes and administrative rules (고시·훈령·예규) are searched together and
+ranked by name relevance; which corpus a lookup means is carried by the
+identifier, not by a separate argument (see `_parse_statute_ref`).
 
 Retrieval is lexical: trigram full text over article bodies, plus substring
 matching on law names. Dense retrieval was tried and only added noise here —
@@ -36,7 +40,12 @@ from ._coerce import coerce_int, coerce_list, coerce_str, to_iso_date
 from ._dedup import dedup_guard
 from ._morph import kiwi as _kiwi
 
-NOTICE_KINDS = {"고시", "admrul"}
+# There is deliberately no kind filter, and a `NOTICE_KINDS` set used to sit
+# here to support one. Narrowing by kind is not worth reviving: the column
+# holds 62 distinct values — 42 ministry-specific 부령 among them, plus
+# historical leftovers — so a caller had to reproduce an exact string, and a
+# near miss returned a silent zero rather than an error. Name relevance does
+# that work instead.
 
 # Articles per call. Without a cap a caller asks for a range like 1-79 and
 # the response alone exceeds the context it was meant to inform.
@@ -54,6 +63,97 @@ LIMIT_MAX = 50
 # administrative rule /statutes/admrul-{st_notices.id}. Attached to responses
 # so a model citing the text can link to the source.
 NOTICE_URL_PREFIX = "admrul-"   # law_id namespace for administrative rules
+
+
+def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | None:
+    """Read a caller's ``statute_id`` into ``(is_rule, id)``, or None if unreadable.
+
+    A bare integer means a statute (``st_statutes``); ``'admrul-18060'`` means an
+    administrative rule (``st_notices``). One shape is neither: a web path
+    ``/statutes/{law_id}`` — or a zero-padded digit string — carries a *law_id*
+    ('004704') rather than a primary key, and comes back as ``("law", law_id)``
+    for `_statute_lookup_impl` to resolve against the database.
+
+    **An identifier has to name its own corpus.** The two tables number their
+    rows independently and the ranges collide: 21,738 of 21,749 administrative
+    rules (99.9%) share an integer with some statute. A separate `kind` argument
+    used to carry that distinction, and when a caller left it off the answer was
+    not "no such document" but an unrelated one, returned as `status: ok`. Over
+    seven weeks of traffic, 29 of 48 lookups that fed a rule id back took that
+    path. Hence the prefix.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return (False, raw)
+    if isinstance(raw, float):
+        return (False, int(raw))
+    if isinstance(raw, (list, tuple)):
+        return _parse_statute_ref(raw[0]) if raw else None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        # Case and stray spaces do not distinguish anything, so accept both.
+        low = s.lower().replace(" ", "")
+        if low.startswith(NOTICE_URL_PREFIX):
+            rest = low[len(NOTICE_URL_PREFIX):]
+            return (True, int(rest)) if rest.isdigit() else None
+        # A whole page url, pasted through from a previous answer.
+        if "/statutes/" in low:
+            tail = (low.rsplit("/statutes/", 1)[1]
+                    .split("/")[0].split("?")[0].split("#")[0])
+            if tail.startswith(NOTICE_URL_PREFIX):
+                rest = tail[len(NOTICE_URL_PREFIX):]
+                return (True, int(rest)) if rest.isdigit() else None
+            # The statute slot of a web path is a law_id by definition. No
+            # zero-padding is applied: a made-up /statutes/584 silently landing
+            # on law_id 000584 is worse than failing loudly into a search.
+            return ("law", tail) if tail.isdigit() else None
+        if s.isdigit() and s.startswith("0") and len(s) >= 2:
+            return ("law", s)             # zero padding only occurs in law_ids
+        return (False, int(s)) if s.isdigit() else None
+    return None
+
+
+def _statute_ref(d: dict[str, Any] | None) -> str:
+    """A result row -> the identifier the caller sees: a bare integer for a
+    statute, ``'admrul-{id}'`` for an administrative rule. The corpus test is
+    the same one `_statute_web_url` uses (does the row carry a law_id) — were
+    the two to disagree, the id and the url in one response would point at
+    different documents.
+    """
+    if not d:
+        return ""
+    nid = d.get("id")
+    if not isinstance(nid, int):
+        nid = d.get("statute_id")
+    if d.get("law_id"):
+        return str(nid) if isinstance(nid, int) else ""
+    if d.get("category") or d.get("notice_id"):
+        return f"{NOTICE_URL_PREFIX}{nid}" if isinstance(nid, int) else ""
+    return str(nid) if isinstance(nid, int) else ""
+
+
+# Which edition of an administrative rule search may surface. Amending one
+# does not rewrite its row: the source publishes a *new row* under a new
+# serial, so superseded editions ('구판') and not-yet-effective ones
+# ('시행예정') sit in the table beside the current text. Unlabelled rows are
+# treated as current — if labelling ever lags, showing a stale rule beats
+# emptying the search entirely. Detail lookups deliberately skip this filter,
+# so an indexed url for an old edition still opens instead of 404-ing.
+_NOTICE_CURRENT = "COALESCE(n.history_status,'현행')='현행'"
+
+# The exposure test is **whether there is text to read**, not how the document
+# is typeset. An earlier `category='article_form'` condition admitted only
+# rules laid out as numbered articles, which hid designation and approval
+# notices wholesale — and some of those set rights and duties directly (the
+# 최저임금법 §5 notice designating simple-labour occupations is one; it was
+# excluded for being short). `has_text_content=1` covers the same article-form
+# rows and additionally the bodies recovered from attachments, while the empty
+# and image-only shells carry 0 and drop out on their own.
 
 
 # ---------- helpers ----------
@@ -202,7 +302,7 @@ def _notice_meta(conn: sqlite3.Connection, nid: int) -> dict[str, Any] | None:
         """
         SELECT id, serial_id, notice_id, name, kind, issuing_agency,
                notice_no, issued_date, effective_date,
-               category, has_articles, has_text_content
+               category, has_articles, has_text_content, history_status, body_source
         FROM st_notices WHERE id=?
         """,
         (nid,),
@@ -321,6 +421,24 @@ def _resolve_current_statute_id(
     return chosen['id'] if chosen else None
 
 
+def resolve_web_law_id(
+    conn: sqlite3.Connection, law_id: str, as_of_iso: str,
+) -> tuple[int, str] | None:
+    """Web-namespace law_id ('004704') -> (current statute id, law name), or None.
+
+    The ``/statutes/{law_id}`` path and the tool's ``statute_id`` are different
+    id spaces, and this is the only place they are joined; the version pick is
+    `_pick_current_version`'s, so a resolved id means the same edition a plain
+    lookup would return.
+    """
+    sid = _resolve_current_statute_id(conn, law_id, as_of_iso)
+    if sid is None:
+        return None
+    row = conn.execute(
+        "SELECT name FROM st_statutes WHERE id=?", (sid,)).fetchone()
+    return (sid, row["name"] if row and row["name"] else "")
+
+
 def _is_repealed_as_of(
     conn: sqlite3.Connection, law_id: str | None, as_of_iso: str,
 ) -> bool:
@@ -408,7 +526,6 @@ def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | No
 def _search_statutes(
     conn: sqlite3.Connection,
     query: str | None,
-    kind: str | None,
     limit: int,
     *,
     offense_date: str | None = None,
@@ -421,11 +538,9 @@ def _search_statutes(
     versions when the date calls for them.
     """
     offense_iso = to_iso_date(offense_date)
+    # No kind filter — a `kind` argument used to add a clause here.
     where_parts = []
     params: list[Any] = []
-    if kind and kind not in NOTICE_KINDS:
-        where_parts.append("s.kind = ?")
-        params.append(kind)
 
     # Oversample so folding versions still leaves enough distinct laws.
     sql_limit = max(limit * 8, 80)
@@ -470,7 +585,7 @@ def _search_statutes(
         LIMIT ?
         """
         # Parameter order follows the order they appear in the SQL:
-        #               [kind(where_parts[0])], name_or(WHERE n), LIMIT
+        #               fts MATCH, cover/exact (SELECT), name_or (WHERE), LIMIT
         params_q = [fts_query_str, *like_params, normalized]
         rows = conn.execute(sql, [*params_q, *params, *like_params, sql_limit]).fetchall()
     else:
@@ -564,7 +679,7 @@ def _search_notices(
         FROM st_notices n
         LEFT JOIN fts_hits h ON h.notice_id = n.id
         WHERE n.has_text_content = 1
-          AND n.category = 'article_form'
+          AND {_NOTICE_CURRENT}
           AND (({name_or}) OR h.hits > 0)
         ORDER BY exact_name DESC, name_cover DESC, length(n.name) ASC, fts_hits DESC
         LIMIT ?
@@ -579,7 +694,8 @@ def _search_notices(
             SELECT id, notice_id, name, kind, issuing_agency, effective_date, category,
                    0 AS fts_hits, 0 AS name_hit
             FROM st_notices
-            WHERE has_text_content=1 AND category='article_form'
+            WHERE has_text_content=1
+              AND COALESCE(history_status,'현행')='현행'
             ORDER BY name LIMIT ?
 """,
             (limit,),
@@ -796,7 +912,11 @@ def _outline_notice(conn: sqlite3.Connection, nid: int) -> dict[str, Any] | None
         articles = [
             {
                 "seq": r["article_seq"],
-                "no": r["article_no_str"] or str(r["article_no"]),
+                # Both can be NULL: a part/chapter/section heading carries no
+                # article number, and `str(None)` would hand the caller the
+                # string "None" as one. No article-form rule had such a row
+                # before 훈령·예규 joined the corpus, so it never showed.
+                "no": r["article_no_str"] or (str(r["article_no"]) if r["article_no"] else ""),
                 "no_str": r["article_no_str"],
                 "title": _notice_article_title(r["article_text"]),
                 "textlen": r["textlen"],
@@ -1070,7 +1190,11 @@ def _detail_notice(
         articles = [
             {
                 "seq": r["article_seq"],
-                "no": r["article_no_str"] or str(r["article_no"]),
+                # Both can be NULL: a part/chapter/section heading carries no
+                # article number, and `str(None)` would hand the caller the
+                # string "None" as one. No article-form rule had such a row
+                # before 훈령·예규 joined the corpus, so it never showed.
+                "no": r["article_no_str"] or (str(r["article_no"]) if r["article_no"] else ""),
                 "no_str": r["article_no_str"],
                 "title": _notice_article_title(r["article_text"]),
                 "text": r["article_text"],
@@ -1182,7 +1306,10 @@ def _format_response_md(resp: dict[str, Any]) -> str:
         matches = resp.get("matches", [])
         lines.append(f"## matches ({len(matches)})")
         for m in matches:
-            mid = m.get("statute_id") or m.get("id")
+            # Administrative rules go out under the 'admrul-' prefix: handing
+            # that identifier straight back is what reaches the same document,
+            # since a bare integer is read in the statute id space.
+            mid = _statute_ref(m) or m.get("statute_id") or m.get("id")
             kind = m.get("kind") or ""
             head = f"- {mid} {m.get('name','')}" + (f" ({kind})" if kind else "")
             lines.append(head)
@@ -1195,7 +1322,7 @@ def _format_response_md(resp: dict[str, Any]) -> str:
 
     stt = resp.get("statute")
     if stt:
-        sid = stt.get("id")
+        sid = _statute_ref(stt) or stt.get("id")
         head = f"## statute: {stt.get('name','')}"
         if sid:
             head += f" (id={sid})"
@@ -1261,13 +1388,15 @@ def _format_response_md(resp: dict[str, Any]) -> str:
 def statute_lookup(
     ctx: RunContext[HarnessDeps],
     query: str | None = None,
-    statute_id: int | None = None,
+    statute_id: int | str | None = None,
     articles: list[str | int] | str | int | None = None,
-    kind: str | None = None,
     limit: int = 10,
     offense_date: str | None = None,
 ) -> str:
-    """법령·고시 조회 — 법령명/키워드 검색과 조문 본문 확인(현행 또는 행위시점 기준).
+    """법령·행정규칙 조회 — 법령명/키워드 검색과 조문 본문 확인(현행 또는 행위시점 기준).
+
+    법률·대통령령·부령·규칙과 **행정규칙(고시·훈령·예규)**을 한 번에 검색합니다. 종류를
+    가리는 인자는 없습니다 — 관련도 순으로 함께 나오고 각 결과에 종류가 붙습니다.
 
     언제:
     - 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 모든 국면 — 조문을 인용할 때만이 아니라
@@ -1287,68 +1416,91 @@ def statute_lookup(
       ② 맞는 법령을 골라 그 statute_id + articles 로 본문 호출.
       조문 번호는 법령-종속이라(같은 '제3조'도 법마다 다름) 법령을 먼저 확정한 뒤
       본문을 받는 게 안전합니다.
+    - **검색이 준 id 를 글자 그대로 되넘기세요.** 행정규칙 id 는 `admrul-18060` 처럼
+      접두사가 붙어 나옵니다 — 접두사를 떼면 **같은 번호의 다른 법령**이 조회됩니다.
     - **위 quick-access 목록 밖의 statute_id 는 추측 금지** (DB primary key — 예: 574 는
       근로기준법이 아니라 형사소송법). 모르면 query 로 검색해 받은 id 를 쓰세요.
     - articles 미지정 시 outline (모든 조문 title) — 형법처럼 큰 법령은 응답이 거대해지니
       가능하면 articles 명시.
 
-    응답: markdown-KV. 상세 조문·고시 본문은 `text_kind: 공식 … 원문`으로 표시되며 그대로
+    응답: markdown-KV. 상세 조문·행정규칙 본문은 `text_kind: 공식 … 원문`으로 표시되며 그대로
     직접인용할 수 있습니다. 답에 쓴 조문은 직접 인용이든 요약이든 반환 url(법령/조문 페이지)을
     링크로 함께 제시하세요.
 
     Args:
-      query: 법령명 또는 본문 키워드. id 모를 때 검색용. 받은 목록에서 id 를 골라 재호출.
-      statute_id: int (DB primary key). 한글 이름 받지 않음. 모르면 query 로 검색(추측 금지).
-      articles: 조문 번호 리스트(문자열/정수 모두 허용) **최대 8개**. 아래 표기 모두 허용(자동 정규화):
+      query: 법령명·행정규칙명 또는 본문 키워드. id 모를 때 검색용. 받은 목록에서 id 를 골라 재호출.
+      statute_id: 검색 결과가 준 식별자를 그대로. 법령은 정수(예: 584), 행정규칙은
+        `'admrul-18060'`. 한글 이름 받지 않음. 모르면 query 로 검색(추측 금지).
+      articles: 조문 번호 리스트(문자열/정수 모두 허용) **최대 8개** — 넘치면 앞 8개만
+        조회하고 나머지는 응답 message 로 알린다(나눠 재호출). 아래 표기 모두 허용(자동 정규화):
         - "347" / "제347조": 347조 + 가지(의2, 의3 ...) 함께
         - "347-2" / "347의2" / "제347조의2": 제347조의2만 콕
         - 연속 범위: ["3","4","5","6","7"]
-        고시는 가지 없음.
-      kind: "법률"|"대통령령"|"부령"|"고시" 필터. "고시"면 고시 테이블.
+        행정규칙은 가지 없음. 조문이 분리되지 않은 행정규칙은 articles 를 아무 값으로나 주면
+        본문 전문이 나옵니다(개요 응답의 note 가 그렇게 안내합니다).
       limit: 검색 모드 최대 결과 수(기본 10, 최대 50).
       offense_date: 행위 일자 (예: '2013.7.30', '20130730'). 지정 시 *행위시점 기준*
         본문/시점본 응답 — 형법 §1 ① "범죄의 성립과 처벌은 행위시의 법률에 의한다" 원칙.
         **미지정 시 오늘 날짜(시스템 시계) 기준 현행본** — 미래 시행예정본은 자동 제외.
     """
     query = coerce_str(query)
-    kind = coerce_str(kind)
     limit = min(max(coerce_int(limit) or 10, 1), LIMIT_MAX)
-    statute_id = coerce_int(statute_id)
     articles = coerce_list(articles)
-    is_notice_target = kind in NOTICE_KINDS
+    ref = _parse_statute_ref(statute_id)
 
-    if statute_id is None and not query:
+    if ref is None and not query:
+        # An unreadable statute_id and no statute_id at all are different
+        # mistakes. Folding the first into missing_input leaves the caller no
+        # reason not to send the same malformed id again.
+        if statute_id is not None:
+            return _format_response_md({
+                "status": "bad_statute_id",
+                "input": {"statute_id": statute_id},
+                "message": (
+                    "statute_id 를 읽지 못했습니다 — 법령은 정수(예: 584), "
+                    "행정규칙은 'admrul-18060' 형태입니다. 검색 결과가 준 식별자를 "
+                    "글자 그대로 넘기거나, query 로 다시 검색하세요."
+                ),
+            })
         return _format_response_md({
             "status": "missing_input",
             "message": (
-                "query(법령명·키워드) 또는 statute_id(DB 식별자) 중 하나는 필요합니다. "
+                "query(법령명·키워드) 또는 statute_id(검색이 준 식별자) 중 하나는 필요합니다. "
                 "법령을 모르면 query로 검색한 뒤 받은 statute_id로 재호출하세요."
             ),
         })
 
+    # Over the cap, answer the first ARTICLES_MAX and say what was deferred
+    # rather than refusing outright. A refusal makes the caller rewrite the
+    # whole call: measured over two days of traffic, nineteen requests of nine
+    # to fifteen articles each came back with nothing at all.
+    dropped_articles: list = []
     if articles is not None and len(articles) > ARTICLES_MAX:
-        return _format_response_md({
-            "status": "too_many_articles",
-            "input": {"statute_id": statute_id, "n_articles": len(articles)},
-            "message": (
-                f"한 호출당 articles는 최대 {ARTICLES_MAX}개까지. "
-                f"{len(articles)}개 요청됨 — 작은 묶음으로 나눠 호출해 주세요."
-            ),
-        })
+        dropped_articles = list(articles[ARTICLES_MAX:])
+        articles = list(articles[:ARTICLES_MAX])
 
     conn = open_db()
     try:
-        return _format_response_md(
-            _statute_lookup_impl(
-                conn, query, statute_id, articles, kind, limit, is_notice_target,
-                offense_date=offense_date,
-            )
+        resp = _statute_lookup_impl(
+            conn, query, ref, articles, limit, offense_date=offense_date,
         )
+        if dropped_articles:
+            preview = ", ".join(str(a) for a in dropped_articles[:12])
+            if len(dropped_articles) > 12:
+                preview += f" 외 {len(dropped_articles) - 12}개"
+            note = (
+                f"articles {ARTICLES_MAX + len(dropped_articles)}개 중 앞 "
+                f"{ARTICLES_MAX}개만 조회했습니다(호출당 최대 {ARTICLES_MAX}개). "
+                f"나머지({preview})는 같은 statute_id 로 나눠 재호출하세요."
+            )
+            prev = resp.get("message")
+            resp["message"] = note if not prev else f"{note} · {prev}"
+        return _format_response_md(resp)
     finally:
         conn.close()
 
 
-def _bad_articles_response(statute_id: int | None, articles: list[str | int]) -> dict[str, Any]:
+def _bad_articles_response(statute_id: int | str | None, articles: list[str | int]) -> dict[str, Any]:
     """Format hint for when nothing in `articles` could be parsed."""
     return {
         "status": "bad_articles",
@@ -1364,32 +1516,25 @@ def _bad_articles_response(statute_id: int | None, articles: list[str | int]) ->
 def _statute_lookup_impl(
     conn,
     query: str | None,
-    statute_id: int | None,
+    ref: tuple[bool, int] | tuple[str, str] | None,
     articles: list[str | int] | None,
-    kind: str | None,
     limit: int,
-    is_notice_target: bool,
     *,
     offense_date: str | None = None,
 ) -> dict[str, Any]:
-    if statute_id is None:
-        if is_notice_target:
-            matches = _search_notices(conn, query, limit)
-        elif kind:
-            matches = _search_statutes(
-                conn, query, kind, limit,
-                offense_date=offense_date,
-            )
-        else:
-            # No fixed share between laws and rules: take up to the limit
-            # from each and interleave by name relevance. A rule whose name
-            # matches rises; one that merely mentions the words does not.
-            stat_matches = _search_statutes(
-                conn, query, None, limit,
-                offense_date=offense_date,
-            )
-            notice_matches = _search_notices(conn, query, limit) if query else []
-            matches = _merge_law_notice_matches(stat_matches + notice_matches, query, limit)
+    """``ref`` is `_parse_statute_ref`'s result — ``(is_rule, id)`` or
+    ``("law", law_id)``. None selects search mode."""
+    if ref is None:
+        # No kind filter, and no fixed share between laws and rules: take up
+        # to the limit from each and interleave by name relevance. A rule
+        # whose name matches rises above the laws; one that merely mentions
+        # the words sorts below them, so the caller need not pick a kind up
+        # front.
+        stat_matches = _search_statutes(
+            conn, query, limit, offense_date=offense_date,
+        )
+        notice_matches = _search_notices(conn, query, limit) if query else []
+        matches = _merge_law_notice_matches(stat_matches + notice_matches, query, limit)
         out = {
             "status": "ok", "mode": "list",
             "matches": matches,
@@ -1405,16 +1550,33 @@ def _statute_lookup_impl(
             )
         return out
 
-    sid = statute_id  # 이미 coerce_int로 정수화됨
+    if ref[0] == "law":
+        # A law_id off a web path. Resolve it to the current version's id and
+        # carry on; the detail flow below re-picks a dated version when
+        # offense_date calls for one.
+        resolved = resolve_web_law_id(conn, ref[1], _today_iso())
+        if resolved is None:
+            return {
+                "status": "not_found",
+                "input": {"law_id": ref[1]},
+                "message": (
+                    "웹 경로의 법령 id(law_id)를 코퍼스에서 찾지 못했습니다 — "
+                    "query 로 법령명을 검색해 statute_id 를 받아 재호출하세요."
+                ),
+            }
+        ref = (False, resolved[0])
+
+    is_notice, sid = ref
+    shown_id = f"{NOTICE_URL_PREFIX}{sid}" if is_notice else sid
     specs = _parse_articles(articles)
 
     # If nothing in `articles` parsed, say what the format is. An empty
     # result gives the caller no clue why, so it retries with variations of
     # the same unparseable input.
     if articles and not specs:
-        return _bad_articles_response(statute_id, articles)
+        return _bad_articles_response(shown_id, articles)
 
-    if is_notice_target:
+    if is_notice:
         res = (
             _detail_notice(conn, sid, specs)
             if specs is not None
@@ -1430,6 +1592,6 @@ def _statute_lookup_impl(
     if res is None:
         return {
             "status": "missing",
-            "input": {"statute_id": statute_id, "kind": kind},
+            "input": {"statute_id": shown_id},
         }
     return {"status": "ok", **res}

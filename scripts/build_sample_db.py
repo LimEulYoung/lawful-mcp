@@ -198,7 +198,10 @@ def main() -> None:
         help="core-current: whitelist laws, current-snapshot articles only; "
         "core: whitelist laws with every version's articles; all: everything",
     )
-    ap.add_argument("--notices", type=int, default=20, help="recent notices to keep")
+    ap.add_argument(
+        "--notices", type=int, default=20,
+        help="recent current-edition notices to keep",
+    )
     ap.add_argument("--force", action="store_true", help="overwrite dest")
     args = ap.parse_args()
 
@@ -281,8 +284,14 @@ def main() -> None:
             "INSERT INTO main.st_articles SELECT * FROM src.st_articles "
             "WHERE statute_id IN (SELECT id FROM main.st_statutes)"
         )
+    # Only rules the tool would actually surface. An administrative rule is
+    # re-issued as a *new row* on amendment, so the corpus holds superseded
+    # editions ('구판') and future ones ('시행예정') alongside the current text;
+    # ``statute_lookup`` searches the current edition with a readable body, and
+    # a sample drawn without that filter fills up with rows no search can reach.
     dest.execute(
         "INSERT INTO main.st_notices SELECT * FROM src.st_notices "
+        "WHERE has_text_content=1 AND COALESCE(history_status,'현행')='현행' "
         "ORDER BY issued_date DESC, id DESC LIMIT ?",
         (args.notices,),
     )

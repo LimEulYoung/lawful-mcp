@@ -89,14 +89,24 @@ _SUFFIX_MODIFIERS: list[tuple[str, str]] = [
 ]
 
 
+# A leading bracketed number, as in "[1]상해". Judgments list their applied
+# provisions as "[1] 형법 §257 / [2] …", and the tag travels with the offence
+# name when a caller copies it across. No charge key in the mapping starts
+# with '[', so stripping it cannot cost a legitimate input.
+# ⚠ Strip only when something remains: a bare number ("[123]") belongs to
+# `_numeric_charge_tokens`, and emptying the string here would lose that path.
+_BRACKET_NUM_PREFIX_RE = re.compile(r"^\[\d{1,4}\]")
+
+
 @dataclass(frozen=True)
 class NormalizedCharge:
     """A normalised charge key plus any modifier split off its tail."""
 
     key: str                        # 정규화된 lookup 키 (suffix 제거 가능)
-    raw_key: str                    # charge_key() 만 적용 (suffix 미제거)
+    raw_key: str                    # charge_key() + 선행 번호 딱지 제거 (suffix 미제거)
     modifiers: dict[str, bool]      # {is_attempted, is_accessory, is_solicitor}
     suffix_split_applied: bool      # 자동 분리 발생 여부 (응답 trace)
+    bracket_prefix_stripped: str | None = None  # 제거된 딱지("[9]") — 응답 note 용
 
 
 def _normalize_charge(
@@ -111,11 +121,17 @@ def _normalize_charge(
 
     Rules:
       1. `charge_key()` 로 1차 정규화 (공백·dot 통일, 괄호 보존)
+      1-b. 선행 번호 딱지("[1]상해") 는 벗긴다 — 잔여가 있을 때만 (`_BRACKET_NUM_PREFIX_RE`).
       2. suffix (미수/교사/방조) 가 *charge_key 마지막* 이고 parent (suffix 제거 형태)
          가 매핑에 존재하면 → 분리 + modifier 설정.
       3. 호출자가 명시한 modifier (is_attempted 등) 는 *override* — 자동 분리와 OR.
     """
     raw = _charge_key_normalize(charge or "")
+    bracket_prefix = None
+    m = _BRACKET_NUM_PREFIX_RE.match(raw)
+    if m and m.end() < len(raw):
+        bracket_prefix = m.group(0)
+        raw = raw[m.end():]
     modifiers: dict[str, bool] = {
         "is_attempted": bool(is_attempted),
         "is_accessory": bool(is_accessory),
@@ -145,6 +161,7 @@ def _normalize_charge(
         raw_key=raw,
         modifiers=modifiers,
         suffix_split_applied=suffix_split,
+        bracket_prefix_stripped=bracket_prefix,
     )
 
 
@@ -1635,6 +1652,11 @@ def _format_stage_header(
         lines.append(f"- modifiers: {mod_str}")
     if norm.suffix_split_applied:
         lines.append("- note: suffix(미수/교사/방조) 자동 분리 — modifier 자동 set")
+    if norm.bracket_prefix_stripped:
+        lines.append(
+            f"- note: 선행 번호 {norm.bracket_prefix_stripped} 제거 → {norm.raw_key}"
+            " — charge 는 죄명 문자열만"
+        )
     if row["is_alias"] and row["alias_of"]:
         lines.append(f"- alias_of: {row['alias_of']}")
 
@@ -2586,6 +2608,59 @@ def _format_not_found_response(norm: NormalizedCharge) -> str:
     return "\n".join(lines)
 
 
+# ---------- numeric charge (charge_numeric) ----------
+#
+# Much of the traffic that found nothing had an integer in `charge` rather
+# than an offence name — a number an earlier tool had handed the caller: an
+# article number from `statute_lookup` (charge=[299,298,297] straight after
+# articles=['297'..'300']), or a charge_id from `sentence_statistics`
+# (charge=[1155], 준강제추행, straight after its candidate list). Answering
+# with the ordinary not_found ("no sentencing guideline") reads as "this
+# offence has no guideline", and callers repeated the same number across
+# turns — five in a row, observed. A distinct status breaks that loop.
+#
+# ⚠ The number is not resolved and carried forward. The id spaces overlap:
+# 형법 §298 is 강제추행 while `sentence_statistics` charge_id 298 is 뇌물수수,
+# so guessing produces a plausible wrong answer. Offering candidates by
+# reverse article lookup would be possible, but comes second — only if this
+# wording turns out not to work.
+
+_NUMERIC_CHARGE_TOKEN_RE = re.compile(r"^\d{1,5}(?:(?:의|-)\d{1,3})?$")
+_NUMERIC_CHARGE_SEP_RE = re.compile(r"[\s\[\]()'\"‚,，·;/]+")
+
+
+def _numeric_charge_tokens(charge: str) -> list[str] | None:
+    """The tokens, if `charge` is nothing but numbers; None otherwise.
+
+    One letter anywhere — Hangul or Latin — makes it an offence name and
+    leaves it to the ordinary lookup. Branch forms like '297의2' count as
+    numeric.
+    """
+    parts = [p for p in _NUMERIC_CHARGE_SEP_RE.split(charge) if p]
+    if not parts or not all(_NUMERIC_CHARGE_TOKEN_RE.match(p) for p in parts):
+        return None
+    return list(dict.fromkeys(parts))[:8]
+
+
+def _format_charge_numeric_response(charge: str, tokens: list[str]) -> str:
+    lines = [
+        "## status: charge_numeric",
+        "## stage: lookup",
+        f"## charge: {charge}",
+        "- charge 는 판결문 죄명 **문자열**입니다(예: 강제추행, 도로교통법위반(음주운전))"
+        " — 숫자는 해석하지 않습니다.",
+        "- statute_lookup 의 조문 번호, sentence_statistics 의 charge_id, 양형기준"
+        " leaf id 는 모두 이 자리의 값이 아닙니다. 앞선 응답에 나온 죄명 문자열을 그대로 쓰세요.",
+    ]
+    if len(tokens) > 1:
+        lines.append("- 죄명은 호출당 하나입니다 — 여러 죄는 각각 호출하세요.")
+    lines.append(
+        "- 죄명을 모르면 sentence_statistics(charges=키워드) 로 후보를 찾거나,"
+        " statute_lookup 으로 그 조문의 제목(죄명)을 확인하세요."
+    )
+    return "\n".join(lines)
+
+
 # ---------- public tool ----------
 
 @dedup_guard("compute_sentencing_range")
@@ -2640,6 +2715,9 @@ def compute_sentencing_range(
 
     Args:
       charge: 판결문 form 죄명 (예: 살인, 도로교통법위반(음주운전)). 정규화는 도구 내부에서 처리.
+        **숫자·ID 불가** — statute_lookup 조문 번호도, sentence_statistics 의 charge_id 도,
+        양형기준 leaf id 도 아니다. 숫자가 오면 계산하지 않고 죄명 문자열 재호출을 유도한다
+        (charge_numeric).
       offense_date: 행위 일자 (예: '2013.7.30', '2013-07-30', '20130730'). 지정 시
         행위시 조문 본문·시점본 정량 반영 — 형법 §1 ① "범죄의 성립과 처벌은 행위시의
         법률에 의한다" 원칙. 미지정 시 현행 기준.
@@ -2684,6 +2762,10 @@ def compute_sentencing_range(
             "## status: missing_input\n"
             "- charge 인자 필요. 판결문 form 죄명 (예: 살인, 도로교통법위반(음주운전))."
         )
+
+    numeric_tokens = _numeric_charge_tokens(charge)
+    if numeric_tokens is not None:
+        return _format_charge_numeric_response(charge, numeric_tokens)
 
     conn = open_db()
     try:
