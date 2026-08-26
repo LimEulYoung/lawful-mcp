@@ -43,10 +43,16 @@ EMBED_DIM = int(os.environ.get("EMBED_DIM", "1024"))
 
 # Retrieval tuning. Not exposed as tool arguments: a caller has no basis to
 # choose them, and they are not what a caller is reasoning about.
-LIMIT = 8            # results returned. Recall at 10 is much better than at 5
+LIMIT = 7            # results returned. Recall at 10 is much better than at 5
                      #   for short queries, and BM25 ranking is coarse enough
-                     #   that a few extra candidates hedge cheaply — eight
-                     #   results with previews cost roughly 900 tokens.
+                     #   that a few extra candidates hedge cheaply.
+                     #   Eight until each result grew a holding line. At eight
+                     #   the response is 20% longer; at seven it is 5%, which
+                     #   is flat in practice (3,922 -> 4,132 characters over
+                     #   150 production queries). What seven gives up is 7.5%
+                     #   of the cases the model actually cited or dived into —
+                     #   they were the eighth result — and six would give up
+                     #   15.7%. Do not go to five: that loses 24.1%.
 RRF_K = 60           # reciprocal rank fusion constant
 OVERSAMPLE = 5       # candidate pool = LIMIT * OVERSAMPLE, so filters can bite
                      #   without leaving the result short
@@ -66,6 +72,19 @@ PREVIEW_TOP_K = int(os.environ.get("PREVIEW_TOP_K", "3"))            # sentences
 PREVIEW_MAX_CHARS = int(os.environ.get("PREVIEW_MAX_CHARS", "400"))  # preview cap; one sentence always survives
 RERANK_INPUT_MAX_CHARS = int(os.environ.get("RERANK_INPUT_MAX_CHARS", "4000"))  # guard against outlier-length input
 PREVIEW_FALLBACK_CHARS = 200                                         # cut used when reranking is off
+# Display cap for one holding item. The cap exists for the tail: among the
+# cases search returns, holdings run to 1,001 characters at p99 and 18,524 at
+# the longest — rows where a full judgment was written into the `holdings`
+# column, 36 of 81,488. Uncapped, one search could add 19,060 characters and
+# quintuple the response.
+#
+# The value trades truncation against characters spent (882 selected items
+# over 200 production queries: median 122, p90 309). At 150 characters 38% of
+# items are cut, at 200 25%, at 300 11% — and 200 -> 300 costs 72 characters
+# per search, 2% of the response. A legal proposition loses most of its worth
+# cut in half, so that 2% buys truncation down to under a third. Past 400 the
+# curve flattens: another 31 characters for 5%.
+HOLDING_MAX_CHARS = 300
 
 from ._fts import safe_fts_query as _safe_fts_query
 
@@ -464,6 +483,142 @@ def _body_excerpts(
     return out
 
 
+# ---------- holdings: split into items, pick the one the query points at ----
+# A holding is the court's own summary of what the case decided. It is shorter
+# than the judgment and closer to the words a query uses, and 81,488 cases
+# carry one (91.7% of the Supreme Court's). It is in no index — neither the
+# trigram FTS nor the morpheme table — so search cannot *find* by it, and the
+# same sentences are not in the body either (a holding's first 40 characters
+# appear in content_md 3% of the time). So the job here is not finding but
+# *choosing*: showing the holdings of results already retrieved lets the model
+# pick which case to dive into.
+#
+# Why not just truncate: holdings divide into `[1] … [2] …`, one legal
+# proposition per item. Cutting by character count halves a proposition, and
+# taking only the first item answers a different question than the one asked
+# 59% of the time (over 3,015 production cases the item matching the query
+# best was the first 40.7%, the second 39.3%, the third or later 17.1%).
+_HOLD_BR = re.compile(r"<br\s*/?>", re.I)
+# Three families of item label. Writing `[가-하]` would swallow most Hangul
+# syllables, so the letters are listed.
+_GANADA = "가나다라마바사아자차카타파하"
+_HOLD_HEAD = re.compile(r"^(?:\[\s*\d+\s*\]|[" + _GANADA + r"]\.|\d+\.)\s*\S")
+_HOLD_INLINE_BRACKET = re.compile(r"(?<!\S)\[\s*(\d+)\s*\]")
+
+
+def _inline_bracket_marks(text: str) -> list[int]:
+    """Offsets of `[1] … [2] …` item heads within one line. Empty unless there
+    are at least two and they run in order.
+
+    They must start at 1 and ascend. Holdings often refer to their own other
+    items ('[2] 위 [1]항의 소멸시효 …', 1,970 cases in the corpus), so cutting
+    wherever a number appears would split one item at the cross-reference.
+    `_inline_ganada` follows the same rule.
+    """
+    marks = [(m.start(), int(m.group(1))) for m in _HOLD_INLINE_BRACKET.finditer(text)]
+    if len(marks) < 2:
+        return []
+    if [num for _, num in marks] != list(range(1, len(marks) + 1)):
+        return []
+    return [pos for pos, _ in marks]
+
+
+def _inline_ganada(text: str) -> list[str]:
+    """Split '가. … 나. … 다. …' written on one line, the variant with no `<br/>`.
+
+    Only in the expected order, or the '다.' ending a sentence ('…하였다.')
+    reads as an item head. A head also has to follow a space, `)` or `]`:
+    some cases run them together, as in '(소극)다. …'.
+    """
+    starts: list[int] = []
+    at = 0
+    for ch in _GANADA:
+        pos = text.find(ch + ".", at)
+        while pos > 0 and text[pos - 1] not in " \t)]":   # not mid-word
+            pos = text.find(ch + ".", pos + 1)
+        if pos < 0:
+            break
+        starts.append(pos)
+        at = pos + 2
+    if len(starts) < 2:
+        return []
+    return _cut_at(text, starts)
+
+
+def _cut_at(text: str, starts: list[int]) -> list[str]:
+    """Cut at the given item heads, keeping whatever precedes the first one.
+
+    Constitutional Court holdings sometimes open with a preamble shared by
+    every item ('1. … 가. … 나. …'). Dropping it leaves the items with nothing
+    to say what they are about; an earlier cut that discarded it showed up as
+    three cases losing text in the full-corpus check.
+    """
+    head = text[:starts[0]].strip()
+    items = [text[a:b].strip() for a, b in zip(starts, starts[1:] + [len(text)])]
+    if head:
+        items[0] = head + " " + items[0]
+    return items
+
+
+def _holdings_items(text: str) -> list[str]:
+    """Holding text -> its items, in order. One item if it will not divide.
+
+    `<br/>` owns the boundary: 93% of the corpus has it, and it agrees with the
+    `[N]` count 99.3% of the time. The labels are used to *check*, not to cut —
+    a fragment that starts without one is a long item the source broke across
+    lines, so it rejoins the previous item rather than halving a proposition.
+
+    The labels cannot serve as keys either: there are three numbering families
+    (brackets, 가나다, digit-dot), and only the order is needed here.
+
+    Full-corpus check over 81,488 holdings: no text lost, no empty item. Of the
+    2.44% where the label count disagreed with the item count, 98.9% were
+    in-text self-references ('위 [1]항의 …') where the parser is right, leaving
+    22 real failures (0.03%).
+    """
+    flat = _HOLD_BR.sub("\n", text or "").replace("［", "[").replace("］", "]")
+    segs = [" ".join(seg.split()) for seg in flat.split("\n")]
+    segs = [seg for seg in segs if seg]
+    if not segs:
+        return []
+    if len(segs) == 1:
+        # A single fragment may still carry its labels inline. This branch has
+        # to come *before* the `_HOLD_HEAD` test: '가. … 나. …' starts on a
+        # label, so testing first would file it as "a document with labels"
+        # and fold the whole thing into one item.
+        marks = _inline_bracket_marks(segs[0])
+        if marks:
+            return _cut_at(segs[0], marks)
+        return _inline_ganada(segs[0]) or segs
+    if any(_HOLD_HEAD.match(seg) for seg in segs):
+        items: list[str] = []
+        for seg in segs:
+            if items and not _HOLD_HEAD.match(seg):
+                items[-1] += " " + seg      # same item, broken across lines
+            else:
+                items.append(seg)
+        return items
+    return segs
+
+
+def _pick_holding(text: str, terms: Sequence[str]) -> str:
+    """The item the query hits most, capped. First item on a tie or no hit.
+
+    Same rule the preview follows in `_excerpt_around`: this points at where
+    the query matched rather than judging what the case says. A trailing `…`
+    reports the cut.
+    """
+    items = _holdings_items(text)
+    if not items:
+        return ""
+    best = items[0]
+    if terms and len(items) > 1:
+        best = max(items, key=lambda it: sum(1 for t in terms if t in it))
+    if len(best) > HOLDING_MAX_CHARS:
+        best = best[:HOLDING_MAX_CHARS].rstrip() + "…"
+    return best
+
+
 def _dense_rank(
     conn: sqlite3.Connection,
     embed_client: Any,
@@ -554,6 +709,7 @@ def _hydrate(
         f"""
         SELECT id, case_number, case_name, court_name, court_level,
                COALESCE(decision_year, case_year) AS year, reference_statute,
+               COALESCE(holdings, '') AS holdings,
                COALESCE(
                    NULLIF(TRIM(generated_summary), ''),
                    NULLIF(TRIM(summary), ''),
@@ -588,6 +744,7 @@ def _hydrate(
                 "reference_statute": r["reference_statute"],
                 "_full_summary": full_summary,   # internal: rerank input + sentence source
                 "_full_summary_source": r["display_summary_source"],
+                "_holdings": r["holdings"],      # internal: `_pick_holding` selects an item
                 "preview": "",                   # filled by sentence-level rerank
             }
         )
@@ -756,9 +913,18 @@ def _set_preview(match: dict[str, Any], text: str, source: str) -> None:
     match["preview_provenance"] = source
 
 
+def _set_holding(match: dict[str, Any], terms: Sequence[str]) -> None:
+    """Attach the holding item the query points at. A case without one — most
+    trial-court judgments — gets no field at all."""
+    holding = _pick_holding(match.get("_holdings") or "", terms)
+    if holding:
+        match["holding"] = holding
+
+
 def _drop_preview_internals(match: dict[str, Any]) -> None:
     match.pop("_full_summary", None)
     match.pop("_full_summary_source", None)
+    match.pop("_holdings", None)
 
 def _format_response_md(resp: dict[str, Any]) -> str:
     """Response dict -> markdown-KV string."""
@@ -783,6 +949,12 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                 # Corpus text carries stray `<br/>`; strip it rather than
                 # pass HTML fragments to the caller.
                 block.append(f"  statute: {_strip_markup(m['reference_statute'])}")
+            if m.get("holding"):
+                # The court wrote this, so it carries no label of its own:
+                # whether it can be quoted is the tool docstring's business,
+                # and a trailing `…` reports a cut. A label line would cost
+                # its length once per result.
+                block.append(f"  holding: {m['holding']}")
             if m.get("preview"):
                 block.append(f"  preview: {m['preview']}")
                 source = m.get("preview_provenance") or "unknown"
@@ -808,8 +980,8 @@ def precedent_search(
 ) -> str:
     """판례 검색 — query 또는 case_number 중 하나는 필수이며, 사건번호 직접 조회 또는
     사실관계 키워드 검색을 수행합니다.
-    짧은 preview와 출처 종류를 반환합니다. 판결문 본문의 판단·법리가 필요하면 가장 관련된
-    결과의 id로 precedent_dive를 이어 호출해 확인합니다.
+    법원이 쓴 판시사항(holding)과 짧은 preview를 반환합니다. 판결문 본문의 판단·법리가
+    필요하면 가장 관련된 결과의 id로 precedent_dive를 이어 호출해 확인합니다.
 
     언제:
     - 유사 사실관계 판례(민사·형사·행정·가사)를 찾거나 주장·전망의 근거가 필요할 때 → query.
@@ -818,9 +990,14 @@ def precedent_search(
     - 판례가 적용한 조문의 본문·현행 여부는 statute_lookup 으로 이어 확인하세요 — 판례는
       선고 당시 조문을 적용하므로 지금 본문과 다를 수 있습니다.
 
-    응답: markdown-KV. `preview_kind: 원문 발췌`만 따옴표로 직접인용할 수 있고,
-    `(직접인용 불가)`가 붙은 요약은 바꿔 쓰세요. 답에 쓴 판례는 직접 인용이든 요약이든
-    반환 url을 링크로 함께 제시하세요.
+    응답: markdown-KV.
+    - `holding`은 법원이 쓴 판시사항(그 사건이 무엇을 정했는지)이라 직접인용할 수 있습니다.
+      쟁점이 여럿인 판례는 질의에 가장 가까운 항 하나만 나가며, 꼬리 `…`는 그 항이 길어
+      잘렸다는 뜻입니다(잘린 문장은 인용하지 말고 필요하면 precedent_dive로 확인하세요).
+      하급심 등 판시사항이 없는 판례는 이 칸이 아예 나오지 않습니다.
+    - `preview_kind: 원문 발췌`만 따옴표로 직접인용할 수 있고, `(직접인용 불가)`가 붙은
+      요약은 바꿔 쓰세요.
+    답에 쓴 판례는 직접 인용이든 요약이든 반환 url을 링크로 함께 제시하세요.
 
     Args:
       query: 사건번호를 뺀 사실관계·죄명·법조의 변별력 있는 명사 어간 여러 개. 2자 죄명도 지원.
@@ -884,12 +1061,16 @@ def precedent_search(
                     conn, [r["id"] for r in id_rows], court_level, year_from, year_to,
                     cap=LIMIT, court_name=court_name,
                 )
+                # A case-number lookup has no query terms to choose by, so
+                # the first item stands as the representative issue.
+                cno_terms = _preview_terms(query) if query else []
                 for m in matches:
                     _set_preview(
                         m,
                         m["_full_summary"][:PREVIEW_FALLBACK_CHARS].replace("\n", " "),
                         m["_full_summary_source"],
                     )
+                    _set_holding(m, cno_terms)
                     _drop_preview_internals(m)
                 if matches:
                     return _format_response_md({"status": "ok", "matches": matches})
@@ -944,8 +1125,9 @@ def precedent_search(
             # the window is excerpted from the body instead — otherwise the
             # preview shows the head of a summary and never the match.
             missed = [m["id"] for m in matches if m["id"] not in snips]
+            terms = _preview_terms(query)
             excerpts = (
-                _body_excerpts(conn, missed, _preview_terms(query), with_provenance=True)
+                _body_excerpts(conn, missed, terms, with_provenance=True)
                 if missed else {}
             )
             for m in matches:
@@ -956,6 +1138,7 @@ def precedent_search(
                     text = m["_full_summary"][:PREVIEW_FALLBACK_CHARS].replace("\n", " ")
                     source = m["_full_summary_source"]
                 _set_preview(m, text, source)
+                _set_holding(m, terms)
                 _drop_preview_internals(m)
             resp = {
                 "status": "ok",
@@ -1017,7 +1200,9 @@ def precedent_search(
                     m["_full_summary_source"],
                 )
 
+        dense_terms = _preview_terms(query)
         for m in matches:
+            _set_holding(m, dense_terms)
             _drop_preview_internals(m)
 
         return _format_response_md({

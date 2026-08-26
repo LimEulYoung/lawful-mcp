@@ -18,7 +18,8 @@ Three tiers:
      does), ``core`` ships every version's articles, ``all`` ships the lot.
   3. Precedents: a bounded selection (``--cases N``). Cases that carry the
      sentencing sample (``prec_defendants``) are preferred so
-     ``sentence_statistics`` stays meaningful, then recent decisions.
+     ``sentence_statistics`` stays meaningful, then cases carrying the
+     court's own issue summary (``holdings``), then recent decisions.
 
 Full-text indexes:
   - The trigram FTS tables are external-content FTS5: base rows are copied,
@@ -192,6 +193,13 @@ def main() -> None:
         help="share of --cases reserved for sentencing-sample cases (0..1)",
     )
     ap.add_argument(
+        "--holdings-share",
+        type=float,
+        default=0.05,
+        help="share of --cases reserved for cases carrying the court's own "
+        "issue summary (0..1)",
+    )
+    ap.add_argument(
         "--statutes",
         choices=["core-current", "core", "all"],
         default="core-current",
@@ -315,6 +323,31 @@ def main() -> None:
         (linked_cap,),
     )
     n_linked = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0]
+    # Cases carrying the court's own issue summary (``holdings``), which
+    # precedent_search prints for every result it returns. These need a quota
+    # of their own because neither other tier reaches them. Only the Supreme
+    # Court and the Constitutional Court publish a holding, and both are a
+    # thin slice of any recent window -- of the sampled decisions from the
+    # last few years that carry none, 126 are Constitutional Court and 69 are
+    # trial court against 9 Supreme Court -- so the recency tier below fills
+    # up before it reaches them. The sentencing tier is trial-court criminal
+    # judgments, which carry none at all. Without this quota the sample holds
+    # not one and the holding path never runs against real data.
+    #
+    # Ordered by the normalised year, not by ``decision_date``: judgments from
+    # the 1950s carry a Dangi-calendar date, and '4289-06-19' sorts above
+    # '2026-01-01' as a string, so ordering on the raw column fills the quota
+    # with the oldest cases in the corpus.
+    holdings_cap = int(args.cases * args.holdings_share)
+    dest.execute(
+        "INSERT OR IGNORE INTO pick "
+        "SELECT id FROM src.prec_cases "
+        "WHERE holdings IS NOT NULL AND TRIM(holdings) <> '' "
+        "  AND id NOT IN (SELECT id FROM pick) "
+        "ORDER BY decision_year DESC, decision_date DESC, id DESC LIMIT ?",
+        (holdings_cap,),
+    )
+    n_holdings = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0] - n_linked
     # Restrict the recency scan to the last few years so the indexed year
     # column narrows it; decision_date itself carries no index.
     recent_floor = time.localtime().tm_year - 4
@@ -323,11 +356,12 @@ def main() -> None:
         "SELECT id FROM src.prec_cases "
         "WHERE decision_year >= ? AND id NOT IN (SELECT id FROM pick) "
         "ORDER BY decision_date DESC, id DESC LIMIT ?",
-        (recent_floor, max(args.cases - n_linked, 0)),
+        (recent_floor, max(args.cases - n_linked - n_holdings, 0)),
     )
     log(
-        f"case selection: {n_linked} sentencing-linked + "
-        f"{dest.execute('SELECT COUNT(*) FROM pick').fetchone()[0] - n_linked} recent"
+        f"case selection: {n_linked} sentencing-linked + {n_holdings} with holdings + "
+        f"{dest.execute('SELECT COUNT(*) FROM pick').fetchone()[0] - n_linked - n_holdings}"
+        " recent"
     )
 
     copy_ddl(dest, "prec_cases")

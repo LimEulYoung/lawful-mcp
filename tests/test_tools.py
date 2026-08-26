@@ -46,6 +46,26 @@ def test_precedent_search_finds_two_syllable_charge(ctx):
     assert "id:" in out
 
 
+def test_precedent_search_shows_a_holding_from_the_sample(ctx):
+    """The court's own issue summary reaches the response.
+
+    The sample reserves a share of its cases for ones that carry a holding
+    (`scripts/build_sample_db.py`) precisely so this path runs against real
+    corpus text rather than only against constructed input.
+    """
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT case_number FROM prec_cases "
+            "WHERE COALESCE(TRIM(holdings), '') <> '' LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row, "the sample carries no holdings; rebuild it with --holdings-share"
+    out = tools.precedent_search(ctx, case_number=row[0])
+    assert "  holding: " in out, out
+
+
 def test_precedent_search_requires_an_argument(ctx):
     out = tools.precedent_search(ctx)
     assert "status" in out
