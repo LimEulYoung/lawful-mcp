@@ -56,6 +56,29 @@ def test_statute_lookup_by_name(ctx):
     assert "형법" in out
 
 
+def test_statute_lookup_prefers_the_law_the_query_names(ctx):
+    """Against the real corpus, not a constructed collision.
+
+    A short name sits inside a longer one, so '군형법 제92조' names both and the
+    answer is the longer. An official abbreviation counts as naming the law
+    too — the search used to miss those entirely, answering 「할부거래법」 with
+    「증권거래법」.
+    """
+    def first(query):
+        """Name of the top hit, out of `- <id> <name> (<kind>)`."""
+        for line in tools.statute_lookup(ctx, query=query).splitlines():
+            if line.startswith("- "):
+                return line[2:].split(" ", 1)[1].rsplit(" (", 1)[0]
+        return None
+
+    assert first("군형법 제92조") == "군형법"
+    assert first("형법 제347조 사기") == "형법"
+    assert first("신용정보법 신용카드 발급") == "신용정보의 이용 및 보호에 관한 법률"
+    # A coincidence across a word boundary is not the query naming a law:
+    # '손해배상 법률' contains 「상법」 by letters alone.
+    assert first("손해배상 법률 상담 절차") != "상법"
+
+
 def test_statute_lookup_article_text(ctx):
     """Quick-access ids in the tool description must resolve in the corpus."""
     out = tools.statute_lookup(ctx, statute_id=578, articles=["347"])

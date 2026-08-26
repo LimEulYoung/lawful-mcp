@@ -226,6 +226,78 @@ def _name_norm_sql(col: str) -> str:
     return expr
 
 
+_SPAN_MAX_TOKENS = 24     # morphemes considered, bounding the O(n^2) span set
+_SPAN_MAX_CHARS = 64      # the longest law name fits well inside this
+
+
+def _query_name_spans(query: str) -> list[str]:
+    """Substrings of the query that could be a law name: the runs that both
+    start and end on a morpheme boundary.
+
+    Character-level substrings will not do. `손해배상 법률 상담` contains 「상법」
+    by letters alone (손해배`상` + `법`률), and reading that coincidence as "the
+    query named this law" puts the commercial code on top of a damages
+    question — which is exactly what a first cut did. Runs that merely overlap
+    another token's start are still candidates: 「군형법 제92조」 offers both
+    '군형법' and '형법', and length comparison picks the longer.
+
+    Spaces and interpuncts are removed, the same shape `_name_norm_sql`
+    produces, so a span compares character for character against a normalised
+    name in SQL. With no analyser the normalised query is the only span, which
+    degrades to the exact matching this replaced.
+    """
+    raw = _strip_dots((query or "").strip())
+    # An everyday name resolved through the alias table stands in for the
+    # exact match. Values in that table keep their interpuncts
+    # (「총포ㆍ도검ㆍ…」), so strip them once more or the span will never equal
+    # the normalised name on the SQL side.
+    spans = {_strip_dots(_STATUTE_ALIASES.get(raw.replace(" ", ""), raw).replace(" ", ""))}
+    try:
+        toks = _kiwi().tokenize(raw)[:_SPAN_MAX_TOKENS]
+    except Exception:
+        toks = []
+    # raw already has its interpuncts gone, so dropping the spaces from a
+    # slice of it leaves the shape the SQL side produces.
+    for i, ti in enumerate(toks):
+        start = ti.start
+        for tj in toks[i:]:
+            end = tj.start + tj.len
+            seg = raw[start:end].replace(" ", "")
+            if 2 <= len(seg) <= _SPAN_MAX_CHARS:
+                spans.add(seg)
+            elif len(seg) > _SPAN_MAX_CHARS:
+                break
+    return [s for s in spans if s]
+
+
+def _name_in_query_sql(col: str, n_spans: int) -> str:
+    """The name's length when the query contains it whole, otherwise 0. The
+    parameters are the span list.
+
+    Exact matching alone (`name = query`) misses most real queries. They read
+    「law name + topic」, so a single trailing word switches it off, and the
+    only measure left is token coverage — under which an administrative rule
+    long enough to carry the topic words in its own name outranks the law the
+    query pointed at. Over fourteen days of traffic, 322 of the 1,768 searches
+    that named a law put an unrelated document first; the model then fetched
+    articles by that id, so the wrong law's text reached the answer.
+
+    Length is the score because a short name sits inside a longer one.
+    '군형법 제92조' contains '형법' and '군형법' both, the answer is the longer,
+    and comparing lengths makes that call. An exact match is this expression's
+    maximum — the whole query — so it needs no branch of its own.
+
+    Candidates come from `_query_name_spans` as morpheme-aligned runs and this
+    only tests membership. Opening it to character substrings (`instr`) lets
+    the coincidences back in.
+    """
+    n = _name_norm_sql(col)
+    if n_spans <= 0:
+        return "0"
+    holes = ",".join("?" for _ in range(n_spans))
+    return f"(CASE WHEN {n} IN ({holes}) THEN length({n}) ELSE 0 END)"
+
+
 def _statute_name_tokens(query: str) -> tuple[str, list[str]]:
     """Return (normalised query, noun tokens) for matching a law name.
 
@@ -556,6 +628,11 @@ def _search_statutes(
         cover_sql = " + ".join(f"({name_norm} LIKE ?)" for _ in like_terms)
         name_or = " OR ".join(f"{name_norm} LIKE ?" for _ in like_terms)
         like_params = [f"%{t}%" for t in like_terms]
+        # Length of whichever of the name or the official abbreviation the
+        # query contains whole (`_name_in_query_sql`).
+        spans = _query_name_spans(query)
+        name_in_q = _name_in_query_sql("s.name", len(spans))
+        short_in_q = _name_in_query_sql("COALESCE(s.short_name,'')", len(spans))
         sql = f"""
         WITH fts_hits AS (
           SELECT a.statute_id, COUNT(*) AS hits
@@ -564,30 +641,37 @@ def _search_statutes(
           WHERE st_articles_fts MATCH ?
           GROUP BY a.statute_id
         )
-        SELECT s.id, s.law_id, s.name, s.kind, s.issuing_agency,
+        SELECT s.id, s.law_id, s.name, s.short_name, s.kind, s.issuing_agency,
                s.effective_date, s.history_status, s.change_kind, s.mst,
                COALESCE(h.hits, 0) AS fts_hits,
                ({cover_sql}) AS name_cover,
-               (CASE WHEN {name_norm} = ? THEN 1 ELSE 0 END) AS exact_name
+               MAX({name_in_q}, {short_in_q}) AS name_in_query
         FROM st_statutes s
         LEFT JOIN fts_hits h ON h.statute_id = s.id
         """
         safe_q = safe_fts_query(query)
         fts_query_str = safe_q if _fts_query_ok(safe_q) else "x" * 1000
-        # A candidate matches on the name or in the text, not necessarily both.
-        where_parts.append(f"(({name_or}) OR h.hits > 0)")
+        # A candidate matches on the name, on an abbreviation the query
+        # contains, or in the text — not necessarily all three. The
+        # abbreviation needs its own clause because its characters need not
+        # appear in the full name at all ('상증세법' against 「상속세 및
+        # 증여세법」), so a token LIKE never reaches it.
+        where_parts.append(f"(({name_or}) OR {short_in_q} > 0 OR h.hits > 0)")
         sql += "WHERE " + " AND ".join(where_parts) + "\n"
-        # Rank by exact name, then how many query tokens the name covers,
-        # then name length, then text hits. Compound names rise through
-        # coverage; everyday names through the alias table and exact match.
+        # Rank by whether the query contains the name whole, longest first,
+        # then how many query tokens the name covers, then name length, then
+        # text hits. An exact match is the first key's maximum, so it has no
+        # column of its own (`_name_in_query_sql`).
         sql += """
-        ORDER BY exact_name DESC, name_cover DESC, length(s.name) ASC, fts_hits DESC
+        ORDER BY name_in_query DESC, name_cover DESC, length(s.name) ASC, fts_hits DESC
         LIMIT ?
         """
         # Parameter order follows the order they appear in the SQL:
-        #               fts MATCH, cover/exact (SELECT), name_or (WHERE), LIMIT
-        params_q = [fts_query_str, *like_params, normalized]
-        rows = conn.execute(sql, [*params_q, *params, *like_params, sql_limit]).fetchall()
+        #   fts MATCH, cover (SELECT), name_in_q (spans), short_in_q (spans),
+        #   name_or (WHERE), short_in_q (WHERE, spans), LIMIT
+        params_q = [fts_query_str, *like_params, *spans, *spans]
+        rows = conn.execute(
+            sql, [*params_q, *params, *like_params, *spans, sql_limit]).fetchall()
     else:
         sql = ("SELECT s.id, s.law_id, s.name, s.kind, s.issuing_agency, "
                "s.effective_date, s.history_status, s.change_kind, s.mst, "
@@ -634,6 +718,11 @@ def _search_statutes(
                 "statute_id": r["id"],
                 "law_id": r["law_id"],
                 "name": r["name"],
+                # The official abbreviation. Nothing in the response text uses
+                # it; the merge sort in `_merge_law_notice_matches` reads it,
+                # so a law the query named by abbreviation is not pushed back
+                # down after the two corpora are interleaved.
+                "short_name": (r["short_name"] if "short_name" in r.keys() else None),
                 "kind": r["kind"],
                 "agency": r["issuing_agency"],
                 "effective_date": r["effective_date"],
@@ -656,6 +745,7 @@ def _search_notices(
         # intervening 의 was enough to break it — so rank by how many of the
         # query's tokens the name contains.
         normalized, tokens = _statute_name_tokens(query)
+        spans = _query_name_spans(query)
         like_terms = tokens or [normalized]
         name_norm = _name_norm_sql("n.name")
         cover_sql = " + ".join(f"({name_norm} LIKE ?)" for _ in like_terms)
@@ -675,18 +765,20 @@ def _search_notices(
                n.effective_date, n.category,
                COALESCE(h.hits, 0) AS fts_hits,
                ({cover_sql}) AS name_cover,
-               (CASE WHEN {name_norm} = ? THEN 1 ELSE 0 END) AS exact_name
+               {_name_in_query_sql("n.name", len(spans))} AS name_in_query
         FROM st_notices n
         LEFT JOIN fts_hits h ON h.notice_id = n.id
         WHERE n.has_text_content = 1
           AND {_NOTICE_CURRENT}
           AND (({name_or}) OR h.hits > 0)
-        ORDER BY exact_name DESC, name_cover DESC, length(n.name) ASC, fts_hits DESC
+        ORDER BY name_in_query DESC, name_cover DESC, length(n.name) ASC, fts_hits DESC
         LIMIT ?
         """
+        # The same key as the statute search. If only one side knew about
+        # containment the merge would be comparing two different measures.
         rows = conn.execute(
             sql,
-            [fts_query_str, *like_params, normalized, *like_params, limit],
+            [fts_query_str, *like_params, *spans, *like_params, limit],
         ).fetchall()
     else:
         rows = conn.execute(
@@ -723,31 +815,58 @@ def _search_notices(
     return out
 
 
-def _name_cover_key(name: str, q_norm: str, tokens: list[str]):
+def _name_cover_key(name: str, q_norm: str, tokens: list[str], spans=()):
     """Name-relevance sort key, lower first, shared by laws and rules.
 
     Having one measure lets the two be interleaved on merit rather than by
-    giving each a fixed share of the results.
+    giving each a fixed share of the results. It has to be the *same* measure
+    `_search_statutes` sorts by — whether the query contains the name whole,
+    longest first, then token coverage. When the two drift apart the merge
+    undoes the search, and a rule with a long name buries the law the search
+    correctly raised, so the two move together in one change.
+
+    `spans` is what `_query_name_spans` produced for the SQL side. Imitating
+    it with character substrings here would readmit the coincidences that
+    cross word boundaries (「상법」 inside '손해배상 법률'). Interpuncts come out
+    here too, matching `_name_norm_sql`: stripping only spaces meant names
+    like 「초ㆍ중등교육법」 never took the containment branch at all.
     """
-    n = (name or "").replace(" ", "")
-    if q_norm and n == q_norm:
-        return (0, 0)                          # exact match sorts first
+    n = _strip_dots((name or "").replace(" ", ""))
+    if n and n in spans:
+        # An exact match is this branch's longest possible span — the whole
+        # query — so it needs no case of its own.
+        return (0, -len(n))
     if tokens:
         cover = sum(1 for t in tokens if t in n)
         return (1, len(tokens) - cover)        # fewer missing tokens sorts higher
     return (1, 0) if (q_norm and q_norm in n) else (2, 0)
 
 
-def _merge_law_notice_matches(matches, query, limit, name_of=None):
+def _merge_law_notice_matches(matches, query, limit, name_of=None, alt_name_of=None):
     """Interleave law and rule results by name relevance, with no fixed share.
 
     The sort is stable, so within one relevance tier the input order
     survives.
+
+    ``alt_name_of`` reads the official abbreviation. A law the query named
+    only by that (「신용정보법」 for 「신용정보의 이용 및 보호에 관한 법률」) is
+    scored on whichever of the two names does better, so the merge does not
+    push it back down. Rules have no abbreviation and yield an empty string,
+    leaving only the full-name key.
     """
     if name_of is None:
         name_of = lambda m: m.get("name", "")
+    if alt_name_of is None:
+        alt_name_of = lambda m: m.get("short_name") or ""
     normalized, tokens = _statute_name_tokens(query) if query else ("", [])
-    return sorted(matches, key=lambda m: _name_cover_key(name_of(m), normalized, tokens))[:limit]
+    spans = frozenset(_query_name_spans(query)) if query else frozenset()
+
+    def key(m):
+        best = _name_cover_key(name_of(m), normalized, tokens, spans)
+        alt = alt_name_of(m)
+        return min(best, _name_cover_key(alt, normalized, tokens, spans)) if alt else best
+
+    return sorted(matches, key=key)[:limit]
 
 
 # ---------- outline mode: a law's article titles ----------
