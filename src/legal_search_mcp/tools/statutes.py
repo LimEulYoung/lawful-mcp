@@ -536,6 +536,97 @@ def _current_version_ref(
     }
 
 
+def _backfilled_sids(conn: sqlite3.Connection, sids) -> set[int]:
+    """The statute ids in `st_backfill_log` — 738 superseded editions loaded
+    after the fact because judgments cite them. Empty when the table is absent,
+    as it is in the bundled sample.
+
+    This is a load record, not a repeal register, and using it as one is wrong.
+    The loader's premise was "repealed laws with no successor in force", on the
+    reasoning that a rename folds to its current edition and so never gets
+    backfilled — but `_fold_versions` folds only among rows the query matched,
+    and that candidate window is cut at `sql_limit`. A law matched under its
+    old name alone has no current row in the window to fold into, so it goes
+    out unfolded. Of the 738, **278 are renames whose successor is alive**:
+    원자력법 -> 원자력 진흥법, 상속세법 -> 상속세 및 증여세법, 주택건설촉진법 ->
+    주택법, 토지수용법 -> 공익사업을 위한 토지 등의 취득 및 보상에 관한 법률.
+    The repeal verdict belongs to `_repealed_sids`.
+    """
+    sids = [s for s in sids if s is not None]
+    if not sids:
+        return set()
+    try:
+        q = ("SELECT statute_id FROM st_backfill_log WHERE status='ok' "
+             "AND statute_id IN (%s)" % ",".join("?" * len(sids)))
+        return {r[0] for r in conn.execute(q, sids)}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _repealed_sids(conn: sqlite3.Connection, sids) -> set[int]:
+    """Repealed = in the backfill record *and* with no later edition in force.
+
+    Which is what the loader meant in the first place. A successor means the
+    law was not killed but renamed, and then "현행 아님, and here is the current
+    one" is the accurate thing to say rather than a repeal badge. Amendments
+    not yet in force do not count as successors — a pending amendment cannot
+    undo a repeal that already happened.
+    """
+    back = _backfilled_sids(conn, sids)
+    if not back:
+        return set()
+    ids = sorted(back)
+    q = ("SELECT s.id FROM st_statutes s WHERE s.id IN (%s) AND NOT EXISTS("
+         "SELECT 1 FROM st_statutes s2 WHERE s2.law_id = s.law_id "
+         "AND s2.effective_date > s.effective_date "
+         "AND COALESCE(s2.history_status,'') != '시행예정')" % ",".join("?" * len(ids)))
+    return {r[0] for r in conn.execute(q, ids)}
+
+
+def _current_refs(conn: sqlite3.Connection, rows) -> dict[int, dict[str, Any]]:
+    """Rows -> {statute_id: marker for the current edition}. A row that is
+    already current has no key.
+
+    Decided from *every* edition of the law_id, read in one query, not from
+    whichever editions the search happened to match. Compare within the
+    matched set — the grouping `_fold_versions` works on — and a law matched
+    only under its old name is alone in its group and so becomes "the current
+    one". That is the seat a superseded edition sat in at the top of a result
+    list. The whole-law read costs 0.1-0.4ms against a 72-120ms search.
+
+    Results are not swapped out here. Someone who searched by an old name and
+    is shown only the new one is no less confused; the choice stands and only
+    the marker is added.
+    """
+    lids = sorted({r["law_id"] for r in rows if r["law_id"]})
+    if not lids:
+        return {}
+    q = ("SELECT id, law_id, name, effective_date, history_status, change_kind, mst "
+         "FROM st_statutes WHERE law_id IN (%s)" % ",".join("?" * len(lids)))
+    by_law: dict[str, list] = {}
+    for r in conn.execute(q, lids):
+        by_law.setdefault(r["law_id"], []).append(r)
+    today = _today_iso()
+    picked: dict[str, Any] = {}
+    out: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        lid = r["law_id"]
+        if not lid:
+            continue
+        if lid not in picked:
+            picked[lid] = _pick_current_version(conn, by_law.get(lid, []), today)
+        cur = picked[lid]
+        if cur is None or cur["id"] == r["id"]:
+            continue
+        out[r["id"]] = {
+            "id": cur["id"],
+            "name": cur["name"],
+            "effective_date": cur["effective_date"],
+            "renamed": _norm_law_name(cur["name"]) != _norm_law_name(r["name"]),
+        }
+    return out
+
+
 def resolve_web_law_id(
     conn: sqlite3.Connection, law_id: str, as_of_iso: str,
 ) -> tuple[int, str] | None:
@@ -823,6 +914,11 @@ def _search_statutes(
         conn, [r["id"] for r in rows], fts_query_str,
         fts_table="st_articles_fts", art_table="st_articles", parent_col="statute_id",
     )
+    # Time-axis markers, computed here so the tool and the web read the same
+    # value. This used to live in the web wrapper alone, which is why a person
+    # saw the badge and a model did not.
+    cur_refs = _current_refs(conn, rows)
+    repealed = _repealed_sids(conn, [r["id"] for r in rows])
 
     out = []
     for r in rows:
@@ -863,6 +959,9 @@ def _search_statutes(
                 "history_status": r["history_status"] if "history_status" in r.keys() else None,
                 "change_kind": r["change_kind"] if "change_kind" in r.keys() else None,
                 "preview": preview,
+                # Is this row the law's current edition, and if not, what is.
+                "is_repealed": r["id"] in repealed,
+                "current": cur_refs.get(r["id"]),
             }
         )
     return out
@@ -1646,7 +1745,22 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             mid = _statute_ref(m) or m.get("statute_id") or m.get("id")
             kind = m.get("kind") or ""
             head = f"- {mid} {m.get('name','')}" + (f" ({kind})" if kind else "")
+            eff = _fmt_eff_iso(m.get("effective_date"))
+            if eff:
+                head += f" · {eff} 시행"
             lines.append(head)
+            # Whether this is a name still in use belongs in the list too.
+            # Without these two lines a model reads a name last current in
+            # 2000 as the law in force and builds an answer on top of it.
+            cur = m.get("current")
+            if cur:
+                ceff = _fmt_eff_iso(cur.get("effective_date"))
+                tail = (f"「{cur.get('name','')}」({ceff} 시행)" if cur.get("renamed")
+                        else f"{ceff} 시행본")
+                lines.append(f"  현행 아님 — 이 법의 현행은 {tail}, "
+                             f"statute_id={cur.get('id')}")
+            elif m.get("is_repealed"):
+                lines.append("  폐지된 법령 — 현행 후속본이 없습니다")
             url = _statute_web_url(m)
             if url:
                 lines.append(f"  url: {url}")

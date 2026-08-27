@@ -307,6 +307,19 @@ def main() -> None:
         "INSERT INTO main.st_notice_articles SELECT * FROM src.st_notice_articles "
         "WHERE notice_id IN (SELECT id FROM main.st_notices)"
     )
+    # The record of which superseded editions were loaded after the fact,
+    # narrowed to the laws in this sample. `statute_lookup` reads it to tell a
+    # repeal from a rename, and reads it fail-soft, so a sample built before
+    # this table existed still works — it just never labels anything repealed.
+    try:
+        copy_ddl(dest, "st_backfill_log")
+        dest.execute(
+            "INSERT INTO main.st_backfill_log SELECT * FROM src.st_backfill_log "
+            "WHERE statute_id IN (SELECT id FROM main.st_statutes)"
+        )
+        copy_indexes(dest, "st_backfill_log")
+    except SystemExit:
+        log("st_backfill_log: absent from source, skipped")
     for t in ("st_statutes", "st_articles", "st_notices", "st_notice_articles"):
         copy_indexes(dest, t)
     log(

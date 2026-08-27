@@ -201,6 +201,70 @@ def test_a_current_lookup_is_not_reported_as_a_dated_one(ctx):
     assert "시점 조회: 2015-06-01" in dated
 
 
+def test_search_marks_a_name_that_is_no_longer_current():
+    """A result list has to say which of its names are still in use.
+
+    The current-edition verdict reads every edition of the law, not just the
+    ones the query matched: a law matched under its old name alone would
+    otherwise be alone in its group and so count as current itself.
+    """
+    conn = open_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, law_id, name, effective_date FROM st_statutes "
+            "WHERE id IN (?, ?)", (RENAMED_OLD_ID, 737)).fetchall()
+        refs = statutes._current_refs(conn, rows)
+    finally:
+        conn.close()
+    assert 737 not in refs, "the current edition needs no marker"
+    ref = refs[RENAMED_OLD_ID]
+    assert ref["id"] == 737 and ref["renamed"] is True
+
+    md = statutes._format_response_md({
+        "status": "ok", "mode": "list",
+        "matches": [{"statute_id": RENAMED_OLD_ID, "law_id": "002044",
+                     "name": "청소년의 성보호에 관한 법률", "kind": "법률",
+                     "effective_date": "20080229", "current": ref,
+                     "is_repealed": False}],
+    })
+    assert "2008-02-29 시행" in md
+    assert "현행 아님" in md and "statute_id=737" in md
+    assert "폐지" not in md, "a rename must never be reported as a repeal"
+
+
+def test_a_rename_is_not_reported_as_a_repeal():
+    """`st_backfill_log` records superseded editions loaded after the fact, not
+    repeals: 278 of its 738 rows are renames whose successor is alive. A repeal
+    is a row in it with no later edition in force — a pending amendment is not
+    one. The sample carries no such table, so build one over it.
+    """
+    conn = open_db()
+    try:
+        conn.execute("CREATE TEMP TABLE st_backfill_log "
+                     "(statute_id INTEGER, status TEXT)")
+        conn.executemany("INSERT INTO st_backfill_log VALUES (?, 'ok')",
+                         [(RENAMED_OLD_ID,), (20276,)])
+        sids = [RENAMED_OLD_ID, 20276]
+        assert statutes._backfilled_sids(conn, sids) == {RENAMED_OLD_ID, 20276}
+        # 31554 has later editions in force; 20276's only successor is a
+        # 시행예정 row, which does not count.
+        assert statutes._repealed_sids(conn, sids) == {20276}
+    finally:
+        conn.close()
+
+
+def test_the_repeal_verdict_fails_soft_without_its_table():
+    """The bundled sample predates `st_backfill_log`, so search must still run
+    and simply label nothing repealed."""
+    conn = open_db()
+    try:
+        assert statutes._backfilled_sids(conn, [578, 584]) == set()
+        assert statutes._repealed_sids(conn, [578, 584]) == set()
+        assert statutes._search_statutes(conn, "형법", 3)
+    finally:
+        conn.close()
+
+
 def _a_rule_id(ctx) -> int:
     """An administrative rule that the search actually surfaces."""
     conn = open_db()
