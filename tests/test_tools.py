@@ -4,6 +4,7 @@ No network and no API keys: every test here runs on data/fixture.db alone.
 """
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +140,65 @@ def test_statute_lookup_article_text(ctx):
 def test_statute_lookup_outline_without_articles(ctx):
     out = tools.statute_lookup(ctx, statute_id=584)
     assert "민법" in out
+
+
+# --- one law, one name -------------------------------------------------------
+#
+# A law renamed by a wholesale amendment keeps its law_id, so the old-name row
+# and the current one are the same law. Asking by the old id used to get the
+# current name from an outline and the old name from a detail — while the
+# detail's body was current text. One id looked like two laws.
+RENAMED_OLD_ID = 31554        # 청소년의 성보호에 관한 법률 (2008)
+RENAMED_NOW = "아동ㆍ청소년의 성보호에 관한 법률"
+
+
+def _header_name(out: str) -> str:
+    """Law name out of '## statute: <name> (id=N) — ...'."""
+    for line in out.splitlines():
+        if line.startswith("## statute: "):
+            return line[len("## statute: "):].split(" (id=", 1)[0]
+    return ""
+
+
+def test_statute_lookup_answers_with_one_name_per_id(ctx):
+    outline = tools.statute_lookup(ctx, statute_id=RENAMED_OLD_ID)
+    detail = tools.statute_lookup(ctx, statute_id=RENAMED_OLD_ID, articles=["8"])
+    assert _header_name(outline) == _header_name(detail) == RENAMED_NOW
+    # And the name the caller asked under is answered for, not dropped.
+    for out in (outline, detail):
+        assert "옛 이름" in out
+        assert "청소년의 성보호에 관한 법률" in out
+
+
+def test_statute_outline_numbers_survive_a_round_trip(ctx):
+    """An outline may only print article numbers that can be asked for.
+
+    A branch is already inside `article_no` in some load generations, and
+    appending it again produced '16의2-2' — a number that does not exist, so
+    a model that read it back got a miss.
+    """
+    out = tools.statute_lookup(ctx, statute_id=32228)          # 형사소송법
+    numbers = [
+        line[2:].split(":", 1)[0]
+        for line in out.splitlines()
+        if line.startswith("- ") and ":" in line
+    ]
+    assert not [n for n in numbers if re.fullmatch(r"\d+의\d+-\d+", n)]
+    branched = [n for n in numbers if "의" in n]
+    assert branched, "fixture no longer carries a branch inside article_no"
+    back = tools.statute_lookup(ctx, statute_id=32228, articles=[branched[0]])
+    assert "## missing" not in back
+    assert "text_kind" in back
+
+
+def test_a_current_lookup_is_not_reported_as_a_dated_one(ctx):
+    """`offense_date` is filled in internally for current lookups too, so only
+    a date the caller actually passed may reach the response."""
+    current = tools.statute_lookup(ctx, statute_id=578, articles=["347"])
+    assert "시점 조회" not in current
+    dated = tools.statute_lookup(
+        ctx, statute_id=578, articles=["347"], offense_date="2015-06-01")
+    assert "시점 조회: 2015-06-01" in dated
 
 
 def _a_rule_id(ctx) -> int:

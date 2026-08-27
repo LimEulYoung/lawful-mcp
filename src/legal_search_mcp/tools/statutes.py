@@ -493,6 +493,49 @@ def _resolve_current_statute_id(
     return chosen['id'] if chosen else None
 
 
+def _fmt_eff_iso(eff: Any) -> str:
+    """'20260102' -> '2026-01-02'. For response fields a model reads as dates;
+    the web renders the same value the Korean way, to be read by a person."""
+    e = str(eff or "")
+    return f"{e[:4]}-{e[4:6]}-{e[6:8]}" if len(e) == 8 and e.isdigit() else e
+
+
+def _norm_law_name(s: Any) -> str:
+    """Normalise a law name for comparison, as `_name_norm_sql` does in SQL."""
+    return _strip_dots((s or "").replace(" ", ""))
+
+
+def _current_version_ref(
+    conn: sqlite3.Connection, law_id: str | None, sid: int, this_name: Any = None,
+) -> dict[str, Any] | None:
+    """A marker for the law's current version, when `sid` is not it; else None.
+
+    The test is `_pick_current_version` and nothing else. Splitting on
+    `history_status` gets it wrong in both directions: an older single-row
+    load is the current text while carrying a NULL status, and the newest
+    delta sometimes carries a '현행' label of its own.
+
+    `renamed` means the name changed, not that the law was repealed, and the
+    two must never share a badge. 「신기술사업금융지원에관한법률」 was never
+    repealed; it became 「기술보증기금법」 under the same law_id. An actual
+    repeal is what `change_kind` records.
+    """
+    if not law_id:
+        return None
+    cur_id = _resolve_current_statute_id(conn, law_id, _today_iso())
+    if cur_id is None or cur_id == sid:
+        return None
+    cur = _statute_meta(conn, cur_id)
+    if cur is None:
+        return None
+    return {
+        "id": cur["id"],
+        "name": cur["name"],
+        "effective_date": cur["effective_date"],
+        "renamed": _norm_law_name(cur["name"]) != _norm_law_name(this_name),
+    }
+
+
 def resolve_web_law_id(
     conn: sqlite3.Connection, law_id: str, as_of_iso: str,
 ) -> tuple[int, str] | None:
@@ -1013,7 +1056,7 @@ def _outline_statute(
                 'eff_date': r['article_eff_date'],
             })
         articles.sort(key=lambda a: (a['no_num'], a['branch'] or 0))
-        return {
+        out = {
             'mode': 'outline',
             'statute': {
                 'id': meta['id'], 'law_id': meta['law_id'],
@@ -1023,16 +1066,32 @@ def _outline_statute(
             'offense_date': offense_iso,
             'articles': articles,
         }
+        # A dated lookup keeps the name the law had then — that one is
+        # correct — and only notes what the current version is.
+        cur_ref = _current_version_ref(conn, law_id, meta['id'], meta.get('name'))
+        if cur_ref:
+            out['current_version'] = cur_ref
+        return out
 
     # Redirect to today's consolidated snapshot even when the caller passed
     # the id of an amendment row, so an outline is the whole law rather than
     # the handful of articles that amendment touched.
     as_of = _today_iso()
+    asked = None
     if meta.get('law_id'):
         cur_id = _resolve_current_statute_id(conn, meta['law_id'], as_of)
         if cur_id is not None and cur_id != sid:
+            cur_meta = _statute_meta(conn, cur_id)
+            if cur_meta:
+                # A redirect that changes the name loses the caller its own
+                # question. Carry the asked-for name so the response can say
+                # why a different one came back; `_detail_statute` is the
+                # other half of this.
+                if _norm_law_name(cur_meta["name"]) != _norm_law_name(meta["name"]):
+                    asked = {"name": meta["name"],
+                             "effective_date": meta["effective_date"]}
+                meta = cur_meta
             sid = cur_id
-            meta = _statute_meta(conn, sid) or meta
 
     # Filtering on a non-null title would empty out laws that have none:
     # the constitution numbers its articles without parenthesised titles, and
@@ -1081,23 +1140,29 @@ def _outline_statute(
     # miss, and gives up. They are short (under about 650 characters), so
     # return the text itself instead of an outline.
     if articles and not any((a["no_num"] or 0) > 0 for a in articles):
-        return {
+        out = {
             "mode": "detail",
             "statute": statute_kv,
             "articles": articles,
             "missing": [],
             "note": "제N조 구조가 없는 단일 본문 규정 — 아래가 본문 전문입니다.",
         }
+        if asked:
+            out["asked_name"] = asked
+        return out
 
     # Ordinary laws: outline is titles only, no article text.
     for a in articles:
         a.pop("text", None)
-    return {
+    out = {
         "mode": "outline",
         "as_of": as_of,
         "statute": statute_kv,
         "articles": articles,
     }
+    if asked:
+        out["asked_name"] = asked
+    return out
 
 
 _NOTICE_TITLE_RE = re.compile(r'^\s*제\s*\d+(?:-\d+)?\s*조(?:의\s*\d+)?\s*\(([^)]*)\)')
@@ -1175,14 +1240,13 @@ def _detail_statute(
     *,
     offense_date: str | None = None,
 ) -> dict[str, Any] | None:
-    """specs: [(num, None), (347, 2), ...]
-      - (num, None): article_no_num = num — 본조 + 모든 가지
-      - (num, branch): article_no_num = num AND article_branch = branch — 가지 콕 짚음
+    """Article text for the requested specs.
 
-    offense_date 지정 시 (M28 연혁 적재 활용):
-      - statute_id 의 law_id 추출
-      - 각 spec 의 *행위시점 이전 최후 변경* 조문 본문 응답
-      - 도구가 *시점 정확 본문* 보장. 변경분 적재 안 된 시점은 *이전 변경분* 사용
+    A spec is ``(number, branch)``: a branch of None means the article and
+    every branch under it, a branch given means that one alone. With a date,
+    each is answered from its last change in force by then — the version rows
+    hold amendments, so a date is resolved by walking back, not by reading
+    one row.
     """
     meta = _statute_meta(conn, sid)
     if meta is None:
@@ -1208,7 +1272,27 @@ def _detail_statute(
     law_id = meta.get('law_id')
     if law_id:
         as_of = offense_iso
+        asked = None
         if as_of is None:
+            # Serving the current body means serving the current name. This
+            # used to keep the requested row's metadata, so current text went
+            # out under a superseded name — while an outline of the same id
+            # redirected and answered with the current one. One statute_id
+            # appeared to hold two different laws, and a model reading that
+            # concluded the corpus was contaminated and abandoned it, in a
+            # production turn that then spent 636 seconds and 36 tool calls
+            # fetching from the government site. The article it needed was in
+            # the corpus the whole time. The asked-for name is not discarded:
+            # `asked_name` carries it so the response answers the question the
+            # discrepancy raises.
+            cur_id = _resolve_current_statute_id(conn, law_id, _today_iso())
+            if cur_id is not None and cur_id != sid:
+                cur_meta = _statute_meta(conn, cur_id)
+                if cur_meta:
+                    if _norm_law_name(cur_meta["name"]) != _norm_law_name(meta["name"]):
+                        asked = {"name": meta["name"],
+                                 "effective_date": meta["effective_date"]}
+                    meta = cur_meta
             cur = conn.execute(
                 "SELECT MAX(effective_date) AS d FROM st_statutes "
                 "WHERE law_id=? AND COALESCE(history_status,'') != '시행예정'",
@@ -1216,7 +1300,11 @@ def _detail_statute(
             ).fetchone()
             as_of = cur["d"] if cur and cur["d"] else None
         if as_of:
-            return _detail_statute_at_date(conn, meta, specs, as_of)
+            res = _detail_statute_at_date(conn, meta, specs, as_of,
+                                          asked_iso=offense_iso)
+            if asked:
+                res["asked_name"] = asked
+            return res
 
     # Fallback for a row with no law id, or when no date can be resolved.
     conditions: list[str] = []
@@ -1286,20 +1374,22 @@ def _detail_statute_at_date(
     meta: dict[str, Any],
     specs: list[tuple[int, int | None]],
     offense_iso: str,
+    *,
+    asked_iso: str | None = None,
 ) -> dict[str, Any]:
     """Article text as of a date, walking back to each article's last change.
 
     Handles an article and its branches alike.
+
+    `offense_iso` is filled in for a current lookup too — "current" means the
+    latest date in force, resolved by the same walk — so it cannot be used to
+    decide whether the caller asked about a date. That is what `asked_iso` is
+    for, and the response's `offense_date` carries only that. Conflate them
+    and every ordinary lookup reports itself as a dated one.
     """
     law_id = meta['law_id']
     # Check whether the law was repealed by then.
     repealed = _is_repealed_at(conn, law_id, offense_iso)
-    # Metadata from the latest version, for the time-axis display.
-    latest = conn.execute(
-        """SELECT effective_date, history_status FROM st_statutes
-           WHERE law_id=? ORDER BY effective_date DESC LIMIT 1""",
-        (law_id,),
-    ).fetchone()
 
     articles: list[dict] = []
     missing: list[str] = []
@@ -1338,10 +1428,11 @@ def _detail_statute_at_date(
             "name": meta["name"],
             "kind": meta["kind"],
         },
-        "offense_date": offense_iso,
         "articles": articles,
         "missing": missing,
     }
+    if asked_iso:
+        out["offense_date"] = asked_iso
     if repealed:
         out["repealed"] = {
             "effective_date": repealed['effective_date'],
@@ -1349,11 +1440,23 @@ def _detail_statute_at_date(
             "note": f"이 법령은 {repealed['effective_date']} {repealed['change_kind']}. "
                     f"행위시점 {offense_iso} 에는 유효였을 수 있음 (확인 필요)."
         }
-    if latest and latest['effective_date'] != articles[0]['eff_date'] if articles else False:
-        out["latest_version"] = {
-            "effective_date": latest['effective_date'],
-            "history_status": latest['history_status'],
-        }
+    # Where `latest_version` used to be. That one took the newest row even
+    # when it was a future amendment, and no renderer ever printed it, so it
+    # was computed and dropped.
+    cur_ref = _current_version_ref(conn, law_id, meta['id'], meta.get('name'))
+    if cur_ref is None and offense_iso and articles:
+        # A dated lookup walks each article separately, so the row can be the
+        # current one while the text served is not: 도로교통법 id=557 is the
+        # current row, and a 2019 lookup against it returns 2019 wording.
+        # Comparing rows alone misses that, and the response loses the line
+        # saying which date the text is from.
+        served = max((a.get("eff_date") or "") for a in articles)
+        cur_eff = str(meta.get("effective_date") or "")
+        if served and cur_eff and served != cur_eff:
+            cur_ref = {"id": meta["id"], "name": meta["name"],
+                       "effective_date": cur_eff, "renamed": False}
+    if cur_ref:
+        out["current_version"] = cur_ref
     return out
 
 
@@ -1463,8 +1566,18 @@ def _detail_notice(
 # ---------- markdown serialisation ----------
 
 def _fmt_article_no(no: Any, branch: Any) -> str:
-    """Display form of an article number, with its branch if it has one."""
-    return f"{no}-{branch}" if branch else f"{no}"
+    """Display form of an article number, with its branch if it has one.
+
+    `st_articles.article_no` already carries the branch in some load
+    generations. 도로교통법 제148조의2 is stored as no='148'/branch=2 on the
+    current row but as no='148의2'/branch=2 on the 2019 one. Appending
+    regardless produces '148의2-2', a number that does not exist: a model
+    prints it, or asks for it and gets a miss. 형사소송법 shows the same in a
+    plain outline ('16의2-2', '59의3-3'), so the outline-to-detail round trip
+    breaks there. When the branch is already in the number, leave it alone.
+    """
+    s = str(no)
+    return f"{s}-{branch}" if branch and "의" not in s else s
 
 
 def _statute_web_url(d: dict[str, Any]) -> str | None:
@@ -1558,6 +1671,37 @@ def _format_response_md(resp: dict[str, Any]) -> str:
         url = _statute_web_url(stt)
         if url:
             lines.append(f"- url: {url}")
+        # Three time-axis lines. The word "폐지" belongs to `repealed` alone:
+        # folding a rename into it makes a model read a live law as gone and
+        # reason from that instead.
+        asked = resp.get("asked_name")
+        if asked:
+            eff = _fmt_eff_iso(asked.get("effective_date"))
+            lines.append(
+                f"- 조회한 「{asked.get('name','')}」은 이 법의 옛 이름입니다"
+                + (f"({eff} 시행본)" if eff else "")
+                + " — 위 이름이 현행명이고 아래 본문도 현행입니다."
+            )
+        cv = resp.get("current_version")
+        tail = ""
+        if cv:
+            ceff = _fmt_eff_iso(cv.get("effective_date"))
+            tail = (f"「{cv.get('name','')}」({ceff} 시행)" if cv.get("renamed")
+                    else f"{ceff} 시행본")
+        od = resp.get("offense_date")
+        if od:
+            # A dated lookup has to say so in the header, or the caller gets
+            # superseded wording with nothing marking it as such — which is
+            # what happened while `offense_date` sat in the dict with no
+            # branch here to print it.
+            lines.append(f"- 시점 조회: {_fmt_eff_iso(od)} 기준 문언입니다"
+                         + (f" — 현행은 {tail}." if tail else "."))
+        elif cv:
+            lines.append(f"- 현행 아님 — 이 법의 현행은 {tail}, "
+                         f"statute_id={cv.get('id')} 입니다.")
+        rep = resp.get("repealed")
+        if rep and rep.get("note"):
+            lines.append(f"- 폐지: {rep['note']}")
 
     if resp.get("content_format"):
         lines.append(f"## content_format: {resp['content_format']}")
@@ -1584,6 +1728,11 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                 art_url = _statute_article_url(stt, a)
                 if art_url:
                     lines.append(f"- url: {art_url}")
+                if resp.get("offense_date") and a.get("eff_date"):
+                    # Articles of one law can take effect on different dates,
+                    # so a dated lookup marks each. Only there: on a current
+                    # lookup this line multiplies by the article count.
+                    lines.append(f"- 시행: {_fmt_eff_iso(a['eff_date'])}판")
                 if a.get("text"):
                     # One marker rather than two lines per article: a single
                     # lookup can carry dozens of articles, so per-line cost
