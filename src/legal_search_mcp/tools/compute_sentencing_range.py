@@ -64,8 +64,12 @@ def _b(x) -> str:
 
 def _rec_range_line(rec) -> str:
     """One-line recommended range; a None bound means that end is open.
-    *둘 다* None 이면 무경계(산출 불가) — 예: 사형·무기 전용 시점본에 leaf 적용 · leaf 범위
-    부적용. 이때 `?~?월` 누출(R 배터리 leak) 대신 명시. 단일 open bound 는 기존대로 '?'."""
+
+    Both bounds None means there is no range to state — a leaf that does not
+    apply, or a historical version offering only death or life. Say that,
+    rather than rendering '?~?월', which reads as a range whose numbers went
+    missing. A single open bound stays '?'.
+    """
     if rec.min_months is None and rec.max_months is None:
         note = " (사형·무기형)" if rec.has_life else ""
         return f"- 범위: 권고 형량범위 없음 (상·하한 미산출){note}"
@@ -120,11 +124,14 @@ def _normalize_charge(
     """Split a charge into a lookup key and its modifiers.
 
     Rules:
-      1. `charge_key()` 로 1차 정규화 (공백·dot 통일, 괄호 보존)
-      1-b. 선행 번호 딱지("[1]상해") 는 벗긴다 — 잔여가 있을 때만 (`_BRACKET_NUM_PREFIX_RE`).
-      2. suffix (미수/교사/방조) 가 *charge_key 마지막* 이고 parent (suffix 제거 형태)
-         가 매핑에 존재하면 → 분리 + modifier 설정.
-      3. 호출자가 명시한 modifier (is_attempted 등) 는 *override* — 자동 분리와 OR.
+      1. `charge_key()` normalises spacing and dots, keeping parentheses.
+      1-b. A leading bracketed number ('[1]상해') is stripped, but only when
+         something remains after it (`_BRACKET_NUM_PREFIX_RE`).
+      2. A suffix (미수 / 교사 / 방조) at the *end* of the charge key splits off
+         and sets a modifier — but only when the parent charge, the key without
+         it, is itself in the mapping.
+      3. A modifier the caller stated (is_attempted and friends) overrides: the
+         two are OR-ed, never replaced.
     """
     raw = _charge_key_normalize(charge or "")
     bracket_prefix = None
@@ -199,11 +206,14 @@ def _lookup_charge(
 ) -> LookupResult:
     """Look up a charge: exact first, then substring candidates on a miss.
 
-    Cross-cat (같은 charge_key, 다른 sg_category_id) 의 경우 sg_category_id 미지정
-    이면 *모든 cat row* 반환해 *호출자가 명시 선택* (auto-매칭 금지 원칙).
+    One charge key can exist under several sentencing categories. With no
+    category given, every matching row comes back for the caller to choose
+    between; the tool does not pick, because a wrong pick is invisible in the
+    answer.
 
-    sg_category_id 명시됐는데 그 cat 에 없으면 *다른 cat 에 exact* 있는지 별도
-    확인 — fuzzy substring 매칭과 *exact-but-wrong-cat* 을 구분 노출.
+    With a category given but no row under it, an exact match in a *different*
+    category is looked up separately, so "right charge, wrong category" is
+    reported as that rather than as a fuzzy substring guess.
     """
     if not key:
         return LookupResult(status="not_found")
@@ -261,9 +271,10 @@ def _lookup_charge(
 def _resolve_alias(conn: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row:
     """Follow an alias to its primary row when the alias carries no penalty.
 
-    882 row 중 일부 alias 는 stats 채워져 있고 (e.g. 공용서류손상→공용서류무효: imp 0~84
-    동일), 일부는 null (e.g. 폭력행위등처벌에관한법률위반(상습공갈) — primary 에 의존).
-    null 인 경우만 primary follow.
+    Of the 882 rows, some aliases carry their own figures — 공용서류손상 and
+    공용서류무효 hold the same 0-84 month range — and some are null, depending
+    on the primary instead (폭력행위등처벌에관한법률위반(상습공갈)). Only the
+    null ones follow through.
     """
     if not row["is_alias"] or row["alias_of"] is None:
         return row
@@ -307,11 +318,18 @@ _ART42_CAPS = {
 class EffectivePenalty:
     """The statutory range this tool reports, after resolution.
 
-    `source` 는 어떻게 결정됐는지 한 줄 설명 — 응답 trace 에 표시.
-    `trace` 는 resolution 과정 (가중 적용 / branch 선택 등) 의 다중행 설명.
-    `fine_formula` (M15) 는 식 기반 fine 정량 NULL row 의 *식 명세*. dict:
-      {"base_label": str, "low_mult": float, "high_mult": float, "is_optional": bool}
-    감경·가중 multiplier 가 정량 NULL 대신 *공식의 low/high_mult* 에 적용됨.
+    `source` is a one-line account of how the range was decided, shown in the
+    response trace; `trace` holds the multi-line version — which branch was
+    taken, which multipliers applied.
+
+    `fine_formula` describes a fine stated as a formula rather than an amount,
+    for rows whose numeric fine bounds are NULL::
+
+      {"base_label": str, "low_mult": float, "high_mult": float,
+       "is_optional": bool}
+
+    Mitigation and aggravation then apply to the formula's multipliers, there
+    being no amount to apply them to.
     """
 
     imp_min_months: int | None
@@ -372,9 +390,12 @@ def _penalty_from_row(row: sqlite3.Row, *, source: str = "direct") -> EffectiveP
 
 
 def _penalty_inline(p: EffectivePenalty) -> str:
-    """One-line summary for the trace. Unspecified bounds show as '?',
-    정량 없는 형종은 생략. M36: 준용/가중 trace 의 `fine {None:,}` 크래시 +
-    `imp None~None월` 누출 해소."""
+    """One-line summary for the trace.
+
+    Unspecified bounds show as '?', and a sentence kind with no figures at all
+    is left out rather than printed: it produced 'imp None~None월' in the
+    trace, and formatting a NULL fine crashed outright.
+    """
     parts: list[str] = []
     if p.imp_min_months is not None or p.imp_max_months is not None:
         lo = "?" if p.imp_min_months is None else f"{p.imp_min_months}"
@@ -394,15 +415,18 @@ def _penalty_inline(p: EffectivePenalty) -> str:
 def _penalty_from_branch(opt: dict, *, branch_key: str) -> EffectivePenalty:
     """Build a penalty from one branch option.
 
-    M14: opt 에 sentence_kind_options 가 명시되어 있으면 우선 채택. 정량 NULL 인 식 기반
-    fine 옵션 (특가법 §8의2 등 B 그룹) 이 *옵션 자체 제거* 되던 부정확 해소. 동시에 A 그룹
-    (일부 branch 가 imp only — 청소년성보호법 §7 ① 강간, 공직선거법 §230 ⑤ 등) 에서
-    fine 옵션이 *잘못 부여* 되던 union 보정 (구 M13) 부작용도 해소.
+    An option that names its own sentence kinds is taken at its word. Deriving
+    them from the figures instead went wrong in both directions. A fine stated
+    as a formula has NULL bounds, so the fine option was dropped from the
+    branch entirely; and a union across branches handed a fine option to
+    branches offering imprisonment alone (청소년성보호법 §7 ① 강간,
+    공직선거법 §230 ⑤).
 
-    M15: opt 에 fine_formula 가 있으면 EffectivePenalty 에 전파. branch 마다 fine 식이
-    다른 경우 (특가법 §6 등) 대비.
+    A branch's own `fine_formula` propagates to the penalty, since branches of
+    one provision can state different formulas.
 
-    명시 없는 경우 (legacy fallback): 정량 기반 자동 산정 — NULL = 옵션 없음 단순 룰.
+    With nothing named, the legacy path derives the kinds from the figures:
+    NULL means the option is not offered.
     """
     if "sentence_kind_options" in opt:
         kinds = list(opt["sentence_kind_options"])
@@ -434,9 +458,11 @@ def _apply_multiplier(
 ) -> EffectivePenalty:
     """Apply an aggravation or reference multiplier to the upper bound.
 
-    형법 §42 ② 가중 50년 cap. 무기·사형 flag 는 그대로 보존 (가중으로 추가 생성 X).
-    벌금 상한은 형법 §55 ④ "다액의 2분의 1" → multiplier 1.5 같은 형식. 본 함수는
-    multiplier 그대로 적용하고 라운딩은 정수 곱 (필요 시 ceiling).
+    형법 §42 ② caps an aggravated term at 50 years. Life and death flags carry
+    through untouched — aggravation never creates one. A fine ceiling
+    multiplier comes from wording like 형법 §55 ④ "다액의 2분의 1", which is a
+    1.5. The multiplier applies as given; rounding is integer multiplication,
+    with a ceiling where one is needed.
     """
     if multiplier == 1.0:
         return EffectivePenalty(
@@ -487,9 +513,10 @@ _REF_CHOICE_RE = re.compile(
 def _parse_statute_choice(choice: str, rows: list[sqlite3.Row]) -> sqlite3.Row | None:
     """Match the caller's chosen provision against the candidate rows.
 
-    `_parse_reference_choice` 와 같은 form ("형법§257", "폭력행위등처벌에관한법률§2③" 등).
-    `statute_name` 공백 정규화 + `article_no_num` + (optional) `article_branch` + (optional)
-    `paragraph` 매칭. 가장 specific 한 row 반환.
+    The same form `_parse_reference_choice` accepts ('형법§257',
+    '폭력행위등처벌에관한법률§2③'). Matching is on the space-normalised statute
+    name and the article number, then optionally the branch and the paragraph;
+    the most specific row wins.
     """
     if not choice or not rows:
         return None
@@ -526,7 +553,7 @@ def _parse_statute_choice(choice: str, rows: list[sqlite3.Row]) -> sqlite3.Row |
 
 
 def _format_statute_choice_form(row: sqlite3.Row) -> str:
-    """row → choice form ("형법§257", "폭력행위등처벌에관한법률§2③" 등) — 응답 노출용."""
+    """A row -> the choice form the response shows ('형법§257')."""
     name = (row["statute_name"] or "").replace(" ", "")
     art = row["article_no_num"]
     branch_str = f"의{row['article_branch']}" if row["article_branch"] else ""
@@ -537,10 +564,8 @@ def _format_statute_choice_form(row: sqlite3.Row) -> str:
 def _parse_reference_choice(choice: str, refs: list[dict]) -> dict | None:
     """Match the caller's chosen reference against the candidates.
 
-    매칭 규칙:
-      1. statute_name 정확 일치 (정규화 후) + article_no_num 일치 → 우선
-      2. + article_branch 일치 → 더 우선
-      3. + paragraph 일치 → 가장 우선
+    In order of precedence: the normalised statute name and the article number
+    must agree; a matching branch beats that; a matching paragraph beats both.
     """
     if not choice or not refs:
         return None
@@ -626,11 +651,14 @@ def _lookup_by_article(
 ) -> sqlite3.Row | None:
     """Resolve a reference to the row for the underlying offence.
 
-    UNIQUE 키 (statute_id, article_no_num, article_branch, paragraph) 매칭. paragraph 가
-    digit("1") vs circled("①") 형식 차이 있으면 양쪽 다 시도.
+    Matches the unique key (statute_id, article_no_num, article_branch,
+    paragraph). A paragraph written as a digit ('1') and as a circled numeral
+    ('①') are both tried, the two spellings coexisting in the data.
 
-    statute_name 은 *공백 정규화 후* 매칭 — 매핑 row 와 reference_articles 의 표기 차이
-    (예: "특정경제범죄가중처벌등에관한법률" vs "특정경제범죄 가중처벌 등에 관한 법률") 흡수.
+    The statute name matches after space normalisation, which absorbs the
+    difference between how a mapping row and a reference write the same act
+    ('특정경제범죄가중처벌등에관한법률' against '특정경제범죄 가중처벌 등에 관한
+    법률').
     """
     name = (ref.get("statute_name") or "").strip()
     art = ref.get("article_no_num")
@@ -678,9 +706,9 @@ def _resolve_payload(
 ) -> tuple[EffectivePenalty | None, PendingResolution | None]:
     """Resolve a row to a statutory range, or to the question blocking it.
 
-    Returns:
-      (penalty, None) — resolution 완료
-      (None, pending) — LLM 의 추가 인자 (branch_key / reference_choice) 필요
+    Returns ``(penalty, None)`` when resolution completed, or ``(None,
+    pending)`` when the caller must supply a branch_key or a reference_choice
+    first.
     """
     rm = row["reference_mode"]
 
@@ -986,23 +1014,25 @@ def _expand_implicit_modifications(
     """Fold implied adjustments into the list the caller supplied.
 
     Rules:
-      - is_attempted (미수, §25): "법률상_임의감경" — 단, statutory_modifications 에
-        이미 미수 항목 있으면 추가하지 않음. **applied=False (M37)**: §25 ② 는 *재량*
-        감경("감경할 수 있다") 이라 감경 적용 여부는 *판사·LLM 판단* (gold 영역, R2·
-        챕터 §4.1). 도구는 trace 에 *적용 가능* 으로만 노출하고 처단형 정량은
-        감경 전(기수) 기준 유지 — auto-halving 금지. 호출자가 applied=True 명시하면 적용.
-      - is_accessory (방조, §32): "법률상_필요감경" — §32 ② "감경한다" *필요적* 이라
-        applied=True 자동 적용이 정당. 호출자 명시 우선.
-      - is_solicitor (교사, §31 ①): 동일 처벌 — 감경 없음. trace 만.
-      - act_count >= 2: "경합범_가중" 동종 §37 전단 — L1 (동종 다행위). 호출자가
-        statutory_modifications 에 이미 경합범_가중 항목 있으면 추가하지 않음
-        (수동 명시 우선). applied=False 로 override 가능 (실무에 가끔 있는
-        §37 미적용 case).
+      - is_attempted (미수, §25) adds 법률상_임의감경, unless the caller already
+        listed one. It is added with **applied=False**: §25 ② reads "감경할 수
+        있다", so whether to mitigate is a judgment call and not the tool's.
+        The trace shows it as available while the figures stay at the
+        completed-offence range — no automatic halving. A caller stating
+        applied=True gets it applied.
+      - is_accessory (방조, §32) adds 법률상_필요감경 with applied=True. §32 ②
+        reads "감경한다", which is mandatory, so applying it is correct.
+      - is_solicitor (교사, §31 ①) carries the same punishment as the
+        principal: no adjustment, trace only.
+      - act_count >= 2 adds 경합범_가중 under §37, unless the caller listed one
+        already. applied=False overrides it, which practice occasionally calls
+        for. A 포괄일죄 — one continuous course of conduct — is act_count=1.
 
-    M27 시도 후 revert — auto_from_act_count 제거 시 LLM 이 prompt 의 aggravators
-    형식을 도구 schema 로 옮길 때 *kind 누락·statutes invalid 키* 사용 회귀
-    (case 41 3/3 retry 모두 schema 잘못). prompt↔도구 schema mismatch 영역 해소
-    전엔 자동 trigger 유지. 챕터 R2 룰 단서로 *포괄일죄 act_count=1* 패턴 명문화.
+    Deriving the concurrence adjustment from act_count is deliberate, and
+    removing it was tried and reverted: without it a model filled the tool's
+    schema in the prompt's aggravator format instead, omitting `kind` and
+    inventing `statutes` keys — all three retries of one case failed on the
+    schema. The automatic trigger stays until prompt and schema agree.
     """
     out = list(mods or [])
     has_attempt = any("미수" in (m.get("type", "") or "") for m in out)
@@ -1044,12 +1074,13 @@ def _apply_single_modification(
 ) -> tuple[ProcessedPenalty, str]:
     """Apply one adjustment, returning the new range and a trace line.
 
-    호출 전 `_MOD_MULT` 에 kind 존재 보장 (_apply_statutory_modifications 의
-    INVALID 가드).
+    The caller guarantees the kind exists in `_MOD_MULT`; the INVALID guard in
+    `_apply_statutory_modifications` is what does that.
 
-    M15: 정량 NULL + fine_formula 있는 경우 (특가법 §8의2 등 식 기반 fine), formula
-    의 low_mult/high_mult 에 multiplier 자동 적용 — 정량 산출은 안 함 (base 가
-    public input 아님), 식의 *배수* 만 변동 표기.
+    Where the fine is a formula rather than an amount, the multiplier applies
+    to the formula's low_mult and high_mult. No amount is computed — the base
+    a formula multiplies is not an input to this tool — so only the multipliers
+    move.
     """
     kind = mod.get("kind", "")
     type_label = mod.get("type", "")
@@ -1158,10 +1189,10 @@ def _apply_single_modification(
 def _format_fine_formula(formula: dict) -> str:
     """One-line rendering of a formula-based fine.
 
-    예: {"base_label": "부가세액", "low_mult": 2, "high_mult": 5}
-        → "부가세액의 2배 ~ 5배"
-        {"base_label": "이득액", "low_mult": 0, "high_mult": 1, "is_optional": True}
-        → "이득액 이하 (임의 병과)"
+    {"base_label": "부가세액", "low_mult": 2, "high_mult": 5}
+        -> "부가세액의 2배 ~ 5배"
+    {"base_label": "이득액", "low_mult": 0, "high_mult": 1, "is_optional": True}
+        -> "이득액 이하 (임의 병과)"
     """
     base = formula.get("base_label", "?")
     low = formula.get("low_mult")
@@ -1293,7 +1324,8 @@ def _convert_factors_to_applied(
 ) -> list[AppliedFactor]:
     """Turn the caller's factor lists into applied-factor records.
 
-    Input shape (chapter 09 §3.1):
+    Input shape::
+
       {
         "special_act_aggravators": ["text", ...],
         "special_act_mitigators":  [...],
@@ -1301,9 +1333,10 @@ def _convert_factors_to_applied(
         "special_actor_mitigators":  [...],
       }
 
-    text 는 LLM 입력 그대로 통과. verify 없음 — LLM 의 분류 정확도는 평가 단계의
-    gold label 비교로 측정 (chapter 09 §7 의 A1). 도구는 *dict key 가 의도한
-    (kind, direction)* 으로 카운트만 — text 내용은 trace 용.
+    The text passes through as the caller wrote it and is not verified: how
+    accurately a factor was classified is measured against gold labels in
+    evaluation, not here. This counts by the (kind, direction) the dict key
+    implies, and the text is for the trace.
     """
     if not guideline_factors:
         return []
@@ -1333,12 +1366,15 @@ def _extract_fine_paragraphs(
 ) -> list[str]:
     """Extract the paragraphs of the provision that mention a fine, verbatim.
 
-    M11: fine 정량이 NULL 인 row (특가법 §8의2 처럼 *식 기반* 정량 — 부가세 2~5배 등)
-    에서 LLM 에 *법정 범위* 를 결정론적으로 전달. paragraph split 룰은 한국 조문의
-    표준 표기 (① ② ③ ...). 추출 텍스트는 *st_articles 원문* — Phase 2 Gemini 가공이 아님.
+    Where a fine is a formula rather than an amount — 특가법 §8의2 sets it at
+    two to five times the tax evaded — the numeric bounds are NULL, and the
+    statutory range reaches the caller only as the provision's own words. The
+    split follows the standard paragraph marks (① ② ③). The text is the
+    article as loaded, not a summary of it.
 
-    배수 선택 (2~5배 중 어느 배수) 은 *판사 재량* (양형위 [조세범죄] 등 cat 에 fine 권고
-    미정의) — 도구는 *법정 범위* 만 전달, 위치 결정은 LLM/판사 정성 추론.
+    Which multiple within that range applies is a judgment call: the
+    guidelines define no fine recommendation for these categories. The tool
+    states the statutory range and stops there.
     """
     if statute_id is None:
         return []
@@ -1364,16 +1400,18 @@ def _extract_fine_paragraphs(
 def _get_statute_floor(processed: "ProcessedPenalty") -> int | None:
     """The processed minimum, which floors the guideline range.
 
-    양형위 §02: *"권고가 처단형을 벗어나면 처단형이 기준"* — floor 는 *처단형 floor*
-    이지 *법정형 floor* 가 아님. 즉 자수·미수·심신미약·작량감경 등 법정·작량 감경
-    적용 *후* 의 처단형 하한이 권고 영역의 절대 floor.
+    The guidelines say that where a recommendation falls outside the processed
+    range, the processed range governs. So the floor is the *processed*
+    minimum — after 자수, 미수, 심신미약, 작량감경 and the rest — not the
+    statutory one.
 
-    이전 (M6) — `charge_legal_map.stat_imp_min_months` (법정형 floor) 사용. 자수 적용
-    살인 case 에서 처단형 [30, 600] 인데 법정형 floor 60 강제 → 권고 raw [42, 144] 의
-    [42, 60) 부분이 사라지는 양형위 §02 위반 발견.
-    M7 — `processed.imp_min_months` (감경 적용 후 처단형) 사용.
+    Using the statutory floor was wrong in a measurable way. For a murder with
+    자수 the processed range is [30, 600] while the statutory floor is 60, and
+    forcing 60 deleted the [42, 60) part of a recommended [42, 144]: the very
+    outcome the rule above forbids.
 
-    처단형 imp 없는 (fine 전용 leaf) case 는 None — determine_range 가 보정 skip.
+    None where the processed range carries no term of imprisonment, a
+    fine-only leaf, which tells `determine_range` to skip the correction.
     """
     return processed.imp_min_months
 
@@ -1384,8 +1422,8 @@ def _intersect_with_processed(
 ) -> tuple[int | None, int | None]:
     """Where the processed and recommended ranges overlap: what may be imposed.
 
-    rec 가 None 이면 (processed.min, processed.max) 그대로.
-    rec.has_life 면 max=None (제한 없음) 으로 처리.
+    With no recommendation the processed range stands as it is, and a
+    recommendation carrying life is unbounded above.
     """
     if rec is None:
         return processed.imp_min_months, processed.imp_max_months
@@ -1475,15 +1513,19 @@ def _probation_recommendation(
 ) -> list[str]:
     """Suspension: eligibility, then the guideline rule over the factor groups.
 
-    `probation_factors` (chapter 09 §3.1):
+    `probation_factors`::
+
       {"major_positive": [...], "major_negative": [...],
        "general_positive": [...], "general_negative": [...]}
 
-    Eligibility 는 *실제 선고형* 기준:
-      - imp ≤ 36월              → 적용 가능 (§62 ①)
-      - fine ≤ 500만원         → 적용 가능 (§62 ① 2018.1.7+)
-      - imp+fine 병과 + 둘 다 cap 안 → §62 ② 일부/전부 집유 가능
-      - 무기·사형 옵션은 *처단형 노출* 이지 실제 선고형 아님 — 미반영.
+    Eligibility turns on the sentence actually imposed, not on the range:
+      - imprisonment of 36 months or less   -> available (§62 ①)
+      - a fine of 5,000,000 won or less     -> available (§62 ①, from
+        2018-01-07)
+      - both imposed, each within its cap   -> §62 ② allows suspending one or
+        both
+    Life and death appear in the processed range as options rather than as a
+    sentence imposed, and do not enter this.
     """
     lines: list[str] = []
 
@@ -1672,9 +1714,10 @@ def _list_leaves_for_category(
 ) -> list[sqlite3.Row]:
     """Guideline leaves available under this category.
 
-    leaf = `sg_subtypes` 중 `type_criterion IS NOT NULL` row. parent group 노드는
-    제외 (양형기준 trie 의 *말단* 만). chapter 09 §3.1 의 lookup stage 응답에
-    노출되어 LLM 이 *다음 호출* 에 `guideline_leaf_id` 인자를 채우는 enum.
+    A leaf is an `sg_subtypes` row with a non-null `type_criterion`; parent
+    group nodes are excluded, leaving the ends of the guideline tree. The
+    lookup stage returns these so the caller can fill `guideline_leaf_id` on
+    its next call.
     """
     return conn.execute(
         "SELECT id, section_no, name, type_criterion FROM sg_subtypes "
@@ -1700,11 +1743,12 @@ def _list_factors_for_category(
 ) -> list[sqlite3.Row]:
     """Factors available under this category.
 
-    leaf 별 attach 된 factor 를 카테고리 단위로 합집합. 같은 cat 안에서 leaf 별
-    factor 가 거의 동일 (유형 차이는 *type_criterion* 으로 분기, factor 는 공유).
+    The union of the factors attached to each leaf. Within one category the
+    leaves carry nearly the same factors: the type criterion is what
+    distinguishes them, while the factors are shared.
 
-    chapter 09 §3.1 의 lookup stage 응답에 노출되어 LLM 이 *다음 호출* 에
-    `guideline_factors` 인자 (특별만) + reasoning 의 일반인자 인용 enum.
+    The lookup stage returns these so the caller can fill `guideline_factors`
+    on its next call and cite the general factors in its reasoning.
     """
     return conn.execute(
         "SELECT DISTINCT scope, kind, direction, text FROM sg_factors "
@@ -1781,13 +1825,13 @@ def _list_probation_factors_for_category(
 ) -> list[sqlite3.Row]:
     """Suspension factors available under this category.
 
-    카테고리 단위 union. section_no (subtype 분할) + source_note (sub_label / 메타)
-    가 grouping 키 — 같은 cat 안에서 sub-section 마다 다른 4분면 사유 보존
-    (42 증권금융처럼 sub-section 별 표가 분리된 경우).
+    A union across the category, grouped by section number and source note.
+    That grouping keeps the separate four-quadrant tables some categories
+    publish per sub-section — 증권·금융 among them — from collapsing into one.
 
-    chapter 09 §3.1 의 lookup stage 응답에 노출되어 LLM 의 `probation_factors`
-    인자 (4 list: major_positive / major_negative / general_positive / general_negative)
-    채울 때 환각 차단 + sub-section 식별 단서.
+    The lookup stage returns these so the caller can fill the four
+    `probation_factors` lists without inventing entries, and can tell which
+    sub-section a factor came from.
     """
     return conn.execute(
         """
@@ -1886,10 +1930,12 @@ def _lookup_historic_article(
 ) -> dict | None:
     """Fetch the provision text as it stood at the offence date.
 
-    같은 law_id 의 *행위시점 이전의 최후 버전* 조문을 찾는다. M37(f) — 종전엔
-    `article_changed='Y'`(변경분) 만 봐 *한 번도 개정 안 된* 조문(baseline 스냅샷
-    changed=None 에만 존재)을 '미적재' 로 놓쳤다 (statute_lookup 과 동일 결함).
-    변경분 우선 + baseline fallback (동일 effective_date 면 'Y' 우선).
+    The last version of the article before that date, within the same law_id.
+    Looking only at rows marked as changed misses an article that was never
+    amended — it exists solely in the baseline snapshot, where the changed flag
+    is NULL — and reports it as not loaded. Changed rows are preferred with the
+    baseline as fallback, and a changed row wins a tie on effective date.
+    `statute_lookup` had the same defect.
     """
     statute_id = payload_row['statute_id'] if 'statute_id' in payload_row.keys() else None
     if not statute_id:
@@ -1940,17 +1986,21 @@ def _apply_art42_versioned_cap(
 ) -> str | None:
     """Correct a ceiling for the version of the general part then in force.
 
-    clm_versions 시점본 정량은 *본조 시행일* 기준 §42 cap 을 박아둔다 (build_clm_
-    versions prompt line 185). 그러나 §42 ① 상한 자체가 2010.10.16 에 15→30년 으로
-    바뀌었고, 이는 *본조와 무관한 총칙 개정* 이라 본조가 그 이전 시행본에 멈춰 있으면
-    시점본에 전파되지 않는다 (예: 살인 §250 은 1996 이후 불변 → 시점본 max=180 고정).
-    → 도구가 행위시점 §42 cap 으로 재보정.
+    A historical row bakes in the §42 cap as of *the article's own* effective
+    date. But the §42 ① ceiling itself rose from 15 to 30 years on 2010-10-16,
+    and that is an amendment to the general part, unrelated to the article: an
+    article unchanged since before then keeps the old cap in every historical
+    row. 살인 §250 has not changed since 1996, so its rows all hold max=180.
+    The tool re-applies the cap in force at the offence date.
 
-    *상한 개방형* ("X년 이상의 징역" — 본조 상한 미명시) 판별 = 현행 charge_legal_map
-    상한 (current_max) 이 현행 §42 cap (360 단독 / 600 가중) 인 row. 본조가 상한을
-    직접 박은 row (예: "15년 이하" = 180) 는 current_max ∉ {360,600} 이라 건드리지
-    않는다 → 오탐 0. (누범·경합 가중 후 cap = _AGGRAVATED_IMP_CAP_MONTHS 는 별개 —
-    그 시점 의존성은 미해결 사각지대, §3 참조.)
+    An open-ended ceiling — "X년 이상의 징역", the article naming no upper bound
+    — is recognised by the current row's ceiling being exactly the current §42
+    cap (360 alone, 600 aggravated). An article stating its own ceiling
+    ("15년 이하" = 180) matches neither value and is left alone, which makes a
+    false positive impossible.
+
+    The aggravated cap after 누범 or 경합 (`_AGGRAVATED_IMP_CAP_MONTHS`) is a
+    separate constant, and its own dependence on the date is not handled here.
     """
     ver_max = payload.get("stat_imp_max_months")
     if ver_max is None or current_max not in _ART42_CAPS:
@@ -1977,12 +2027,13 @@ def _apply_art42_versioned_cap(
 def _clmv_version_is_empty(v: sqlite3.Row) -> bool:
     """Is this historical row empty of any penalty information?
 
-    빈 행으로 base 정량을 override 하면 법정형이 통째로 NULL 로 덮여 '?~?' 빈 범위가
-    나간다 (철학 B 위반: 나쁜 DB 행이 로직을 조용히 깨뜨림). True 면 _get_versioned_
-    payload 가 override 를 건너뛰고 현행 base 정량을 유지한다.
+    Overlaying an empty row on the current one blanks the statutory range and
+    sends out an empty '?~?' — a bad row quietly breaking the logic. True makes
+    `_get_versioned_payload` skip the overlay and keep the current figures.
 
-    *직접 정량·분기·참조·식(formula) 어느 것도 없을 때만* 퇴화로 본다 — 참조전용·
-    분기전용 시점본(직접 정량 NULL 이 정상)은 override 대상으로 보존.
+    Only a row with no direct figures, no branches, no references and no
+    formula counts as empty. A reference-only or branch-only row has NULL
+    figures legitimately and is still overlaid.
     """
     try:
         kinds = json.loads(v["sentence_kind_options"] or "[]")
@@ -2012,11 +2063,13 @@ def _get_versioned_payload(
     conn: sqlite3.Connection, base_row: sqlite3.Row, offense_iso: str | None,
 ) -> tuple[dict, dict | None, str | None]:
     """Overlay historical bounds onto the current row for a given date.
-    정량 필드 override. 매치 없으면 base_row 그대로.
 
-    return: (payload_dict, version_meta|None, art42_trace|None)
-      version_meta = {effective_date, matched_paragraph, match_confidence, mst}
-      art42_trace  = §42① 상한 시점보정 trace 줄 (보정 발생 시만, M33)
+    Overrides the numeric fields; with no match the base row stands.
+
+    Returns (payload_dict, version_meta | None, art42_trace | None), where
+    version_meta is {effective_date, matched_paragraph, match_confidence, mst}
+    and art42_trace is the line describing a ceiling correction, present only
+    when one happened.
     """
     base_dict = dict(base_row)
     if not offense_iso:
@@ -2073,9 +2126,10 @@ def _historic_appendix(
 ) -> str:
     """Provision text, appended to every stage response after an exact match.
 
-    형법 §1 ① "범죄의 성립과 처벌은 행위시의 법률에 의한다" 원칙.
-    도구 정량은 *현행* charge_legal_map 기준이라 LLM 이 행위시 본문 보고
-    *시점별 본조 분기·법정형 차이* 정확 인식 가능.
+    형법 §1 ①: an offence and its punishment are governed by the law in force
+    when it was committed. This tool's figures come from the current mapping,
+    so the caller needs the text as it then stood to see a branch or a
+    statutory range that has since changed.
     """
     offense_iso = to_iso_date(offense_date)
     if not offense_iso:
@@ -2101,9 +2155,10 @@ def _historic_appendix(
 def _manual_source(conn: sqlite3.Connection, sg_category_id: int) -> tuple[str, str] | None:
     """Link to the published guideline commentary for this offence group.
 
-    값은 scripts/build_sg_manuals.py 가 적재. 컬럼이 없거나 값이 비면 None — 링크 생략이
-    if 분기가 아니라 데이터 유무로 결정되도록 OperationalError 를 흡수한다(미적재 환경에서도
-    도구는 정상 동작).
+    A separate loader populates the column. An absent column or an empty value
+    means None and the link is simply omitted: swallowing OperationalError
+    makes that a question of whether the data is there rather than a branch, so
+    the tool works the same in an installation that never loaded it.
     """
     try:
         r = conn.execute(
@@ -2127,16 +2182,17 @@ def _format_lookup_response(
     """The lookup stage, once the provision has resolved.
 
     Args:
-      conn: leaf 후보 enum fetch 용.
-      row: 원래 lookup hit row (alias 분기 trace 용).
-      payload_row: alias 해소 후 metadata 소스 (본조, sg_category_id).
-      penalty: resolve 후 최종 법정형.
+      conn: for fetching the leaf enum.
+      row: the original lookup hit, for the alias trace.
+      payload_row: metadata source after the alias resolved (the article, the
+        sg_category_id).
+      penalty: the statutory range finally resolved.
 
-    `notes` / `penalty_notes` DB 컬럼은 *Opus 자연어 요약* 이라 도구가 아예 적재
-    (`_SELECT_ROW`)하지 않는다 — "응답 노출 금지" 원칙을 *구조적으로* 보장 (자유 prose
-    를 기능 출력으로 piggyback 하지 않음). 본 도구는 *정량* (선고형 범위) 만 책임.
-    절차·부가처분 정보 (반의사불벌, 병과, 몰수, 신상등록 등) 가 필요하면 호출자가
-    `statute_lookup` 으로 본조 원문을 조회.
+    The `notes` and `penalty_notes` columns hold LLM-written prose, and this
+    tool does not load them at all (`_SELECT_ROW`), which enforces "never
+    surface them" structurally rather than by remembering to. This tool answers
+    for the figures. Procedural matter — 반의사불벌, 병과, 몰수, 신상등록 — is in
+    the provision itself, which `statute_lookup` returns.
     """
     lines = _format_stage_header(norm, row, payload_row, "lookup")
 
@@ -2482,13 +2538,18 @@ def _penalty_brief(r: sqlite3.Row) -> str:
 
 
 def _candidate_line(r: sqlite3.Row, with_cat: bool = False) -> str:
-    """One candidate line: provision, penalty, conduct described, and how to choose it.
+    """One candidate line: provision, penalty, conduct described, and how to
+    choose it.
 
-    `act_descriptor` 는 *substrate 파생* 행위 라벨(st_articles 호 본문/참조 조문 제목에서 도출,
-    `migrate_act_descriptor.py`). md_source 가 조문 인용뿐인 행(약물류 등)의 *행위축* 항해를
-    위해 노출 — 같은 조항군에서 수출입↔매매↔소지↔사용 구별. 없으면 무노출.
-    `notes`(Opus 자유 prose)는 도구가 적재조차 안 함(`_format_lookup_response` 원칙) — 행위
-    보강은 자유 prose 가 아닌 검증된 substrate 필드로만."""
+    `act_descriptor` is a conduct label derived from the corpus — from the text
+    of the article's items and the titles of the provisions it references. It
+    is shown so that a family of provisions cited by article number alone, as
+    drug offences tend to be, can still be navigated by what the conduct was:
+    수출입 against 매매 against 소지 against 사용. Absent, it is omitted. The
+    `notes` column, being free prose, is not loaded at all, for the reason
+    `_format_lookup_response` gives — conduct is described from verified fields
+    or not at all.
+    """
     cat = f"sg_category_id={r['sg_category_id']}  " if with_cat else ""
     act = (r["act_descriptor"] or "").strip()
     act_str = f"  행위={act}" if act else ""
@@ -2517,10 +2578,12 @@ def _format_cross_cat_response(
 def _format_same_cat_multi_row_response(
     norm: NormalizedCharge, rows: list[sqlite3.Row]
 ) -> str:
-    """Several provisions within one category: which provision, not which category.
+    """Several provisions within one category: which provision, not which
+    category.
 
-    예: `상해` 가 형법 §257 ① + 폭처법 §2 ③ (누범상해) 둘 다 같은 sg_cat=46 폭력범죄.
-    LLM 이 facts 의 *행위 형태 / 전과* 보고 적절한 statute_choice 명시.
+    상해 falls under 형법 §257 ① and 폭처법 §2 ③ (누범상해) alike, both in the
+    same violent-offence category. The caller states which, having read the
+    facts for the form the conduct took and whether there is a prior record.
     """
     cat = rows[0]["sg_category_id"]
     lines = [
