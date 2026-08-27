@@ -593,6 +593,85 @@ def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | No
     return dict(r) if r else None
 
 
+# ---------- article previews for the list mode ----------
+#
+# The line under a search hit is what tells a reader which law this is. It used
+# to be article 1 unconditionally, but a purpose clause reads "…을 목적으로 한다"
+# in every act: it says nothing about the query and nothing that separates
+# 「신용정보법」 from 「신용카드업법」. When the query matched the body, show *the
+# article it matched* — the rule the precedent search already follows for
+# holdings, which is choosing among rows already retrieved rather than finding
+# new ones.
+#
+# The cut is at the head of the article, not at the match. By corpus convention
+# `article_text` opens with '제10조의4(권리금 회수기회 보호 등) ① …', so keeping
+# the head keeps the one thing worth showing: which article this was. An
+# excerpt centred on the match loses that.
+SEARCH_PREVIEW_MAX_CHARS = 200
+
+
+def _clip_preview(text: str | None) -> str:
+    """An article body -> one line, with a trailing … when it was cut."""
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(t) > SEARCH_PREVIEW_MAX_CHARS:
+        return t[:SEARCH_PREVIEW_MAX_CHARS].rstrip() + "…"
+    return t
+
+
+def _matched_article_previews(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    fts_query: str | None,
+    *,
+    fts_table: str,
+    art_table: str,
+    parent_col: str,
+) -> dict[int, str]:
+    """{parent id: head of the article the query matched best}. A law the query
+    only named, without matching its text, has no key here.
+
+    One query however many results there are. The shape this replaced ran one
+    or two per result, so twenty hits meant up to forty round trips. The window
+    passes article *ids* only and the body is read from the winning row with
+    ``substr``, so a common token matching hundreds of articles within one law
+    does not drag their text along with it.
+
+    A miss is not reopened with an OR over the query's tokens. That was tried
+    and rejected: 「상가건물 임대차보호법 권리금」 does improve to article 10-4,
+    but 「개인정보 보호법 주민등록번호」 then answers with article 25, on video
+    surveillance, because bm25 rewards common tokens like '정보' and '처리'.
+    The index is trigram besides, so two-syllable tokens ('청약', '해고') never
+    match at all and the very shapes the OR was meant to rescue stayed misses.
+    An article shown here reads as "this is the provision you asked about", so
+    a confident wrong one is worse than a purpose clause that merely fails to
+    inform. Reviving it needs an index that can see two-syllable tokens first.
+    """
+    if not ids or not fts_query:
+        return {}
+    ph = ",".join("?" * len(ids))
+    try:
+        rows = conn.execute(
+            f"""
+            WITH best AS (
+              SELECT a.{parent_col} AS pid, a.id AS aid,
+                     ROW_NUMBER() OVER (PARTITION BY a.{parent_col}
+                                        ORDER BY bm25({fts_table})) AS rn
+              FROM {fts_table} f JOIN {art_table} a ON a.id = f.rowid
+              WHERE {fts_table} MATCH ? AND a.{parent_col} IN ({ph})
+            )
+            SELECT b.pid, substr(x.article_text, 1, ?) AS t
+            FROM best b JOIN {art_table} x ON x.id = b.aid
+            WHERE b.rn = 1
+            """,
+            (fts_query, *ids, SEARCH_PREVIEW_MAX_CHARS * 2),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Malformed FTS query, or no index built. The preview is optional, so
+        # fail open and let the caller fall back to the first article.
+        return {}
+    return {r["pid"]: _clip_preview(r["t"]) for r in rows if (r["t"] or "").strip()}
+
+
 # ---------- list mode: search for laws ----------
 
 def _search_statutes(
@@ -613,6 +692,7 @@ def _search_statutes(
     # No kind filter — a `kind` argument used to add a clause here.
     where_parts = []
     params: list[Any] = []
+    fts_query_str: str | None = None   # the preview below reads it again
 
     # Oversample so folding versions still leaves enough distinct laws.
     sql_limit = max(limit * 8, 80)
@@ -692,27 +772,38 @@ def _search_statutes(
         rows = [r for r in rows if not _is_repealed_as_of(conn, r['law_id'], today)]
     rows = rows[:limit]
 
+    # A law whose text the query matched previews *that* article; one the query
+    # only named previews article 1. The matched side arrives in a single query
+    # and only the leftovers fall back to a per-row lookup, which is an index
+    # hit limited to one row and covers few results in practice.
+    matched = _matched_article_previews(
+        conn, [r["id"] for r in rows], fts_query_str,
+        fts_table="st_articles_fts", art_table="st_articles", parent_col="statute_id",
+    )
+
     out = []
     for r in rows:
-        prev = conn.execute(
-            """
-            SELECT article_text FROM st_articles
-            WHERE statute_id=? AND article_no_num=1
-              AND title IS NOT NULL
-            ORDER BY article_branch NULLS FIRST LIMIT 1
-            """,
-            (r["id"],),
-        ).fetchone()
-        if prev is None:
+        preview = matched.get(r["id"], "")
+        if not preview:
             prev = conn.execute(
                 """
                 SELECT article_text FROM st_articles
-                WHERE statute_id=? AND length(article_text) > 30
-                ORDER BY article_no_num, article_branch LIMIT 1
+                WHERE statute_id=? AND article_no_num=1
+                  AND title IS NOT NULL
+                ORDER BY article_branch NULLS FIRST LIMIT 1
                 """,
                 (r["id"],),
             ).fetchone()
-        preview = (prev["article_text"][:200] if prev else "").replace("\n", " ")
+            if prev is None:
+                prev = conn.execute(
+                    """
+                    SELECT article_text FROM st_articles
+                    WHERE statute_id=? AND length(article_text) > 30
+                    ORDER BY article_no_num, article_branch LIMIT 1
+                    """,
+                    (r["id"],),
+                ).fetchone()
+            preview = _clip_preview(prev["article_text"] if prev else "")
         out.append(
             {
                 "statute_id": r["id"],
@@ -739,6 +830,7 @@ def _search_notices(
     query: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
+    fts_query_str: str | None = None   # the preview below reads it again
     if query:
         # Same token-coverage ranking as the statute search. Names carry
         # particles and spacing that a substring match cannot survive — one
@@ -793,13 +885,23 @@ def _search_notices(
             (limit,),
         ).fetchall()
 
+    # Same rule as the laws: the matched article first, else the opening one.
+    matched = _matched_article_previews(
+        conn, [r["id"] for r in rows], fts_query_str,
+        fts_table="st_notice_articles_fts", art_table="st_notice_articles",
+        parent_col="notice_id",
+    )
+
     out = []
     for r in rows:
-        prev = conn.execute(
-            "SELECT article_text FROM st_notice_articles WHERE notice_id=? ORDER BY article_seq LIMIT 1",
-            (r["id"],),
-        ).fetchone()
-        preview = (prev["article_text"][:200] if prev else "").replace("\n", " ")
+        preview = matched.get(r["id"], "")
+        if not preview:
+            prev = conn.execute(
+                "SELECT article_text FROM st_notice_articles WHERE notice_id=?"
+                " ORDER BY article_seq LIMIT 1",
+                (r["id"],),
+            ).fetchone()
+            preview = _clip_preview(prev["article_text"] if prev else "")
         out.append(
             {
                 "statute_id": r["id"],

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from legal_search_mcp import tools
+from legal_search_mcp.tools import statutes
 from legal_search_mcp.config import corpus_db_path
 from legal_search_mcp.deps import build_deps, open_db
 
@@ -97,6 +98,35 @@ def test_statute_lookup_prefers_the_law_the_query_names(ctx):
     # A coincidence across a word boundary is not the query naming a law:
     # '손해배상 법률' contains 「상법」 by letters alone.
     assert first("손해배상 법률 상담 절차") != "상법"
+
+
+def test_statute_search_previews_the_article_the_query_matched(ctx):
+    """The preview is a choice among the law's articles, not a fixed one.
+
+    Article 1 states a purpose in every act, so it neither answers the query
+    nor tells two laws apart. The field has no consumer in this build — the
+    response markdown does not print it — but production renders it, and the
+    contract is shared.
+    """
+    conn = open_db()
+    try:
+        by_name = {
+            m["name"]: m["preview"]
+            for m in statutes._search_statutes(conn, "개인정보 주민등록번호", 5)
+        }
+    finally:
+        conn.close()
+    preview = by_name.get("개인정보 보호법", "")
+    assert preview.startswith("제24조의2"), preview
+
+
+def test_statute_preview_says_when_it_was_cut():
+    """A cut preview ends in an ellipsis; a short one is left alone."""
+    assert statutes._clip_preview("제1조(목적) 짧다") == "제1조(목적) 짧다"
+    long = "가" * (statutes.SEARCH_PREVIEW_MAX_CHARS + 50)
+    clipped = statutes._clip_preview(long)
+    assert clipped.endswith("…")
+    assert len(clipped) == statutes.SEARCH_PREVIEW_MAX_CHARS + 1
 
 
 def test_statute_lookup_article_text(ctx):
