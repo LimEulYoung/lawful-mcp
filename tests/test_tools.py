@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from legal_search_mcp import tools
-from legal_search_mcp.tools import statutes
-from legal_search_mcp.config import corpus_db_path
-from legal_search_mcp.deps import build_deps, open_db
+from lawful_mcp import tools
+from lawful_mcp.tools import statutes
+from lawful_mcp.config import corpus_db_path
+from lawful_mcp.deps import build_deps, open_db
 
 
 @pytest.fixture
@@ -376,7 +376,7 @@ def test_citation_urls_follow_configured_base(ctx, monkeypatch):
 
 def test_precedent_dive_without_model_is_not_registered(monkeypatch):
     """The dive tool is left out when no model is configured, not broken."""
-    from legal_search_mcp.deps import build_dive_subagent
+    from lawful_mcp.deps import build_dive_subagent
 
     monkeypatch.delenv("DIVE_API_KEY", raising=False)
     assert build_dive_subagent() is None
@@ -392,7 +392,7 @@ def test_mcp_layer_lets_a_json_looking_charge_through():
     """
     import anyio
 
-    from legal_search_mcp import server
+    from lawful_mcp import server
 
     async def call(value):
         return await server.mcp.call_tool(
@@ -408,7 +408,7 @@ def test_sibling_string_arguments_stay_narrow():
     """The asymmetry above is a decision, not an oversight — keep it visible."""
     import anyio
 
-    from legal_search_mcp import server
+    from lawful_mcp import server
 
     schemas = {t.name: t.inputSchema for t in anyio.run(server.mcp.list_tools)}
 

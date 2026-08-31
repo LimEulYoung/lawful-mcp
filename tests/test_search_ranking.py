@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 import sqlite3
 
-from legal_search_mcp.tools import statutes
+from lawful_mcp.tools import statutes
 # Imported by name: `tools/__init__` exports the tool function under the same
 # name as its module, so `from ... import precedent_search` gives the function.
-from legal_search_mcp.tools.precedent_search import (
+from lawful_mcp.tools.precedent_search import (
     HOLDING_MAX_CHARS,
     _format_response_md,
     _holdings_items,
