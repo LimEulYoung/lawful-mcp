@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Repository root: src/legal_search_mcp/config.py -> up three.
+# Repository root: src/lawful_mcp/config.py -> up three.
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_CORPUS_DB = _ROOT / "data" / "fixture.db"

@@ -214,7 +214,7 @@ def within_range_position(months: float, r: RecommendedRange) -> float | None:
 
 
 # Worked examples. Run this module directly to check the rules against the
-# corpus: `python -m legal_search_mcp.eval.recommended_range`.
+# corpus: `python -m lawful_mcp.eval.recommended_range`.
 
 if __name__ == "__main__":
     from ..deps import open_db

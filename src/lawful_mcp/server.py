@@ -24,7 +24,7 @@ from . import tools as _t
 from .config import corpus_db_path, dive_config
 from .deps import build_deps, build_dive_subagent
 
-logger = logging.getLogger("legal-search-mcp")
+logger = logging.getLogger("lawful-mcp")
 
 _HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 _PORT = os.environ.get("MCP_PORT", "8100")
@@ -43,7 +43,7 @@ _INSTRUCTIONS = (
 )
 
 mcp = FastMCP(
-    "legal-search",
+    "lawful-mcp",
     instructions=_INSTRUCTIONS,
     # Stateless request/response JSON: no session state, no SSE, so a plain
     # reverse proxy in front needs no special handling.
@@ -329,7 +329,7 @@ def _warmup() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Legal Search MCP server")
+    parser = argparse.ArgumentParser(description="Lawful MCP server")
     parser.add_argument(
         "--transport",
         choices=["stdio", "http"],

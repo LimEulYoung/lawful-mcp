@@ -1,4 +1,4 @@
-"""Legal Search MCP — Korean case law, statutes and sentencing data as MCP tools.
+"""Lawful MCP — Korean case law, statutes and sentencing data as MCP tools.
 
 Five read-only tools over a SQLite corpus of Korean court judgments,
 statutes, administrative rules and sentencing-guideline data:

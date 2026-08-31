@@ -1,4 +1,4 @@
-# Legal Search MCP
+# Lawful MCP
 
 English | [한국어](README.ko.md)
 
@@ -31,7 +31,7 @@ key at [console.crow-tit.com](https://console.crow-tit.com) and add:
 ```json
 {
   "mcpServers": {
-    "legal-search": {
+    "lawful-mcp": {
       "type": "http",
       "url": "https://mcp.crow-tit.com/mcp",
       "headers": { "Authorization": "Bearer YOUR_KEY" }
@@ -48,11 +48,11 @@ rate limits.
 The repository ships a sample corpus so a clone runs immediately:
 
 ```bash
-git clone https://github.com/LimEulYoung/legal-search-mcp
-cd legal-search-mcp
+git clone https://github.com/LimEulYoung/lawful-mcp
+cd lawful-mcp
 pip install -e .
-legal-search-mcp                 # stdio
-legal-search-mcp --transport http --port 8100
+lawful-mcp                 # stdio
+lawful-mcp --transport http --port 8100
 ```
 
 Register it with a client:
@@ -60,8 +60,8 @@ Register it with a client:
 ```json
 {
   "mcpServers": {
-    "legal-search": {
-      "command": "legal-search-mcp"
+    "lawful-mcp": {
+      "command": "lawful-mcp"
     }
   }
 }
@@ -137,7 +137,7 @@ in research, please cite the paper ([`CITATION.cff`](CITATION.cff)).
 
 ## Also available
 
-- **Legal Search API** — one question in, a grounded answer out.
+- **Lawful Agent API** — one question in, a grounded answer out.
   [crow-tit.com](https://crow-tit.com)
 - **로풀 (Lawful)** — the free consumer service, 법률AI: chat, search, labour
   calculators, legal document drafting.

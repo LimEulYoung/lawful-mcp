@@ -3000,7 +3000,7 @@ def compute_sentencing_range(
 
 # Worked examples. Run this module directly to exercise every resolution
 # path against the corpus:
-#   python -m legal_search_mcp.tools.compute_sentencing_range
+#   python -m lawful_mcp.tools.compute_sentencing_range
 
 if __name__ == "__main__":
     from collections import deque

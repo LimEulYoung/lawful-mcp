@@ -1,4 +1,4 @@
-# Legal Search MCP
+# 로풀 MCP (lawful-mcp)
 
 [English](README.md) | 한국어
 
@@ -30,7 +30,7 @@
 ```json
 {
   "mcpServers": {
-    "legal-search": {
+    "lawful-mcp": {
       "type": "http",
       "url": "https://mcp.crow-tit.com/mcp",
       "headers": { "Authorization": "Bearer YOUR_KEY" }
@@ -47,11 +47,11 @@ Claude Desktop, Claude Code, Cursor 등 MCP를 지원하는 클라이언트면 �
 샘플 코퍼스가 같이 들어 있어서 클론하면 바로 돌아갑니다.
 
 ```bash
-git clone https://github.com/LimEulYoung/legal-search-mcp
-cd legal-search-mcp
+git clone https://github.com/LimEulYoung/lawful-mcp
+cd lawful-mcp
 pip install -e .
-legal-search-mcp                 # stdio
-legal-search-mcp --transport http --port 8100
+lawful-mcp                 # stdio
+lawful-mcp --transport http --port 8100
 ```
 
 클라이언트에는 이렇게 등록합니다.
@@ -59,8 +59,8 @@ legal-search-mcp --transport http --port 8100
 ```json
 {
   "mcpServers": {
-    "legal-search": {
-      "command": "legal-search-mcp"
+    "lawful-mcp": {
+      "command": "lawful-mcp"
     }
   }
 }
@@ -134,7 +134,7 @@ python scripts/build_sample_db.py --source /path/to/corpus.db \
 
 ## 이런 것도 있습니다
 
-- **Legal Search API** — 질문 하나 넣으면 근거가 달린 답이 돌아옵니다.
+- **로풀 Agent API** — 질문 하나 넣으면 근거가 달린 답이 돌아옵니다.
   [crow-tit.com](https://crow-tit.com)
 - **로풀 (Lawful)** — 누구나 무료로 쓰는 법률AI입니다. 챗, 검색, 노무 계산기, 법률
   문서 작성. [lawful.crow-tit.com](https://lawful.crow-tit.com)
