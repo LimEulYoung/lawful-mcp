@@ -25,23 +25,39 @@ a free Korean legal-AI service, and the descendant of the research prototype in
 ## Quick start — hosted
 
 The full corpus (220k+ judgments, statutes with their amendment history,
-administrative rules, sentencing guidelines) is served for you. Get a free
-key at [console.crow-tit.com](https://console.crow-tit.com) and add:
+administrative rules, sentencing guidelines) is served for you. No rate
+limits. Three ways in:
+
+**Claude / ChatGPT on the web — no code.** Add a custom connector with this
+URL, sign in with OAuth when asked, and the five tools appear. No API key
+needed:
+
+```
+https://mcp.crow-tit.com/mcp
+```
+
+Step-by-step with the exact menu clicks: [crow-tit.com/docs#mcp](https://crow-tit.com/docs#mcp)
+
+**Claude Code** — one command, with a free key from
+[console.crow-tit.com](https://console.crow-tit.com):
+
+```bash
+claude mcp add --transport http lawful https://mcp.crow-tit.com/mcp \
+  --header "Authorization: Bearer ct_..."
+```
+
+**Any other MCP client** (Claude Desktop, Cursor, …) — JSON config, same key:
 
 ```json
 {
   "mcpServers": {
-    "lawful-mcp": {
-      "type": "http",
+    "lawful": {
       "url": "https://mcp.crow-tit.com/mcp",
-      "headers": { "Authorization": "Bearer YOUR_KEY" }
+      "headers": { "Authorization": "Bearer ct_..." }
     }
   }
 }
 ```
-
-Works with Claude Desktop, Claude Code, Cursor and any other MCP client. No
-rate limits.
 
 ## Quick start — self-host
 

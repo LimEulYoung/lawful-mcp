@@ -24,23 +24,37 @@
 ## 빠른 시작 — 호스티드
 
 판결 22만 건, 개정 이력이 붙은 법령 전체, 행정규칙, 양형기준을 전부 저희 서버에서
-서비스합니다. [console.crow-tit.com](https://console.crow-tit.com)에서 무료 키를 받아
-설정에 넣으시면 됩니다.
+서비스합니다. 호출 횟수 제한은 없습니다. 붙는 길은 셋입니다.
+
+**Claude·ChatGPT 웹 — 코드 없이.** 커스텀 커넥터에 아래 주소를 넣고 OAuth
+로그인만 하면 도구 5종이 붙습니다. API 키도 필요 없습니다.
+
+```
+https://mcp.crow-tit.com/mcp
+```
+
+메뉴 클릭 순서까지 적은 단계별 안내: [crow-tit.com/docs#mcp](https://crow-tit.com/docs#mcp)
+
+**Claude Code** — 한 줄이면 됩니다. 키는
+[console.crow-tit.com](https://console.crow-tit.com)에서 무료 발급:
+
+```bash
+claude mcp add --transport http lawful https://mcp.crow-tit.com/mcp \
+  --header "Authorization: Bearer ct_..."
+```
+
+**그 밖의 MCP 클라이언트**(Claude Desktop, Cursor 등) — JSON 설정, 키는 같은 것:
 
 ```json
 {
   "mcpServers": {
-    "lawful-mcp": {
-      "type": "http",
+    "lawful": {
       "url": "https://mcp.crow-tit.com/mcp",
-      "headers": { "Authorization": "Bearer YOUR_KEY" }
+      "headers": { "Authorization": "Bearer ct_..." }
     }
   }
 }
 ```
-
-Claude Desktop, Claude Code, Cursor 등 MCP를 지원하는 클라이언트면 다 됩니다. 호출
-횟수 제한은 없습니다.
 
 ## 빠른 시작 — 직접 띄우기
 
