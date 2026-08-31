@@ -95,7 +95,7 @@ _DESC_PRECEDENT_SEARCH = (
     "Args: query=사실관계·죄명·법조 키워드(명사 어간 여러 개; 2자 죄명도 지원; 사건번호 제외). "
     "case_number=특정 사건번호로 바로 찾을 때(예 '2010다89012'; '대법원 … 선고 2010다89012 판결'이면 사건번호 부분만). "
     "court_level='1심'|'2심'|'대법원'|'헌재'. court_name=법원명·지역 부분매칭(예 '부산','특허법원'). year_from/year_to=사건년도 범위.\n"
-    "url만 인용 링크로 씁니다. `preview_kind: 원문 발췌`만 직접인용하고 `(직접인용 불가)`가 붙은 요약은 바꿔 쓰세요."
+    "url만 인용 링크로 씁니다. preview_kind 이름에 '원문'이 있는 것만 직접인용하고 요약 계열은 바꿔 쓰세요."
 )
 _DESC_STATUTE_LOOKUP = (
     "법령·행정규칙 조회 — 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 국면의 기본 도구이며, "
@@ -126,16 +126,17 @@ _DESC_SENTENCE_STATISTICS = (
     "비교 판례·그리드의 url만 인용 링크로, 집계 분포 수치는 링크 없이 제시."
 )
 _DESC_COMPUTE_SENTENCING_RANGE = (
-    "통합 양형 도구 — 죄명에서 법정형 → 처단형 → 권고형(양형기준) → 선고 검증까지 단계 계산. 인자를 채울수록 깊은 단계로 자동 진행: "
-    "charge만=lookup(법정형·양형기준 leaf 후보·가중감경 인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
+    "통합 양형 도구 — 죄명에서 법정형→처단형→권고형→선고 검증까지, 인자를 채울수록 깊은 단계로 자동 진행: "
+    "charge만=lookup(법정형·leaf 후보·인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
     "+guideline_leaf_id·guideline_factors=권고형 / +sentence_months·fine_amount(+probation_factors)=final(선고형·집행유예 검증). "
     "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정한 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
-    "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 숫자·ID 불가"
-    "(조문 번호·sentence_statistics의 charge_id·leaf id 아님; 숫자가 오면 계산 없이 죄명 문자열 재호출 유도[charge_numeric]). "
+    "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 호출당 하나"
+    "(list는 죄명별 매칭 유도[multiple_charges]), 숫자·ID 불가"
+    "(조문 번호·sentence_statistics의 charge_id·leaf id 아님; 숫자면 죄명 문자열로 유도[charge_numeric]). "
     "offense_date=행위 일자(지정 시 행위시 조문). "
-    "sg_category_id·statute_choice·branch_key·reference_choice=응답이 모호할 때(ambiguous_* 후보 제공) 명시. "
-    "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=형법§56 가중감경 list(lookup enum에서 선택). "
-    "guideline_leaf_id·guideline_factors=양형기준 leaf·특별인자(lookup 후보/enum에서). "
+    "sg_category_id·statute_choice·branch_key·reference_choice=ambiguous_* 응답이 후보를 줄 때. "
+    "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=가중감경 list(lookup enum에서). "
+    "guideline_leaf_id·guideline_factors=양형기준 leaf·특별인자. "
     "sentence_months=검증 선고형(자유형·월)·fine_amount=벌금(원)·probation_factors=집행유예 인자(dict). act_count=동종 다행위 수(≥2면 경합범 가중 자동).\n"
     "후속 단계 값은 이전 응답 enum에 있는 key만 쓰고 추측 금지. 응답의 '출처'(양형기준 해설서 PDF)가 있으면 인용 링크로 제시."
 )
@@ -143,7 +144,7 @@ _DESC_PRECEDENT_DIVE = (
     "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 300자 내외 생성 요약을 반환. "
     "summary는 직접인용이 아니며 text_truncated=true이면 not_in_text도 전체 원문 부재를 확정하지 못합니다.\n"
     "Args: case_id=precedent_search 결과 id. question=공개 판례에서 추출할 쟁점·항목만(사용자 이름·주소·연락처·계정·사적 첨부사실 등 개인정보 금지).\n"
-    "url만 인용 링크로 쓰고 `(직접인용 불가)`로 표시된 summary는 원문 직접인용으로 쓰지 마세요."
+    "url만 인용 링크로 쓰고 생성 요약인 summary 는 원문 직접인용으로 쓰지 마세요."
 )
 
 

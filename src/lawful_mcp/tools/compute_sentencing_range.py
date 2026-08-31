@@ -36,7 +36,8 @@ from ..eval.recommended_range import (
     in_range,
     within_range_position,
 )
-from ._coerce import coerce_dict, coerce_dict_list, coerce_int, coerce_str, to_iso_date
+from ._coerce import (
+    coerce_dict, coerce_dict_list, coerce_int, coerce_list, coerce_str, to_iso_date)
 from ._dedup import dedup_guard
 
 _log = logging.getLogger(__name__)
@@ -101,16 +102,29 @@ _SUFFIX_MODIFIERS: list[tuple[str, str]] = [
 # `_numeric_charge_tokens`, and emptying the string here would lose that path.
 _BRACKET_NUM_PREFIX_RE = re.compile(r"^\[\d{1,4}\]")
 
+# Wrapping quotes ('"협박"'), where a caller passes the offence name as if it
+# were a string literal. One such input came in three times running without
+# ever recovering: the quotes survived normalisation and the exact match was
+# missed. None of the 853 keys in the mapping holds a quote character, so —
+# as with the bracket tag — stripping cannot cost a legitimate input.
+# ⚠ One layer at a time, only when both ends pair up and something remains.
+# A lone quote, or one inside the string, is left alone.
+_WRAP_QUOTE_PAIRS = {
+    '"': '"', "'": "'", "`": "`", "＂": "＂", "＇": "＇",
+    "“": "”", "‘": "’", "「": "」", "『": "』",
+}
+
 
 @dataclass(frozen=True)
 class NormalizedCharge:
     """A normalised charge key plus any modifier split off its tail."""
 
     key: str                        # 정규화된 lookup 키 (suffix 제거 가능)
-    raw_key: str                    # charge_key() + 선행 번호 딱지 제거 (suffix 미제거)
+    raw_key: str                    # charge_key() + 선행 번호 딱지·감싼 인용부호 제거 (suffix 미제거)
     modifiers: dict[str, bool]      # {is_attempted, is_accessory, is_solicitor}
     suffix_split_applied: bool      # 자동 분리 발생 여부 (응답 trace)
     bracket_prefix_stripped: str | None = None  # 제거된 딱지("[9]") — 응답 note 용
+    quotes_stripped: str | None = None          # 제거된 감싼 인용부호('""') — 응답 note 용
 
 
 def _normalize_charge(
@@ -125,8 +139,9 @@ def _normalize_charge(
 
     Rules:
       1. `charge_key()` normalises spacing and dots, keeping parentheses.
-      1-b. A leading bracketed number ('[1]상해') is stripped, but only when
-         something remains after it (`_BRACKET_NUM_PREFIX_RE`).
+      1-b. A leading bracketed number ('[1]상해') and wrapping quotes
+         ('"협박"') are stripped, but only when something remains after them.
+         Either can wrap the other ('[1] "협박"'), so they alternate.
       2. A suffix (미수 / 교사 / 방조) at the *end* of the charge key splits off
          and sets a modifier — but only when the parent charge, the key without
          it, is itself in the mapping.
@@ -135,10 +150,19 @@ def _normalize_charge(
     """
     raw = _charge_key_normalize(charge or "")
     bracket_prefix = None
-    m = _BRACKET_NUM_PREFIX_RE.match(raw)
-    if m and m.end() < len(raw):
-        bracket_prefix = m.group(0)
-        raw = raw[m.end():]
+    quotes_stripped = None
+    for _ in range(4):  # one layer each in the observed inputs; the cap is slack
+        m = _BRACKET_NUM_PREFIX_RE.match(raw)
+        if m and m.end() < len(raw):
+            bracket_prefix = (bracket_prefix or "") + m.group(0)
+            raw = raw[m.end():]
+            continue
+        closer = _WRAP_QUOTE_PAIRS.get(raw[:1])
+        if closer and len(raw) > 2 and raw.endswith(closer):
+            quotes_stripped = (quotes_stripped or "") + raw[0] + closer
+            raw = raw[1:-1]
+            continue
+        break
     modifiers: dict[str, bool] = {
         "is_attempted": bool(is_attempted),
         "is_accessory": bool(is_accessory),
@@ -169,6 +193,7 @@ def _normalize_charge(
         modifiers=modifiers,
         suffix_split_applied=suffix_split,
         bracket_prefix_stripped=bracket_prefix,
+        quotes_stripped=quotes_stripped,
     )
 
 
@@ -1699,6 +1724,11 @@ def _format_stage_header(
             f"- note: 선행 번호 {norm.bracket_prefix_stripped} 제거 → {norm.raw_key}"
             " — charge 는 죄명 문자열만"
         )
+    if norm.quotes_stripped:
+        lines.append(
+            f"- note: 감싼 인용부호 {norm.quotes_stripped} 제거 → {norm.raw_key}"
+            " — charge 는 죄명 문자열만"
+        )
     if row["is_alias"] and row["alias_of"]:
         lines.append(f"- alias_of: {row['alias_of']}")
 
@@ -2688,6 +2718,68 @@ def _format_not_found_response(norm: NormalizedCharge) -> str:
 # reverse article lookup would be possible, but comes second — only if this
 # wording turns out not to work.
 
+# Cap on a charge list, the same policy value as statute_lookup's "answer the
+# first eight".
+_MULTI_CHARGE_ITEM_CAP = 8
+
+
+def _format_multiple_charges_response(
+    conn: sqlite3.Connection, items: list[str]
+) -> str:
+    """A list of charges: report per-item matching rather than looking up the
+    joined string, and send the caller back one charge at a time.
+
+    Joining through `coerce_str` ("주거침입, 퇴거불응") makes a single key that
+    cannot exist, and the call fell through to not_found. Of eighteen calls
+    that produced nothing in one day, fourteen had this shape: the candidates
+    held the right answer for each part, but nothing said one charge per call,
+    so half of them repeated the list until they gave up. Saying which items
+    match exactly removes that round trip, and closes the path from an empty
+    result into a numeric sweep (charge=[1..10] eight times in a row, straight
+    after one such empty result).
+    """
+    shown = items[:_MULTI_CHARGE_ITEM_CAP]
+    lines = [
+        "## status: multiple_charges",
+        "## stage: lookup",
+        f"## charge: {', '.join(shown)}",
+        "- 이 도구는 한 호출에 죄명 하나만 계산합니다 — 아래 죄명별로 각각 호출하세요.",
+        "- 여러 죄의 경합(§37)은 각 죄의 계산에서 statutory_modifications=['경합범_가중'] 로,"
+        " 같은 죄 여러 행위는 act_count 로 반영합니다.",
+        "## 죄명별 매칭",
+    ]
+    for item in shown:
+        norm = _normalize_charge(conn, item)
+        # Digits left after the quotes come off ('"298"') take the numeric
+        # hint, exactly as they do on the single-charge path.
+        if _numeric_charge_tokens(item) is not None or _numeric_charge_tokens(norm.key) is not None:
+            lines.append(f"- {item}: 숫자 — 죄명 문자열을 넣으세요")
+            continue
+        result = _lookup_charge(conn, norm.key)
+        # Re-call on raw_key, not norm.key: the latter has the suffix split
+        # off, so '살인미수' would come back as '살인' and calling that loses
+        # the attempt reduction.
+        if result.status == "exact":
+            lines.append(
+                f"- {norm.key}: 매칭 ok — charge='{norm.raw_key}' 로 재호출"
+                f" ({_format_article(result.rows[0])})")
+        elif result.status in ("exact_cross_cat", "exact_same_cat_multi_row"):
+            lines.append(
+                f"- {norm.key}: 매칭 ok(조항·카테고리 후보 여러 개) —"
+                f" charge='{norm.raw_key}' 로 재호출하면 후보를 안내합니다")
+        elif result.status == "fuzzy_candidates":
+            cands = ", ".join(c["charge_key"] for c in result.candidates[:3])
+            lines.append(f"- {norm.key}: 정확 일치 없음 — 유사 후보: {cands}")
+        else:
+            lines.append(
+                f"- {norm.key}: 양형기준 비등재(권고 없음) — 실선고 분포는"
+                f" sentence_statistics(charges='{norm.key}') 로 확인 가능")
+    if len(items) > len(shown):
+        lines.append(
+            f"- (나머지 {len(items) - len(shown)}개 생략: {', '.join(items[len(shown):])})")
+    return "\n".join(lines)
+
+
 _NUMERIC_CHARGE_TOKEN_RE = re.compile(r"^\d{1,5}(?:(?:의|-)\d{1,3})?$")
 _NUMERIC_CHARGE_SEP_RE = re.compile(r"[\s\[\]()'\"‚,，·;/]+")
 
@@ -2706,20 +2798,21 @@ def _numeric_charge_tokens(charge: str) -> list[str] | None:
 
 
 def _format_charge_numeric_response(charge: str, tokens: list[str]) -> str:
+    # The correction and a way out, nothing else. Enumerating the ID spaces
+    # ("not an article number, not a charge_id, not a leaf id") was removed:
+    # naming IDs in a failure response reinforces the ID frame and invites the
+    # numeric sweep it exists to stop. The docstring Args owns that lesson.
     lines = [
         "## status: charge_numeric",
         "## stage: lookup",
         f"## charge: {charge}",
-        "- charge 는 판결문 죄명 **문자열**입니다(예: 강제추행, 도로교통법위반(음주운전))"
-        " — 숫자는 해석하지 않습니다.",
-        "- statute_lookup 의 조문 번호, sentence_statistics 의 charge_id, 양형기준"
-        " leaf id 는 모두 이 자리의 값이 아닙니다. 앞선 응답에 나온 죄명 문자열을 그대로 쓰세요.",
+        "- 숫자가 아니라 죄명 문자열을 넣으세요."
+        " 예: charge='강제추행', charge='도로교통법위반(음주운전)'.",
     ]
     if len(tokens) > 1:
         lines.append("- 죄명은 호출당 하나입니다 — 여러 죄는 각각 호출하세요.")
     lines.append(
-        "- 죄명을 모르면 sentence_statistics(charges=키워드) 로 후보를 찾거나,"
-        " statute_lookup 으로 그 조문의 제목(죄명)을 확인하세요."
+        "- 정확한 죄명 표기를 모르면 sentence_statistics(charges=키워드) 로 후보를 찾으세요."
     )
     return "\n".join(lines)
 
@@ -2729,13 +2822,22 @@ def _format_charge_numeric_response(charge: str, tokens: list[str]) -> str:
 @dedup_guard("compute_sentencing_range")
 def compute_sentencing_range(
     ctx: RunContext[HarnessDeps],
-    # The parameter types are deliberately wide. Models send a scalar where
-    # a list belongs, or a list double-encoded as a JSON string. Schema
-    # validation runs before this function is entered, so a narrow type
+    # The parameter types are deliberately wide — not one model's quirk but a
+    # standing condition of this tool. Over thirty days and 608 calls, 535
+    # (88%) arrived outside the narrow types: charge=["강제추행", …] 301,
+    # guideline_factors='{"...": [...]}' 117, statute_choice=[…] 34,
+    # statutory_modifications='[…]' 24, sentence_months="36" 17.
+    # Schema validation runs before this function is entered, so a narrow type
     # turns a recoverable formatting mistake into a failed turn: validation
-    # fails, retries are exhausted, and the whole call dies. Accepting
-    # broadly and normalising on entry keeps the failure recoverable. The
-    # docstring tells the caller which type is actually intended.
+    # fails, retries are exhausted, and the whole call dies — narrowing would
+    # kill half the sentencing turns that way. Accepting broadly and
+    # normalising on entry keeps the failure recoverable, and the docstring
+    # tells the caller which type is actually intended.
+    # ⚠ Re-measure those ratios before narrowing anything.
+    # ⚠ The MCP surface solves the same problem differently: the SDK unpacks
+    #   JSON-looking strings before entry (`func_metadata.pre_parse_json`), so
+    #   there only `charge` widens and its siblings stay narrow. The two
+    #   surfaces differing in width is each layer's preprocessing, not drift.
     charge: str | list | None = None,
     sg_category_id: int | str | list | None = None,
     statute_choice: str | list | None = None,
@@ -2778,6 +2880,8 @@ def compute_sentencing_range(
 
     Args:
       charge: 판결문 form 죄명 (예: 살인, 도로교통법위반(음주운전)). 정규화는 도구 내부에서 처리.
+        **한 호출에 하나** — 여러 죄를 list 로 넣으면 계산하지 않고 죄명별 매칭 현황으로
+        유도한다(multiple_charges). 경합 사안은 죄명별로 각각 계산.
         **숫자·ID 불가** — statute_lookup 조문 번호도, sentence_statistics 의 charge_id 도,
         양형기준 leaf id 도 아니다. 숫자가 오면 계산하지 않고 죄명 문자열 재호출을 유도한다
         (charge_numeric).
@@ -2806,6 +2910,21 @@ def compute_sentencing_range(
         포괄일죄·영업범처럼 판결문이 §37 을 명시하지 않는 유형은 1로 두세요.
     """
     # Normalise everything the wide signature let through.
+    # A list of two or more charges is caught before `coerce_str` joins it:
+    # the joined string is a single key that cannot exist, and the call falls
+    # through to not_found (see `_format_multiple_charges_response`).
+    charge_items = None
+    if isinstance(charge, str) and charge.lstrip()[:1] == "[":
+        parsed = coerce_list(charge)   # a list written as text ('["주거침입","퇴거불응"]')
+        if parsed is not None:
+            charge = parsed
+    if isinstance(charge, (list, tuple)):
+        deduped = list(dict.fromkeys(
+            s for s in (coerce_str(x) for x in charge) if s))
+        if len(deduped) >= 2:
+            charge_items = deduped
+        elif deduped:
+            charge = deduped[0]  # one left after dedup — use it, don't join
     charge = coerce_str(charge)
     sg_category_id = coerce_int(sg_category_id)
     statute_choice = coerce_str(statute_choice)
@@ -2832,6 +2951,8 @@ def compute_sentencing_range(
 
     conn = open_db()
     try:
+        if charge_items is not None:
+            return _format_multiple_charges_response(conn, charge_items)
         norm = _normalize_charge(
             conn,
             charge,
@@ -2839,6 +2960,13 @@ def compute_sentencing_range(
             is_accessory=is_accessory,
             is_solicitor=is_solicitor,
         )
+        # Stripping the tag and the quotes can leave nothing but digits
+        # ('"298"'). Letting that through as an unlisted charge revives the
+        # "no guideline for this offence" misreading that charge_numeric cuts,
+        # so it goes to the same hint.
+        residual_numeric = _numeric_charge_tokens(norm.key)
+        if residual_numeric is not None:
+            return _format_charge_numeric_response(charge, residual_numeric)
         result = _lookup_charge(conn, norm.key, sg_category_id=sg_category_id)
 
         # A stated choice resolves an otherwise ambiguous match.

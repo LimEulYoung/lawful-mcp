@@ -327,6 +327,25 @@ def test_statute_lookup_over_the_article_cap_answers_the_first_eight(ctx):
     assert "261" in out          # named as deferred in the message
 
 
+def test_statute_lookup_refuses_a_table_as_an_article(ctx):
+    """'별표5' must not become 제5조 and come back labelled as official text.
+
+    Reading the number off a structural unit answers a question nobody asked
+    and calls it the source, which is worse than finding nothing.
+    """
+    out = tools.statute_lookup(ctx, statute_id=578, articles=["별표5"])
+    assert "## status: bad_articles" in out
+    assert "별표" in out                # says which word was refused
+    assert "제5조" not in out
+
+
+def test_statute_lookup_names_the_units_it_dropped(ctx):
+    """A mixed call reads the articles and still reports what it cut."""
+    out = tools.statute_lookup(ctx, statute_id=578, articles=["347", "별표5"])
+    assert "## status: ok" in out
+    assert "별표5 는 제외했습니다" in out
+
+
 def test_statute_outline_never_prints_a_null_article_number(ctx):
     """Structural headings carry no article number; `str(None)` would leak."""
     out = tools.statute_lookup(ctx, statute_id=f"admrul-{_a_rule_id(ctx)}")
@@ -365,6 +384,31 @@ def test_compute_sentencing_range_strips_a_leading_number_tag(ctx):
 def test_compute_sentencing_range_keeps_a_bare_number_numeric(ctx):
     """Stripping the tag must not empty the string and lose the numeric path."""
     assert "charge_numeric" in tools.compute_sentencing_range(ctx, charge="[123]")
+
+
+def test_compute_sentencing_range_splits_a_list_of_charges(ctx):
+    """A list is reported per charge rather than joined into one lookup key.
+
+    Joining makes a key that cannot exist, and the empty result reads as
+    "no guideline for these offences".
+    """
+    out = tools.compute_sentencing_range(ctx, charge=["주거침입", "퇴거불응"])
+    assert "## status: multiple_charges" in out
+    assert "not_found" not in out
+    assert "- 주거침입: 매칭 ok" in out
+    assert "- 퇴거불응: 매칭 ok" in out
+
+
+def test_compute_sentencing_range_strips_wrapping_quotes(ctx):
+    """A charge sent as a string literal still matches."""
+    out = tools.compute_sentencing_range(ctx, charge='"협박"')
+    assert "## status: ok" in out
+    assert "## charge: 협박" in out
+
+
+def test_compute_sentencing_range_keeps_quoted_numbers_numeric(ctx):
+    """Stripping the quotes must not let a bare number reach the lookup."""
+    assert "charge_numeric" in tools.compute_sentencing_range(ctx, charge='"298"')
 
 
 def test_citation_urls_follow_configured_base(ctx, monkeypatch):

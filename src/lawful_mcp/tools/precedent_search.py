@@ -885,8 +885,19 @@ def _sentence_previews_batch(
 # depend on the field name, so renaming it broke them. A marker inside the
 # value has no name to depend on.
 #
-# Only a verbatim excerpt is quotable. A displayed body string is a head
-# extract and does not match the source exactly, so it is not.
+# The label decides it in the positive: a name carrying 원문 is quotable and
+# anything else is not. The other side used to take an explicit
+# `(직접인용 불가)` tag, but that tag is text a person reads when they expand a
+# tool result, and the name alone was already enough for the model — over
+# thirty days of traffic it reached exactly one of 21,277 answers. So a value
+# that is not quotable must not carry 원문 in its name; putting it there flips
+# the decision on the spot.
+#
+# Only `original_text_excerpt` is quotable. A displayed body string is a head
+# extract and does not match the source exactly, so its name avoids 원문 too.
+# The three outer names (`original_text`, `official_summary`,
+# `generated_summary`) are emitted by no current path, but they are where a
+# fallback label would land, so the names are kept safe.
 _MARKUP_RE = re.compile(r"</?\s*br\s*/?\s*>", re.I)
 
 
@@ -895,15 +906,14 @@ def _strip_markup(text: str) -> str:
     return _MARKUP_RE.sub(" ", str(text or "")).strip()
 
 
-_NO_QUOTE = "(직접인용 불가)"
 _PREVIEW_KINDS = {
     "original_text_excerpt": "원문 발췌",
-    "original_text": f"원문 머리 발췌{_NO_QUOTE}",
-    "official_summary": f"공식 요약{_NO_QUOTE}",
-    "official_summary_excerpt": f"공식 요약 발췌{_NO_QUOTE}",
-    "generated_summary": f"AI 요약{_NO_QUOTE}",
-    "generated_summary_excerpt": f"AI 요약 발췌{_NO_QUOTE}",
-    "reference_statute_metadata_excerpt": f"참조조문 메타·판시 아님{_NO_QUOTE}",
+    "original_text": "본문 머리 표시용",
+    "official_summary": "공식 요약",
+    "official_summary_excerpt": "공식 요약 발췌",
+    "generated_summary": "AI 요약",
+    "generated_summary_excerpt": "AI 요약 발췌",
+    "reference_statute_metadata_excerpt": "참조조문 메타·판시 아님",
 }
 
 
@@ -958,8 +968,9 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             if m.get("preview"):
                 block.append(f"  preview: {m['preview']}")
                 source = m.get("preview_provenance") or "unknown"
-                block.append(f"  preview_kind: "
-                             f"{_PREVIEW_KINDS.get(source, f'{source}{_NO_QUOTE}')}")
+                # An unknown provenance is printed under its own name, which
+                # carries no 원문 and so is not quotable by the rule above.
+                block.append(f"  preview_kind: {_PREVIEW_KINDS.get(source, source)}")
             lines.append("\n".join(block))
     elif status == "ok":
         lines.append("## matches: (없음)")
@@ -995,8 +1006,8 @@ def precedent_search(
       쟁점이 여럿인 판례는 질의에 가장 가까운 항 하나만 나가며, 꼬리 `…`는 그 항이 길어
       잘렸다는 뜻입니다(잘린 문장은 인용하지 말고 필요하면 precedent_dive로 확인하세요).
       하급심 등 판시사항이 없는 판례는 이 칸이 아예 나오지 않습니다.
-    - `preview_kind: 원문 발췌`만 따옴표로 직접인용할 수 있고, `(직접인용 불가)`가 붙은
-      요약은 바꿔 쓰세요.
+    - `preview_kind` 이름에 **원문**이 있는 것만 따옴표로 직접인용할 수 있고
+      (`원문 발췌`), 요약 계열은 바꿔 쓰세요.
     답에 쓴 판례는 직접 인용이든 요약이든 반환 url을 링크로 함께 제시하세요.
 
     Args:

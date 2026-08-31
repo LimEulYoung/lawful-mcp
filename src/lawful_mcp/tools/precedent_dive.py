@@ -114,10 +114,10 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append("- not_in_text_conclusive: false")
             lines.append("- note: 중간 원문이 생략되어 보존 구간에 없다는 뜻일 뿐, 전체 원문 부재를 확정하지 못함")
     if resp.get("summary"):
-        # One marker, not four. The heading says the summary is generated and
-        # cannot be quoted verbatim; repeating that in separate metadata
-        # fields spent tokens saying the same thing again.
-        lines.append("## summary — AI 생성 요약(직접인용 불가)")
+        # One name, not four. The name carries no 원문, so the positive rule
+        # documented above `precedent_search._PREVIEW_KINDS` already makes it
+        # unquotable — no prohibition tag is added on top of that.
+        lines.append("## summary — AI 생성 요약")
         lines.append(resp["summary"])
 
     return "\n".join(lines)
@@ -137,7 +137,7 @@ async def precedent_dive(
 
     규칙:
     - question은 선택한 공개 판례 안에서 확인할 쟁점·항목만 쓰고 사용자 대화·첨부·문서·계정·
-      세션 정보나 사적 사실을 넣지 마세요. 명백한 식별번호는 서버가 추가 삭제합니다.
+      세션 정보나 사적 사실을 넣지 마세요.
     - text_truncated=true일 때 not_in_text는 보존된 앞·뒤 구간에 없다는 뜻일 뿐입니다.
 
     응답: markdown-KV. summary는 생성 요약이므로 직접인용하지 말고, 답에 쓴 판례는 반환

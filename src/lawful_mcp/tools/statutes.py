@@ -325,6 +325,21 @@ def _fts_query_ok(q: str) -> bool:
     return any(len(w) >= 3 for w in q.split())
 
 
+# Structural units that are not articles, filtered out before any number is
+# read off the token.
+#
+# '별표5' used to match the article regex below and come back as 제5조, with
+# `text_kind: 공식 조문 원문` on the response. Three consecutive requests for a
+# rule's 별표 5 were each answered with an unrelated article, and the model
+# kept retrying in different spellings. That is worse than not finding it —
+# it says something exists when it does not. Tables and forms are not
+# collected into the corpus at all, and addenda do not live in the article
+# tables, so a token carrying one of these words is dropped without reading
+# its number and ends at the fail-loud hint in `_bad_articles_response`.
+_NON_ARTICLE_UNIT_RE = re.compile(
+    r"별\s*표|별\s*지|별\s*첨|별\s*도|서\s*식|양\s*식|붙\s*임|부\s*칙|부\s*록")
+
+
 def _parse_articles(
     spec: list[str | int] | None,
 ) -> list[tuple[int, int | None]] | None:
@@ -334,8 +349,10 @@ def _parse_articles(
     a number with a branch selects just that branch. A range is passed as a
     list of numbers rather than as a range expression.
 
-    Unparseable tokens are skipped. If that leaves nothing at all, the
-    caller returns a format hint rather than silently searching for nothing.
+    Unparseable tokens are skipped, as are structural units that are not
+    articles (별표5, 부칙 — see `_NON_ARTICLE_UNIT_RE`). If that leaves nothing
+    at all, the caller returns a format hint rather than silently searching
+    for nothing.
     """
     if spec is None:
         return None
@@ -348,6 +365,13 @@ def _parse_articles(
         # 76의2, 76-2, 제76조, 76. Normalise the hyphen form first, then
         # pull the article number and its branch out of the rest.
         s = str(token).replace("-", "의")
+        # A structural word at the *head* of the token makes it a structural
+        # unit, so no number is read off it. A real article whose title
+        # carries one of those words ('제106조(별도합산과세대상)') starts with
+        # 제 and survives; '부칙 제2조' leads with 부칙 and is dropped. Matching
+        # anywhere with `.search` swallowed legitimate articles.
+        if _NON_ARTICLE_UNIT_RE.match(s.lstrip()):
+            continue
         m = re.search(r"(\d+)\s*조?\s*(?:의\s*(\d+))?", s)
         if not m:
             continue
@@ -1920,6 +1944,8 @@ def statute_lookup(
         - "347" / "제347조": 347조 + 가지(의2, 의3 ...) 함께
         - "347-2" / "347의2" / "제347조의2": 제347조의2만 콕
         - 연속 범위: ["3","4","5","6","7"]
+        **별표·별지·서식·부칙은 받지 않습니다**(코퍼스에 본문이 없습니다) — 별표가 필요하면
+        국가법령정보센터에서 해당 파일을 직접 확인하세요.
         행정규칙은 가지 없음. 조문이 분리되지 않은 행정규칙은 articles 를 아무 값으로나 주면
         본문 전문이 나옵니다(개요 응답의 note 가 그렇게 안내합니다).
       limit: 검색 모드 최대 결과 수(기본 10, 최대 50).
@@ -1979,21 +2005,50 @@ def statute_lookup(
             )
             prev = resp.get("message")
             resp["message"] = note if not prev else f"{note} · {prev}"
+        # A mixed call (`["13","별표5"]`) where the articles read and only the
+        # table was dropped. Articles coming back look like a complete answer,
+        # and the caller then invents the rest, so the dropped tokens are
+        # echoed by name. When nothing parsed at all, `_bad_articles_response`
+        # has already said the same thing.
+        unsupported = _unsupported_units(articles) if resp.get("status") == "ok" else []
+        if unsupported:
+            note = f"{', '.join(unsupported)} 는 제외했습니다. {_UNSUPPORTED_UNIT_HINT}"
+            prev = resp.get("message")
+            resp["message"] = note if not prev else f"{prev} · {note}"
         return _format_response_md(resp)
     finally:
         conn.close()
 
 
+def _unsupported_units(articles: list[str | int] | None) -> list[str]:
+    """Tokens in `articles` naming a structural unit rather than an article,
+    echoed back verbatim so the caller sees which of its own words was cut."""
+    return [str(a) for a in (articles or []) if _NON_ARTICLE_UNIT_RE.search(str(a))]
+
+
+# Tables and forms are not in the corpus — collection skips them, because the
+# ministry serves them as separate files rather than as article text. A caller
+# that does not know this retries the same lookup in new spellings, so the
+# response says where the text does live instead of only refusing.
+_UNSUPPORTED_UNIT_HINT = (
+    "별표·별지·서식·부칙은 조문 조회 대상이 아니고 본문이 코퍼스에 없습니다 — "
+    "국가법령정보센터에서 해당 파일을 직접 확인하세요."
+)
+
+
 def _bad_articles_response(statute_id: int | str | None, articles: list[str | int]) -> dict[str, Any]:
     """Format hint for when nothing in `articles` could be parsed."""
+    message = (
+        "articles 파싱 실패 — 조문 번호를 숫자로 주세요. "
+        "'76'(76조 본조+가지), '76-2'(제76조의2만). "
+        "예: articles=['76-2','76-3']"
+    )
+    if _unsupported_units(articles):
+        message = f"{_UNSUPPORTED_UNIT_HINT} {message}"
     return {
         "status": "bad_articles",
         "input": {"statute_id": statute_id, "articles": articles},
-        "message": (
-            "articles 파싱 실패 — 조문 번호를 숫자로 주세요. "
-            "'76'(76조 본조+가지), '76-2'(제76조의2만). "
-            "예: articles=['76-2','76-3']"
-        ),
+        "message": message,
     }
 
 
