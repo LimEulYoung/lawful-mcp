@@ -130,7 +130,7 @@ async def precedent_dive(
     question: str,
 ) -> str:
     """단건 판결·결정 본문 추출(sub-agent 위임) — search preview가 부족할 때 case id로
-    호출하면 question에 답하는 300자 내외 생성 요약을 반환합니다(직접인용 아님).
+    호출하면 question에 답하는 500자 내외 생성 요약을 반환합니다(직접인용 아님).
 
     언제:
     - 한 case의 구체 판단 이유·결론·역할·피해규모 등이 preview에 없을 때.

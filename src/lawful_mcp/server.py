@@ -13,10 +13,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 import threading
 from types import SimpleNamespace
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
@@ -42,24 +43,55 @@ _INSTRUCTIONS = (
     "양형기준 계산(compute_sentencing_range). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
 
-mcp = FastMCP(
-    "lawful-mcp",
-    instructions=_INSTRUCTIONS,
-    # Stateless request/response JSON: no session state, no SSE, so a plain
-    # reverse proxy in front needs no special handling.
-    stateless_http=True,
-    json_response=True,
-    transport_security=TransportSecuritySettings(
-        allowed_hosts=[
-            "127.0.0.1",
-            f"127.0.0.1:{_PORT}",
-            "localhost",
-            f"localhost:{_PORT}",
-            *_EXTRA_HOSTS,
-        ],
-        allowed_origins=[f"https://{h}" for h in _EXTRA_HOSTS],
-    ),
-)
+mcp = MCPServer("lawful-mcp", instructions=_INSTRUCTIONS)
+
+
+def _reclaim_root_logging() -> None:
+    """Reclaim root logger hijacked by MCP SDK's MCPServer.
+
+    MCPServer(...) calls basicConfig(level=INFO, handlers=[RichHandler])
+    internally. RichHandler wraps at 80 columns in non-TTY pipes and lets
+    libraries like httpx log URL queries at INFO. We replace it with a
+    standard stream handler.
+    """
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if handler.__class__.__module__.startswith("rich"):
+            root.removeHandler(handler)
+    if not root.handlers:
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        root.addHandler(stream)
+    root.setLevel(logging.INFO)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+_reclaim_root_logging()
+
+
+def _streamable_app():
+    """Build the streamable HTTP ASGI app for the MCP endpoint.
+
+    mcp 2.x passes transport security and JSON response flags to
+    streamable_http_app() rather than the MCPServer constructor.
+    """
+    return mcp.streamable_http_app(
+        stateless_http=True,
+        json_response=True,
+        transport_security=TransportSecuritySettings(
+            allowed_hosts=[
+                "127.0.0.1",
+                f"127.0.0.1:{_PORT}",
+                "localhost",
+                f"localhost:{_PORT}",
+                *_EXTRA_HOSTS,
+            ],
+            allowed_origins=[f"https://{h}" for h in _EXTRA_HOSTS],
+        ),
+    )
 
 # One sub-agent for the process: building a model client per call would pay
 # connection setup on every dive. None when unconfigured, which is why the
@@ -141,7 +173,7 @@ _DESC_COMPUTE_SENTENCING_RANGE = (
     "후속 단계 값은 이전 응답 enum에 있는 key만 쓰고 추측 금지. 응답의 '출처'(양형기준 해설서 PDF)가 있으면 인용 링크로 제시."
 )
 _DESC_PRECEDENT_DIVE = (
-    "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 300자 내외 생성 요약을 반환. "
+    "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 500자 내외 생성 요약을 반환. "
     "summary는 직접인용이 아니며 text_truncated=true이면 not_in_text도 전체 원문 부재를 확정하지 못합니다.\n"
     "Args: case_id=precedent_search 결과 id. question=공개 판례에서 추출할 쟁점·항목만(사용자 이름·주소·연락처·계정·사적 첨부사실 등 개인정보 금지).\n"
     "url만 인용 링크로 쓰고 생성 요약인 summary 는 원문 직접인용으로 쓰지 마세요."
@@ -306,7 +338,7 @@ def build_app():
 
     from starlette.applications import Starlette
 
-    http_app = mcp.streamable_http_app()
+    http_app = _streamable_app()
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app):

@@ -20,7 +20,7 @@ classifiers = [
     "Natural Language :: Korean",
 ]
 dependencies = [
-    "mcp>=1.2",
+    "mcp>=2.1",
     "pydantic>=2.0",
     "pydantic-ai>=0.0.20",
     "kiwipiepy>=0.17",   # morphological index; two-syllable terms need it

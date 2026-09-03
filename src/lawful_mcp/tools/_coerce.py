@@ -16,9 +16,30 @@ import sys
 from typing import Any
 
 
+def _caller_tool() -> str:
+    """Identify the tool function name that triggered the coercion warning.
+
+    Callers only pass the argument (e.g. ``coerce_str(v)``), so the tool name
+    is not passed explicitly. Inspect the stack frames backwards to find the
+    first non-private caller outside this module.
+    """
+    try:
+        frame = sys._getframe(1)
+        while frame is not None:
+            name = frame.f_code.co_name
+            if frame.f_code.co_filename != __file__ and not name.startswith("_"):
+                return name[:48]
+            frame = frame.f_back
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _warn(arg: Any, target: str) -> None:
+    tool = _caller_tool()
+    tool_suffix = f" tool={tool}" if tool else ""
     print(
-        f"[coerce] WARN: tool arg type-violated → {target} (got {type(arg).__name__}: {arg!r:.80s})",
+        f"[coerce] WARN: tool arg type-violated → {target} (got {type(arg).__name__}: {arg!r:.80s}){tool_suffix}",
         file=sys.stderr,
     )
 

@@ -454,7 +454,10 @@ def test_sibling_string_arguments_stay_narrow():
 
     from lawful_mcp import server
 
-    schemas = {t.name: t.inputSchema for t in anyio.run(server.mcp.list_tools)}
+    schemas = {
+        t.name: t.model_dump(by_alias=True, exclude_none=True)["inputSchema"]
+        for t in anyio.run(server.mcp.list_tools)
+    }
 
     def types(tool, field):
         prop = schemas[tool]["properties"][field]
@@ -469,3 +472,51 @@ def test_sibling_string_arguments_stay_narrow():
         ("compute_sentencing_range", "statute_choice"),
     ):
         assert "array" not in types(tool, field), f"{tool}.{field}"
+
+
+def test_current_protocol_revision_is_served_not_rejected():
+    """Modern clients (e.g. claude.ai) send protocol revision 2026-07-28 with _meta."""
+    import anyio
+    import httpx
+    from mcp_types import (
+        CLIENT_CAPABILITIES_META_KEY,
+        CLIENT_INFO_META_KEY,
+        PROTOCOL_VERSION_META_KEY,
+    )
+    from mcp_types.version import SUPPORTED_PROTOCOL_VERSIONS
+
+    modern = "2026-07-28"
+    assert modern in SUPPORTED_PROTOCOL_VERSIONS, f"SDK does not support {modern}"
+
+    meta = {
+        PROTOCOL_VERSION_META_KEY: modern,
+        CLIENT_CAPABILITIES_META_KEY: {},
+        CLIENT_INFO_META_KEY: {"name": "test-client", "version": "1"},
+    }
+
+    from lawful_mcp.server import _streamable_app, mcp
+
+    async def run():
+        app = _streamable_app()
+        async with mcp.session_manager.run():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+                r = await client.post(
+                    "/mcp",
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": modern,
+                        "mcp-method": "tools/list",
+                    },
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}},
+                )
+                assert r.status_code == 200, f"{modern} rejected: {r.text[:200]}"
+                tools = r.json()["result"]["tools"]
+                tool_names = {t["name"] for t in tools}
+                assert "precedent_search" in tool_names
+                assert "inputSchema" in tools[0]
+                assert "readOnlyHint" in tools[0]["annotations"]
+
+    anyio.run(run)
+
