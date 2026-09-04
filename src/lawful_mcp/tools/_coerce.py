@@ -91,8 +91,8 @@ def coerce_int(v: Any) -> int | None:
 def coerce_list(v: Any) -> list | None:
     """Normalise a list argument, including one double-encoded as JSON.
 
-    Some models send ``'["15"]'`` — a JSON array inside a string — so tools
-    widen the parameter type to accept a string and normalise here.
+    Callers occasionally pass JSON strings like '["15"]' or '[{...}]';
+    widen the parameter type and normalise here.
     list/tuple stays a list, a JSON array string is parsed, any other scalar
     becomes a one-element list, and empty or null-ish input becomes None.
     """

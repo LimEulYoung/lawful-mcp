@@ -24,6 +24,7 @@ from mcp.types import ToolAnnotations
 from . import tools as _t
 from .config import corpus_db_path, dive_config
 from .deps import build_deps, build_dive_subagent
+from .tools.compute_sentencing_range import ChargeArg
 
 logger = logging.getLogger("lawful-mcp")
 
@@ -159,18 +160,18 @@ _DESC_SENTENCE_STATISTICS = (
 )
 _DESC_COMPUTE_SENTENCING_RANGE = (
     "통합 양형 도구 — 죄명에서 법정형→처단형→권고형→선고 검증까지, 인자를 채울수록 깊은 단계로 자동 진행: "
-    "charge만=lookup(법정형·leaf 후보·인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
-    "+guideline_leaf_id·guideline_factors=권고형 / +sentence_months·fine_amount(+probation_factors)=final(선고형·집행유예 검증). "
-    "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정한 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
+    "charge만=lookup(법정형·권고범위·인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
+    "+guideline_type·guideline_factors=권고형 / +sentence_months·fine_amount(+probation_factors)=final(선고형·집행유예 검증). "
+    "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
     "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 호출당 하나"
-    "(list는 죄명별 매칭 유도[multiple_charges]), 숫자·ID 불가"
-    "(조문 번호·sentence_statistics의 charge_id·leaf id 아님; 숫자면 죄명 문자열로 유도[charge_numeric]). "
+    "(여러 죄는 각각 호출; list면 죄명별 유도[multiple_charges]), 숫자·ID 불가"
+    "(조문번호·charge_id 아님; 숫자면 유도[charge_numeric]). "
     "offense_date=행위 일자(지정 시 행위시 조문). "
     "sg_category_id·statute_choice·branch_key·reference_choice=ambiguous_* 응답이 후보를 줄 때. "
     "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=가중감경 list(lookup enum에서). "
-    "guideline_leaf_id·guideline_factors=양형기준 leaf·특별인자. "
+    "guideline_type·guideline_leaf_id·guideline_factors=권고유형(lookup 목록 명칭 그대로)·leaf_id·특별인자. "
     "sentence_months=검증 선고형(자유형·월)·fine_amount=벌금(원)·probation_factors=집행유예 인자(dict). act_count=동종 다행위 수(≥2면 경합범 가중 자동).\n"
-    "후속 단계 값은 이전 응답 enum에 있는 key만 쓰고 추측 금지. 응답의 '출처'(양형기준 해설서 PDF)가 있으면 인용 링크로 제시."
+    "후속 단계 값은 이전 응답 enum에 있는 key만 쓰고 추측 금지. 응답의 '출처'(해설서 PDF)가 있으면 인용 링크로 제시."
 )
 _DESC_PRECEDENT_DIVE = (
     "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 500자 내외 생성 요약을 반환. "
@@ -266,21 +267,10 @@ def sentence_statistics(
     openWorldHint=False,
 )
 def compute_sentencing_range(
-    # Only this argument also accepts `list`. The MCP layer runs json.loads over
-    # any JSON-looking string argument *before* the tool does (SDK
-    # `func_metadata.pre_parse_json`, applied wherever the annotation is not
-    # exactly `str`), so `charge='[299,298,297]'` arrives as a list and a narrow
-    # `str | None` rejects the value that layer just produced. That is precisely
-    # the shape the charge_numeric hint exists for — article numbers carried over
-    # from a previous tool result — so the hint never reached the caller here,
-    # while `'298'` and `'297의2'` (scalar, non-JSON) always worked. Taking it
-    # wide lets the tool's own coerce_str fold it back to "299, 298, 297" and the
-    # hint fires as intended.
-    # Sibling string arguments stay narrow on purpose: widening only pays off
-    # where a prepared answer exists for the wide value. A list reaching `query`
-    # or `charges` would instead be joined into one comma-separated search term
-    # and searched silently, which is worse than a validation error.
-    charge: str | list | None = None,
+    # charge shares the same ChargeArg as the core tool (wire schema `string` and required;
+    # lists are folded by BeforeValidator before schema validation). Sibling string arguments
+    # remain narrow: widening is only beneficial when an answer is prepared for the wide value.
+    charge: ChargeArg,
     sg_category_id: int | None = None,
     statute_choice: str | None = None,
     branch_key: str | None = None,
@@ -290,6 +280,7 @@ def compute_sentencing_range(
     is_solicitor: bool = False,
     statutory_modifications: list[dict] | None = None,
     guideline_leaf_id: int | None = None,
+    guideline_type: str | None = None,
     guideline_factors: dict | None = None,
     sentence_months: int | None = None,
     fine_amount: int | None = None,
@@ -309,6 +300,7 @@ def compute_sentencing_range(
         is_solicitor=is_solicitor,
         statutory_modifications=statutory_modifications,
         guideline_leaf_id=guideline_leaf_id,
+        guideline_type=guideline_type,
         guideline_factors=guideline_factors,
         sentence_months=sentence_months,
         fine_amount=fine_amount,

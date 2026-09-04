@@ -13,13 +13,14 @@ Each is a plain function: import them directly, or take ``agents.TOOLS`` to
 register the set with a pydantic-ai agent. Their docstrings are the tool
 descriptions a model reads, which is why they are written in Korean.
 """
-from .compute_sentencing_range import compute_sentencing_range
+from .compute_sentencing_range import ChargeArg, compute_sentencing_range
 from .precedent_dive import precedent_dive
 from .precedent_search import precedent_search
 from .sentence_statistics import sentence_statistics
 from .statutes import statute_lookup
 
 __all__ = [
+    "ChargeArg",
     "compute_sentencing_range",
     "statute_lookup",
     "precedent_search",

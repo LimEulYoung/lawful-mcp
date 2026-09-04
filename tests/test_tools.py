@@ -426,30 +426,23 @@ def test_precedent_dive_without_model_is_not_registered(monkeypatch):
     assert build_dive_subagent() is None
 
 
-def test_mcp_layer_lets_a_json_looking_charge_through():
-    """The validation layer must not reject what it just parsed for us.
-
-    A JSON-looking string argument is json.loads-ed before the tool runs, so
-    `charge='[299,298,297]'` becomes a list. A narrow annotation turned that into
-    a validation error and the charge_numeric hint never reached the caller —
-    over MCP only, since the tool itself takes the argument wide.
-    """
-    import anyio
-
-    from lawful_mcp import server
-
-    async def call(value):
-        return await server.mcp.call_tool(
-            "compute_sentencing_range", {"charge": value})
-
-    assert "charge_numeric" in str(anyio.run(call, "[299,298,297]"))
-    # Shapes that already worked must keep working.
-    assert "charge_numeric" in str(anyio.run(call, "298"))
-    assert "charge_numeric" in str(anyio.run(call, "297의2"))
+def test_guideline_type_resolves_and_formats_recommendation(ctx):
+    """guideline_type natural language input enters recommended range computation."""
+    rec_out = tools.compute_sentencing_range(ctx, charge="사기", guideline_type="일반사기 1유형")
+    assert "## status: ok" in rec_out
+    assert "## stage: 권고형" in rec_out
+    assert "일반사기 1유형" in rec_out
 
 
-def test_sibling_string_arguments_stay_narrow():
-    """The asymmetry above is a decision, not an oversight — keep it visible."""
+def test_mixed_charge_list_with_number_and_name(ctx):
+    """Mixed numbers and single charge name discards numbers with an explanatory note."""
+    out = tools.compute_sentencing_range(ctx, charge=[6, "사기"])
+    assert "## status: ok" in out
+    assert "charge 리스트의 숫자 6 은 무시했습니다" in out
+
+
+def test_charge_is_string_and_required():
+    """Wire schema exposes charge as string and required, not array or null."""
     import anyio
 
     from lawful_mcp import server
@@ -465,13 +458,54 @@ def test_sibling_string_arguments_stay_narrow():
             return {b["type"] for b in prop["anyOf"] if "type" in b}
         return {prop["type"]} if "type" in prop else set()
 
-    assert "array" in types("compute_sentencing_range", "charge")
+    schema = schemas["compute_sentencing_range"]
+    assert types("compute_sentencing_range", "charge") == {"string"}
+    assert "charge" in schema.get("required", [])
+
     for tool, field in (
         ("precedent_search", "query"),
+        ("precedent_search", "case_number"),
+        ("precedent_search", "court_name"),
         ("sentence_statistics", "charges"),
         ("compute_sentencing_range", "statute_choice"),
+        ("compute_sentencing_range", "offense_date"),
     ):
         assert "array" not in types(tool, field), f"{tool}.{field}"
+
+
+def test_real_array_charge_folds_before_validation(monkeypatch):
+    """Clients sending a real list despite wire schema fold via BeforeValidator."""
+    import anyio
+
+    from lawful_mcp import server
+    from lawful_mcp.tools._coerce import coerce_list
+
+    seen = {}
+
+    def _stub(ctx, **kw):
+        seen.update(kw)
+        return ""
+
+    monkeypatch.setattr(tools, "compute_sentencing_range", _stub)
+    anyio.run(server.mcp.call_tool, "compute_sentencing_range", {"charge": ["살인"]})
+    assert seen["charge"] == "살인"
+    anyio.run(server.mcp.call_tool, "compute_sentencing_range", {"charge": ["주거침입", "절도"]})
+    assert coerce_list(seen["charge"]) == ["주거침입", "절도"]
+
+
+def test_mcp_layer_lets_a_json_looking_charge_through():
+    """Both JSON-looking string and scalar charges reach the tool and trigger guidance."""
+    import anyio
+
+    from lawful_mcp import server
+
+    async def call(value):
+        return await server.mcp.call_tool(
+            "compute_sentencing_range", {"charge": value})
+
+    assert "charge_numeric" in str(anyio.run(call, "[299,298,297]"))
+    assert "charge_numeric" in str(anyio.run(call, "298"))
+    assert "charge_numeric" in str(anyio.run(call, "297의2"))
 
 
 def test_current_protocol_revision_is_served_not_rejected():
