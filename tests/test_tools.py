@@ -493,6 +493,97 @@ def test_real_array_charge_folds_before_validation(monkeypatch):
     assert coerce_list(seen["charge"]) == ["주거침입", "절도"]
 
 
+def test_sentencing_optional_string_args_have_no_array_branch_and_fold_lists():
+    """Wire schema for optional string args is string|null and folds incoming lists."""
+    import json
+    from pydantic_ai.tools import Tool
+
+    t = Tool(tools.compute_sentencing_range)
+    props = t.tool_def.parameters_json_schema["properties"]
+    for name in ("branch_key", "statute_choice", "reference_choice", "guideline_type", "offense_date"):
+        kinds = {b.get("type") for b in props[name]["anyOf"]}
+        assert kinds == {"string", "null"}, f"{name}: {props[name]}"
+        assert props[name]["default"] is None
+    v = t.function_schema.validator
+
+    def parse(extra: str) -> dict:
+        return v.validate_json('{"charge": "살인", %s}' % extra)
+
+    assert parse('"branch_key": [1]')["branch_key"] == "1"
+    assert parse('"branch_key": ["①"]')["branch_key"] == "①"
+    assert parse('"branch_key": 3')["branch_key"] == "3"
+    assert parse('"branch_key": null')["branch_key"] is None
+    assert parse('"branch_key": [null]')["branch_key"] is None
+    assert parse('"offense_date": ["2022-02-14"]')["offense_date"] == "2022-02-14"
+    garbage = parse('"branch_key": [{"start": "①2"}]')["branch_key"]
+    assert isinstance(garbage, str) and "①2" in garbage
+    assert parse('"statute_choice": ["형법§257", "폭처법§2③"]')["statute_choice"] == "형법§257, 폭처법§2③"
+
+
+def test_branch_key_matcher_reads_paragraph_and_item_structure():
+    """Branch keys parse into (para, item) structure and match flexibly."""
+    import importlib
+    csr_module = importlib.import_module("lawful_mcp.tools.compute_sentencing_range")
+    match, label = csr_module._match_branch_option, csr_module._branch_key_label
+
+    def pick(key, *keys):
+        chosen = match(key, [{"key": k} for k in keys])
+        return chosen and chosen["key"]
+
+    special = ("①", "②", "③-1", "③-2")
+    assert pick("①", *special) == "①" and pick("1", *special) == "①"
+    assert pick("3-1", *special) == pick("③1", *special) == pick("③-1", *special) == "③-1"
+    assert pick("3", *special) is None and pick("12", *special) is None
+    econ = ("①1", "①2")
+    assert pick("①2", *econ) == pick("2", *econ) == pick("1-2", *econ) == "①2" and pick("1", *econ) == "①1"
+    assert pick("12", *econ) is None
+    dui_versioned = ("1호", "2호", "3호")
+    assert pick("③2", *dui_versioned) == pick("2", *dui_versioned) == pick("3-2", *dui_versioned) == "2호"
+    halves = ("②전단", "②후단")
+    assert pick("전단", *halves) == pick("2-전단", *halves) == "②전단" and pick("2", *halves) is None
+    assert pick("①전단", "전단", "후단") == "전단"
+    assert pick("① 단서 제1호", "① 단서 제1호", "① 단서 제2호") == "① 단서 제1호"
+
+    for keys in (special, econ, dui_versioned, halves, ("살인", "치사"), ("①본문", "①단서"),
+                 ("①1", "①1의2", "①2", "①3", "①4"), ("1", "1의2", "2", "3", "4")):
+        for k in keys:
+            assert pick(k, *keys) == k, (k, keys)
+    assert [label(k) for k in special] == ["1", "2", "3-1", "3-2"]
+    assert [label(k) for k in ("①1", "①2", "1호", "②전단", "②_상해", "①1의2", "살인")] == [
+        "1-1", "1-2", "1", "2-전단", "2-상해", "1-1의2", "살인"]
+
+
+def test_branch_menu_prints_ascii_keys_and_a_folded_list_lands_on_a_valid_key(ctx):
+    """Branch menu renders ASCII keys, folded list input lands on option, and branch: token does not leak."""
+    import json
+    from pydantic_ai.tools import Tool
+
+    charge = "도로교통법위반(음주운전)"
+    menu = tools.compute_sentencing_range(ctx, charge=charge)
+    assert "## status: needs_branch_key" in menu
+    assert "- 3-1: " in menu and "- 3-2: " in menu and "- 3-3: " in menu
+    assert 'branch_key="3-1"' in menu
+
+    folded = Tool(tools.compute_sentencing_range).function_schema.validator.validate_json(
+        json.dumps({"charge": charge, "branch_key": [2]}, ensure_ascii=False)
+    )
+    ok = tools.compute_sentencing_range(ctx, **folded)
+    assert "## status: ok" in ok
+    assert "## branch_key 선택: 3-2 — 혈중알코올농도가 0.08퍼센트 이상" in ok
+    assert "- 정량 근거: 본조 분기 3-2" in ok
+    assert "정량 근거: branch:" not in ok
+
+    for raw in ("3-2", "2", "③2"):
+        out = tools.compute_sentencing_range(ctx, charge=charge, branch_key=raw)
+        assert "## status: ok" in out, raw
+
+    bad = tools.compute_sentencing_range(ctx, charge=charge, branch_key="9")
+    assert "## status: invalid_branch_key" in bad
+    assert "branch_key='9' 는 아래 목록에 없습니다" in bad
+    assert "문자열 하나로" in bad
+    assert "- 3-1: " in bad
+
+
 def test_mcp_layer_lets_a_json_looking_charge_through():
     """Both JSON-looking string and scalar charges reach the tool and trigger guidance."""
     import anyio

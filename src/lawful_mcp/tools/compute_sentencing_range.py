@@ -134,6 +134,10 @@ def _source_label(src: str) -> str:
     if src.startswith("reference_"):
         mode, _, target = src[len("reference_"):].partition(":")
         return f"{mode} 참조 → {target}" if target else f"{mode} 참조"
+    if src.startswith("branch:"):
+        return f"본조 분기 {_branch_key_label(src[len('branch:'):])}"
+    if src.startswith("versioned:"):
+        return f"행위시 시점본 (시행 {src[len('versioned:'):]})"
     return src
 
 
@@ -496,6 +500,63 @@ def _penalty_inline(p: EffectivePenalty) -> str:
     return " · ".join(parts) if parts else "정량 미상 (원범죄 호별 분기 등)"
 
 
+# ---------- Branch key notation and matching ----------
+
+_CIRCLED_DIGITS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
+def _parse_branch_key(key: object) -> tuple[int | None, str]:
+    """Parse branch key into (paragraph_num, remainder).
+
+    The remainder strips whitespace, '제', '호', and delimiters.
+    Paragraph markers match circled digits, '1항', or '1-' (when followed by a tail).
+    """
+    s = re.sub(r"\s+", "", str(key or ""))
+    para: int | None = None
+    if s and s[0] in _CIRCLED_DIGITS:
+        para, s = _CIRCLED_DIGITS.index(s[0]) + 1, s[1:]
+    else:
+        m = re.match(r"^제?(\d+)항(.*)$", s) or re.match(r"^(\d+)[-_·.](.+)$", s)
+        if m:
+            para, s = int(m.group(1)), m.group(2)
+    rest = re.sub(r"[-_·.]", "", s)
+    rest = re.sub(r"제(?=\d)", "", rest)
+    rest = re.sub(r"(\d)(호|항)$", r"\1", rest)
+    return para, rest
+
+
+def _branch_key_label(key: object) -> str:
+    """ASCII representation for menus and trace lines: ① -> 1, ①2 -> 1-2, ③-1 -> 3-1, 1호 -> 1."""
+    para, rest = _parse_branch_key(key)
+    if para is not None and rest:
+        return f"{para}-{rest}"
+    if para is not None:
+        return str(para)
+    return rest or str(key)
+
+
+def _match_branch_option(branch_key: str, opts: list[dict]) -> dict | None:
+    """Match caller's branch_key against menu options. Returns None if ambiguous or not found."""
+    want = _parse_branch_key(branch_key)
+    parsed = [(o, _parse_branch_key(o.get("key"))) for o in opts]
+    exact = [o for o, p in parsed if p == want]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    para, rest = want
+    if para is None and rest.isdigit():
+        bare = [o for o, p in parsed if p == (int(rest), "")]
+        if len(bare) == 1:
+            return bare[0]
+    menu_paras = {p[0] for _, p in parsed}
+    if rest and (menu_paras == {None} or (para is None and len(menu_paras) == 1)):
+        by_rest = [o for o, p in parsed if p[1] == rest]
+        if len(by_rest) == 1:
+            return by_rest[0]
+    return None
+
+
 def _penalty_from_branch(opt: dict, *, branch_key: str) -> EffectivePenalty:
     """Build a penalty from one branch option.
 
@@ -824,14 +885,15 @@ def _resolve_payload(
                 options=opts,
                 message="branch_key 인자로 옵션 선택 필요.",
             )
-        chosen = next((o for o in opts if o.get("key") == branch_key), None)
+        chosen = _match_branch_option(branch_key, opts)
         if chosen is None:
             return None, PendingResolution(
                 kind="branch_invalid",
                 options=opts,
-                message=f"branch_key={branch_key!r} 는 유효하지 않음.",
+                message=(f"branch_key={branch_key!r} 는 아래 목록에 없습니다 — "
+                         "목록의 키를 문자열 하나로 그대로 넣으세요."),
             )
-        penalty = _penalty_from_branch(chosen, branch_key=branch_key)
+        penalty = _penalty_from_branch(chosen, branch_key=chosen.get("key", branch_key))
         # Each branch states its own sentence kinds, so they are taken as
         # written rather than unioned with the row's — unioning gave a fine
         # option to branches that carry only imprisonment. A fine formula is
@@ -844,7 +906,8 @@ def _resolve_payload(
             except (TypeError, json.JSONDecodeError, IndexError):
                 pass
         penalty.trace.append(
-            f"## branch_key 선택: {branch_key} — {chosen.get('cond', '')[:80]}"
+            f"## branch_key 선택: {_branch_key_label(chosen.get('key', branch_key))} — "
+            f"{chosen.get('cond', '')[:80]}"
         )
         return penalty, None
 
@@ -1740,8 +1803,8 @@ def _format_article(row: sqlite3.Row) -> str:
 
 
 def _format_branch_option(o: dict) -> str:
-    key = o.get("branch_key")
-    cond = o.get("branch_condition") or "기본"
+    key = _branch_key_label(o.get("key", "?"))
+    cond = (o.get("cond") or "").strip()
     parts: list[str] = []
     imp_lo, imp_hi = o.get("imp_min_months"), o.get("imp_max_months")
     if imp_lo is not None or imp_hi is not None:
@@ -2782,7 +2845,8 @@ def _format_pending_response(
         lines.append(f"## branch_options ({len(pending.options)})")
         for o in pending.options:
             lines.append(_format_branch_option(o))
-        lines.append("## 호출: branch_key=\"...\" 인자 명시 후 재호출")
+        first = _branch_key_label(pending.options[0].get("key")) if pending.options else "1"
+        lines.append(f'## 호출: 위 목록의 키를 branch_key 에 문자열 하나로 넣어 재호출 (예: branch_key="{first}")')
     elif pending.kind in ("reference", "reference_invalid"):
         lines.append(f"## reference_articles ({len(pending.options)})")
         for ref in pending.options:
@@ -3129,33 +3193,62 @@ def _coerce_charge_arg(v: object) -> object:
 ChargeArg = Annotated[str, BeforeValidator(_coerce_charge_arg)]
 
 
+def _coerce_optional_str_arg(v: object) -> object:
+    """Fold list or numeric arguments into strings before Pydantic validation (BeforeValidator for OptStrArg).
+
+    The wire schema is string|null, but values deviating from the schema are folded rather than
+    failing schema validation. Lists fold to single items or comma-joined text. Numbers become str.
+    None and strings are passed through untouched.
+    """
+    def text(x: object) -> str:
+        if isinstance(x, str):
+            return x
+        if isinstance(x, (dict, list, tuple)):
+            return json.dumps(x, ensure_ascii=False)
+        return str(x)
+    if isinstance(v, (list, tuple)):
+        items = [x for x in v if x is not None]
+        if not items:
+            return None
+        return text(items[0]) if len(items) == 1 else ", ".join(text(x) for x in items)
+    if v is None or isinstance(v, str):
+        return v
+    return text(v)
+
+
+# Wire schema for 5 optional string arguments (statute_choice, branch_key, reference_choice,
+# guideline_type, offense_date): `anyOf[string, null]` with default null.
+# An array branch caused models (e.g. Grok) to send [1] or [{...}]. Narrowing to string|null eliminates
+# the garbage while BeforeValidator preserves robustness against clients sending arrays.
+OptStrArg = Annotated[str | None, BeforeValidator(_coerce_optional_str_arg)]
+
+
 # ---------- public tool ----------
 
 @dedup_guard("compute_sentencing_range")
 def compute_sentencing_range(
     ctx: RunContext[HarnessDeps],
     # charge is ChargeArg (above) — wire schema string and required, lists folded before validation.
-    # The body still contains defensive checks for list/JSON string/None for direct test invocations.
-    # Other parameters remain intentionally wide to accept loose model outputs and normalize via coerce_*.
-    # The MCP surface (`server.py`) uses the same ChargeArg for charge while keeping others narrow.
+    # The 5 optional string arguments use OptStrArg (above) — wire schema string|null, lists folded before validation.
+    # Integer/dict parameters remain wide to accept loose model outputs and normalize via coerce_*.
     charge: ChargeArg,
     sg_category_id: int | str | list | None = None,
-    statute_choice: str | list | None = None,
-    branch_key: str | list | None = None,
-    reference_choice: str | list | None = None,
+    statute_choice: OptStrArg = None,
+    branch_key: OptStrArg = None,
+    reference_choice: OptStrArg = None,
     is_attempted: bool = False,
     is_accessory: bool = False,
     is_solicitor: bool = False,
     # Subsequent stage parameters. Wide types normalized inside body.
     statutory_modifications: list | dict | str | None = None,
     guideline_leaf_id: int | str | list | None = None,
-    guideline_type: str | list | None = None,
+    guideline_type: OptStrArg = None,
     guideline_factors: dict | str | list | None = None,
     sentence_months: int | str | list | None = None,
     fine_amount: int | str | list | None = None,
     probation_factors: dict | str | list | None = None,
     act_count: int | str | list = 1,
-    offense_date: str | list | None = None,
+    offense_date: OptStrArg = None,
 ) -> str:
     """통합 양형 도구 — 죄명에서 출발해 법정형 → 처단형 → 권고형(양형기준) → 선고 검증까지 단계별 계산.
 
@@ -3183,7 +3276,8 @@ def compute_sentencing_range(
       sg_category_id: 동일 charge_key 가 복수 카테고리일 때 명시 (ambiguous_category 응답이 후보 제공).
       statute_choice: 같은 sg_category 안에 여러 row (ambiguous_statute 응답) 일 때
         구체 조항 명시 (예: "형법§257", "폭력행위등처벌에관한법률§2③").
-      branch_key: 분기형 row 의 옵션 key (예: "③2") — 응답이 후보를 제공.
+      branch_key: 분기 조항의 선택지 — needs_branch_key 응답 목록의 키를 문자열 하나로 그대로
+        (예: "1", "3-1"). 항 기호 표기("①", "③-1")도 같은 뜻으로 받는다.
       reference_choice: 가중·준용·분기 row 의 원범죄 명시 (예: "형법§347") — 응답이 안내.
       is_attempted: 미수 명시. 죄명 접미("살인미수" 등)로도 자동 인식되며, 접미와 이 플래그
         중 하나만 있어도 적용됩니다(OR).
