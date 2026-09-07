@@ -37,13 +37,6 @@ from typing import Literal, Sequence
 Level = Literal["감경", "기본", "가중"]
 _ACT_KINDS = {"행위", "행위_공통", "행위_미수"}
 
-# Deprecated and intentionally empty. A statutory floor per guideline
-# category was only ever an approximation from a representative article, and
-# it is wrong wherever articles inside one category carry different statutory
-# ranges (narcotics and robbery both do). The floor now comes per-article
-# from the charge-to-penalty map. Kept as an empty dict so an outside import
-# does not break.
-LEGAL_FLOOR_MONTHS: dict[str, int] = {}
 
 
 @dataclass(frozen=True)

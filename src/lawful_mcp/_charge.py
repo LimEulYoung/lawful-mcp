@@ -20,8 +20,7 @@ number of distinct charges per defendant — which is how multi-charge
 defendants leak into the single-charge pool that ``sentence_statistics``
 reports on.
 
-So normalisation touches spacing and punctuation only. The result is the same
-form as ``charge_key``; the two names mark caller intent, not different rules.
+So normalisation touches spacing and punctuation only.
 """
 from __future__ import annotations
 
@@ -40,19 +39,4 @@ def norm_charge(s: str) -> str:
     """
     if not s:
         return ""
-    s = _CHARGE_NORM_WS.sub("", s)
-    return s.translate(_DOT_VARIANTS)
-
-
-def charge_key(s: str) -> str:
-    """Lookup key into the charge-to-penalty map. Same rules as ``norm_charge``.
-
-    The mapping table has to tell offences apart —
-    ``도로교통법위반(음주운전)`` (drink-driving) and ``(무면허운전)`` (unlicensed
-    driving) and the bare form are three different entries — which is why the
-    parentheses survive here too.
-    """
-    if not s:
-        return ""
-    s = _CHARGE_NORM_WS.sub("", s)
-    return s.translate(_DOT_VARIANTS)
+    return _CHARGE_NORM_WS.sub("", s).translate(_DOT_VARIANTS)

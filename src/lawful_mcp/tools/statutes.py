@@ -203,6 +203,15 @@ _STATUTE_ALIASES = {
     "조특법": "조세특례제한법",
     "택상법": "택지소유상한에관한법률",
     "성폭법": "성폭력범죄의 처벌 등에 관한 특례법",
+    # Common abbreviations (outside the official st_statutes.short_name table) shared
+    # with the sentencing charge resolver (_charge_index). Values match st_statutes.name.
+    "특경법": "특정경제범죄 가중처벌 등에 관한 법률",
+    "아청법": "아동ㆍ청소년의 성보호에 관한 법률",
+    "폭처법": "폭력행위 등 처벌에 관한 법률",
+    "교특법": "교통사고처리 특례법",
+    "산안법": "산업안전보건법",
+    "전금법": "전자금융거래법",
+    "파견근로자보호법": "파견근로자 보호 등에 관한 법률",
 }
 
 

@@ -52,10 +52,13 @@ FULL_TABLES = [
     "sg_probation_factors",
     "sg_fine_conditions",
     "sg_ranges",
-    "charge_taxonomy",
-    "charge_family",
     "charge_legal_map",
     "clm_versions",
+    "official_charges_meta",
+    "official_charges",
+    "charge_aliases",
+    "charge_norm_map",
+    "official_guideline_map",
 ]
 
 # Statute whitelist for --statutes core. Matched against both ``name`` and

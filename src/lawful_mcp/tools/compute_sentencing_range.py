@@ -29,7 +29,7 @@ from typing import Annotated
 from pydantic import BeforeValidator
 from pydantic_ai import RunContext
 
-from .._charge import charge_key as _charge_key_normalize
+from .._charge import norm_charge
 from ..deps import HarnessDeps, open_db
 from ..eval.recommended_range import (
     AppliedFactor,
@@ -38,6 +38,9 @@ from ..eval.recommended_range import (
     in_range,
     within_range_position,
 )
+from ._charge_index import (
+    ARTICLE_REF_RE, Resolution as _Resolution, norm_cmp as _norm_cmp, numeric_charge_tokens, official_index,
+    strip_charge_decorations)
 from ._coerce import (
     coerce_dict, coerce_dict_list, coerce_int, coerce_list, coerce_str, to_iso_date)
 from ._dedup import dedup_guard
@@ -166,37 +169,17 @@ _SUFFIX_MODIFIERS: list[tuple[str, str]] = [
 ]
 
 
-# A leading bracketed number, as in "[1]상해". Judgments list their applied
-# provisions as "[1] 형법 §257 / [2] …", and the tag travels with the offence
-# name when a caller copies it across. No charge key in the mapping starts
-# with '[', so stripping it cannot cost a legitimate input.
-# ⚠ Strip only when something remains: a bare number ("[123]") belongs to
-# `_numeric_charge_tokens`, and emptying the string here would lose that path.
-_BRACKET_NUM_PREFIX_RE = re.compile(r"^\[\d{1,4}\]")
-
-# Wrapping quotes ('"협박"'), where a caller passes the offence name as if it
-# were a string literal. One such input came in three times running without
-# ever recovering: the quotes survived normalisation and the exact match was
-# missed. None of the 853 keys in the mapping holds a quote character, so —
-# as with the bracket tag — stripping cannot cost a legitimate input.
-# ⚠ One layer at a time, only when both ends pair up and something remains.
-# A lone quote, or one inside the string, is left alone.
-_WRAP_QUOTE_PAIRS = {
-    '"': '"', "'": "'", "`": "`", "＂": "＂", "＇": "＇",
-    "“": "”", "‘": "’", "「": "」", "『": "』",
-}
-
-
 @dataclass(frozen=True)
 class NormalizedCharge:
     """A normalised charge key plus any modifier split off its tail."""
 
     key: str                        # 정규화된 lookup 키 (suffix 제거 가능)
-    raw_key: str                    # charge_key() + 선행 번호 딱지·감싼 인용부호 제거 (suffix 미제거)
+    raw_key: str                    # norm_charge() + 선행 번호 딱지·감싼 인용부호 제거 (suffix 미제거)
     modifiers: dict[str, bool]      # {is_attempted, is_accessory, is_solicitor}
     suffix_split_applied: bool      # 자동 분리 발생 여부 (응답 trace)
-    bracket_prefix_stripped: str | None = None  # 제거된 딱지("[9]") — 응답 note 용
+    bracket_prefix_stripped: str | None = None  # 제거된 선행 번호 딱지("[9]") — 응답 note 용
     quotes_stripped: str | None = None          # 제거된 감싼 인용부호('""') — 응답 note 용
+    alias_resolved: tuple[str, str] | None = None  # (입력 표기, 해석 표기) — 약칭·개명·형법 괄호를 풀었을 때(note 용)
 
 
 def _normalize_charge(
@@ -207,34 +190,14 @@ def _normalize_charge(
     is_accessory: bool = False,
     is_solicitor: bool = False,
 ) -> NormalizedCharge:
-    """Split a charge into a lookup key and its modifiers.
+    raw, bracket_prefix, quotes_stripped = strip_charge_decorations(norm_charge(charge or ""))
+    index = official_index(conn)
 
-    Rules:
-      1. `charge_key()` normalises spacing and dots, keeping parentheses.
-      1-b. A leading bracketed number ('[1]상해') and wrapping quotes
-         ('"협박"') are stripped, but only when something remains after them.
-         Either can wrap the other ('[1] "협박"'), so they alternate.
-      2. A suffix (미수 / 교사 / 방조) at the *end* of the charge key splits off
-         and sets a modifier — but only when the parent charge, the key without
-         it, is itself in the mapping.
-      3. A modifier the caller stated (is_attempted and friends) overrides: the
-         two are OR-ed, never replaced.
-    """
-    raw = _charge_key_normalize(charge or "")
-    bracket_prefix = None
-    quotes_stripped = None
-    for _ in range(4):  # one layer each in the observed inputs; the cap is slack
-        m = _BRACKET_NUM_PREFIX_RE.match(raw)
-        if m and m.end() < len(raw):
-            bracket_prefix = (bracket_prefix or "") + m.group(0)
-            raw = raw[m.end():]
-            continue
-        closer = _WRAP_QUOTE_PAIRS.get(raw[:1])
-        if closer and len(raw) > 2 and raw.endswith(closer):
-            quotes_stripped = (quotes_stripped or "") + raw[0] + closer
-            raw = raw[1:-1]
-            continue
-        break
+    def canonical(s: str) -> tuple[str, tuple[str, str] | None] | None:
+        r = index.resolve_exact(s)
+        return (r.key, r.alias_from) if r is not None else None
+
+    alias_resolved = None
     modifiers: dict[str, bool] = {
         "is_attempted": bool(is_attempted),
         "is_accessory": bool(is_accessory),
@@ -243,21 +206,33 @@ def _normalize_charge(
 
     key = raw
     suffix_split = False
-    for suf, flag in _SUFFIX_MODIFIERS:
-        if not key.endswith(suf) or len(key) <= len(suf):
-            continue
-        parent = key[: -len(suf)]
-        # Split only when the parent offence actually exists; otherwise the
-        # suffix is part of the offence name, not a modifier.
-        hit = conn.execute(
-            "SELECT 1 FROM charge_legal_map WHERE charge_key=? LIMIT 1",
-            (parent,),
-        ).fetchone()
-        if hit is not None:
-            key = parent
-            modifiers[flag] = True
-            suffix_split = True
+    for _round in range(len(_SUFFIX_MODIFIERS)):
+        stripped = False
+        for suf, flag in _SUFFIX_MODIFIERS:
+            if not key.endswith(suf) or len(key) <= len(suf):
+                continue
+            if suf != "미수":
+                whole = index.resolve_exact(key)
+                if whole is not None and whole.derived is None and _norm_cmp(whole.key) == _norm_cmp(key):
+                    continue
+            parent = key[: -len(suf)]
+            phit = canonical(parent)
+            if phit is not None:
+                key = phit[0]
+                alias_resolved = phit[1] or alias_resolved
+                modifiers[flag] = True
+                suffix_split = stripped = True
+                break
+        if not stripped:
             break
+
+    if not suffix_split:
+        hit = canonical(raw)
+        if hit is None and raw.endswith("죄") and not raw.endswith("범죄") and len(raw) > 1:
+            hit = canonical(raw[:-1])
+        if hit is not None:
+            key = raw = hit[0]
+            alias_resolved = hit[1]
 
     return NormalizedCharge(
         key=key,
@@ -266,6 +241,7 @@ def _normalize_charge(
         suffix_split_applied=suffix_split,
         bracket_prefix_stripped=bracket_prefix,
         quotes_stripped=quotes_stripped,
+        alias_resolved=alias_resolved,
     )
 
 
@@ -279,10 +255,7 @@ _SELECT_ROW = (
     "has_conditional_branch, branch_options, "
     "reference_mode, reference_multiplier, reference_articles, "
     "is_alias, alias_of, "
-    # Two columns in this table are not read here. The `source` carried on a
-    # penalty is provenance built at runtime, not that column.
-    "also_in_categories, "
-    "sanity_warnings, fine_formula, act_descriptor "
+    "fine_formula, act_descriptor "
     "FROM charge_legal_map"
 )
 
@@ -294,6 +267,99 @@ class LookupResult:
     status: str
     rows: list[sqlite3.Row] = field(default_factory=list)
     candidates: list[sqlite3.Row] = field(default_factory=list)
+    candidate_names: list[str] = field(default_factory=list)
+    resolution: _Resolution | None = None
+
+
+def _guideline_keys(conn: sqlite3.Connection, officials: list[str]) -> dict[str, list[str]]:
+    """Map official charge names to their mapping keys. The official name itself is always included."""
+    out = {o: [o] for o in officials}
+    if not officials:
+        return out
+    try:
+        ph = ",".join("?" * len(officials))
+        rows = conn.execute(
+            f"SELECT official_name, charge_key FROM official_guideline_map WHERE official_name IN ({ph})",
+            officials).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    excluded = {o for o, k in rows if k == ""}
+    for o, k in rows:
+        if k and k not in out[o]:
+            out[o].append(k)
+    for o in excluded:
+        out[o] = [k for k in out[o] if k != o]
+    return out
+
+
+_PAYLOAD_COLS = (
+    "sg_category_id", "statute_id", "article_no_num", "article_branch", "paragraph", "sentence_kind_options",
+    "stat_imp_min_months", "stat_imp_max_months", "stat_fine_min_won", "stat_fine_max_won", "has_life", "has_death",
+    "has_conditional_branch", "branch_options", "reference_mode", "reference_multiplier", "reference_articles",
+    "fine_formula", "act_descriptor",
+)
+
+
+def _is_pointer_row(r: sqlite3.Row) -> bool:
+    """True if row is a pure alias pointer without its own quantities/branches/references."""
+    return bool(r["is_alias"]) and bool(r["alias_of"]) and not any(
+        r[c] for c in ("stat_imp_min_months", "stat_imp_max_months", "stat_fine_min_won", "stat_fine_max_won",
+                       "has_life", "has_death", "branch_options", "reference_mode", "fine_formula"))
+
+
+def _collapse_rows(rows: list[sqlite3.Row], prefer_key: str) -> list[sqlite3.Row]:
+    """Collapse duplicate rows across union of self-named and mapped rows."""
+    keys = {r["charge_key"] for r in rows}
+    ranked = sorted(rows, key=lambda r: (r["charge_key"] != prefer_key, bool(r["is_alias"])))
+    kept: list[sqlite3.Row] = []
+    seen: set[tuple] = set()
+    for r in ranked:
+        if _is_pointer_row(r) and r["alias_of"] in keys and r["alias_of"] != r["charge_key"]:
+            continue
+        payload = tuple(r[c] for c in _PAYLOAD_COLS)
+        if payload in seen:
+            continue
+        seen.add(payload)
+        kept.append(r)
+    order = {r["id"]: i for i, r in enumerate(rows)}
+    return sorted(kept, key=lambda r: order[r["id"]])
+
+
+def _rows_for_officials(conn: sqlite3.Connection, officials: list[str]) -> list[tuple[str, sqlite3.Row]]:
+    keys_by = _guideline_keys(conn, officials)
+    all_keys = list(dict.fromkeys(k for ks in keys_by.values() for k in ks))
+    if not all_keys:
+        return []
+    ph = ",".join("?" * len(all_keys))
+    rows = conn.execute(
+        _SELECT_ROW + f" WHERE charge_key IN ({ph}) "
+        "ORDER BY sg_category_id, statute_id, article_no_num, article_branch, paragraph", all_keys).fetchall()
+    by_key: dict[str, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_key.setdefault(r["charge_key"], []).append(r)
+    out: list[tuple[str, sqlite3.Row]] = []
+    for o in officials:
+        mine = [r for k in keys_by.get(o, []) for r in by_key.get(k, [])]
+        out.extend((o, r) for r in _collapse_rows(mine, o))
+    return out
+
+
+def _rows_for_official(conn: sqlite3.Connection, official: str) -> list[sqlite3.Row]:
+    return [r for _o, r in _rows_for_officials(conn, [official])]
+
+
+def _classify_rows(rows: list[sqlite3.Row], sg_category_id: int | None) -> LookupResult:
+    if sg_category_id is not None:
+        mine = [r for r in rows if r["sg_category_id"] == sg_category_id]
+        if mine:
+            return LookupResult(status="exact" if len(mine) == 1 else "exact_same_cat_multi_row", rows=mine)
+        return LookupResult(status="exact_wrong_category", rows=list(rows))
+    if len(rows) == 1:
+        return LookupResult(status="exact", rows=list(rows))
+    cats = {r["sg_category_id"] for r in rows}
+    if len(cats) == 1:
+        return LookupResult(status="exact_same_cat_multi_row", rows=list(rows))
+    return LookupResult(status="exact_cross_cat", rows=list(rows))
 
 
 def _lookup_charge(
@@ -301,68 +367,25 @@ def _lookup_charge(
     key: str,
     sg_category_id: int | None = None,
 ) -> LookupResult:
-    """Look up a charge: exact first, then substring candidates on a miss.
-
-    One charge key can exist under several sentencing categories. With no
-    category given, every matching row comes back for the caller to choose
-    between; the tool does not pick, because a wrong pick is invisible in the
-    answer.
-
-    With a category given but no row under it, an exact match in a *different*
-    category is looked up separately, so "right charge, wrong category" is
-    reported as that rather than as a fuzzy substring guess.
-    """
+    """Look up a charge: exact against official charges / guideline map first, then candidates."""
     if not key:
         return LookupResult(status="not_found")
+    rows = _rows_for_official(conn, key)
+    if rows:
+        return _classify_rows(rows, sg_category_id)
 
-    # 1. Exact match, within the given category if one was specified.
-    if sg_category_id is not None:
-        rows = conn.execute(
-            _SELECT_ROW + " WHERE charge_key=? AND sg_category_id=? "
-            "ORDER BY statute_id, article_no_num, article_branch, paragraph",
-            (key, sg_category_id),
-        ).fetchall()
-        if rows:
-            if len(rows) == 1:
-                return LookupResult(status="exact", rows=list(rows))
-            # One category can still hold several provisions for a charge —
-            # assault is in both the Criminal Act and the special act.
-            return LookupResult(status="exact_same_cat_multi_row", rows=list(rows))
-
-        # Not in that category: is it exact in another?
-        other = conn.execute(
-            _SELECT_ROW + " WHERE charge_key=? ORDER BY sg_category_id",
-            (key,),
-        ).fetchall()
-        if other:
-            return LookupResult(status="exact_wrong_category", rows=list(other))
-    else:
-        rows = conn.execute(
-            _SELECT_ROW + " WHERE charge_key=? "
-            "ORDER BY sg_category_id, statute_id, article_no_num, article_branch, paragraph",
-            (key,),
-        ).fetchall()
-        if rows:
-            if len(rows) == 1:
-                return LookupResult(status="exact", rows=list(rows))
-            cats = set(r["sg_category_id"] for r in rows)
-            if len(cats) == 1:
-                # Several rows in one category: the ambiguity is which
-                # provision, not which category.
-                return LookupResult(status="exact_same_cat_multi_row", rows=list(rows))
-            return LookupResult(status="exact_cross_cat", rows=list(rows))
-
-    # 2. substring fuzzy — '%KEY%' OR KEY LIKE '%cand%'
-    fuzzy = conn.execute(
-        _SELECT_ROW + " WHERE charge_key LIKE ? OR ? LIKE '%' || charge_key || '%' "
-        "ORDER BY sg_category_id, charge_key LIMIT 10",
-        (f"%{key}%", key),
-    ).fetchall()
-
-    if fuzzy:
-        return LookupResult(status="fuzzy_candidates", candidates=list(fuzzy))
-
-    return LookupResult(status="not_found")
+    res = official_index(conn).resolve(key)
+    if res.kind == "exact" and res.key != key:
+        inner = _lookup_charge(conn, res.key, sg_category_id)
+        if inner.status != "not_found":
+            return inner
+        return LookupResult(status="not_found", resolution=res)
+    if res.candidates:
+        pairs = _rows_for_officials(conn, list(res.candidates))
+        if pairs:
+            return LookupResult(status="fuzzy_candidates", candidates=[r for _n, r in pairs],
+                                candidate_names=[n for n, _r in pairs], resolution=res)
+    return LookupResult(status="not_found", resolution=res)
 
 
 def _resolve_alias(conn: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row:
@@ -1859,7 +1882,12 @@ def _format_stage_header(
             f"- note: 감싼 인용부호 {norm.quotes_stripped} 제거 → {norm.raw_key}"
             " — charge 는 죄명 문자열만"
         )
-    if row["is_alias"] and row["alias_of"]:
+    if norm.alias_resolved:
+        lines.append(
+            f"- note: 죄명 표기 해석 {norm.alias_resolved[0]} → {norm.alias_resolved[1]}"
+            " — 매핑 키는 이 표기(재호출도 이 표기로)"
+        )
+    if row["is_alias"] and row["alias_of"] and _norm_cmp(row["alias_of"]) != _norm_cmp(norm.key):
         lines.append(f"- 별칭 원본: {row['alias_of']}")
 
     lines.append(f"## 본조: {_format_article(payload_row)}")
@@ -2994,20 +3022,45 @@ def _format_wrong_cat_response(
     return "\n".join(lines)
 
 
-def _format_fuzzy_response(
-    norm: NormalizedCharge, candidates: list[sqlite3.Row]
-) -> str:
+def _format_fuzzy_response(norm: NormalizedCharge, result: LookupResult) -> str:
+    res = result.resolution
     lines = [
         "## status: not_found_with_candidates",
         "## stage: lookup",
         f"## charge: {norm.raw_key}",
-        "- 정확한 매칭 없음. 유사 후보:",
     ]
-    for c in candidates:
+    if res is not None and res.alias_from:
+        lines.append(f"- note: 죄명 표기 해석 {res.alias_from[0]} → {res.alias_from[1]}")
+    statute = res.statute if res is not None else None
+    if res is not None and res.kind == "exact" and statute:
         lines.append(
-            f"  - {c['charge_key']}  (sg_category_id={c['sg_category_id']}, "
-            f"{_format_article(c)})"
+            f"- '{res.key}' 은 죄명표의 괄호 없는 표기(그 밖의 조항 위반)라 그 이름의 양형기준 행이 없습니다."
+            f" {statute} 의 공식 죄명 중 양형기준에 등재된 것 — 해당 죄명으로 재호출:"
         )
+    elif res is not None and res.sub and statute:
+        lines.append(
+            f"- {statute}: '({res.sub})' 은 이 법률의 공식 죄명(대검 죄명표)이 아닙니다. 이 법률의 공식 죄명 중"
+            " 양형기준에 등재된 것:"
+        )
+    elif statute:
+        lines.append(f"- {statute}: 이 법률의 공식 죄명 중 양형기준에 등재된 것 — 해당 죄명으로 재호출:")
+    else:
+        lines.append(f"- '{norm.raw_key}' 은 아래 법률들의 부속 죄명입니다 — 적용 법조에 맞는 것으로 재호출:")
+    shown = len(dict.fromkeys(result.candidate_names))
+    if res is not None and len(res.candidates) > shown:
+        lines.append(f"- (이 법률의 공식 죄명 {len(res.candidates)}개 중 양형기준 등재 {shown}개 — 나머지는 권고형 없음)")
+    if res is not None and res.suffix_stripped:
+        lines.append(
+            f"- 접미 '{res.suffix_stripped}' 를 떼고 찾았습니다 — 재호출 때 미수·교사·방조는"
+            " is_attempted·is_solicitor·is_accessory 플래그로 넣습니다."
+        )
+    groups: dict[tuple[int, str], list[str]] = {}
+    for name, c in zip(result.candidate_names, result.candidates):
+        names = groups.setdefault((c["sg_category_id"], _format_article(c)), [])
+        if name not in names:
+            names.append(name)
+    for (cat, article), names in groups.items():
+        lines.append(f"  - {' · '.join(names)}  (sg_category_id={cat}, {article})")
     lines.append("- facts 의 부속표시 확인 후 정확한 charge 로 재호출.")
     return "\n".join(lines)
 
@@ -3033,33 +3086,56 @@ def _format_invalid_statute_choice_response(
     return "\n".join(lines)
 
 
-def _format_not_found_response(norm: NormalizedCharge) -> str:
+def _format_not_found_response(
+    norm: NormalizedCharge, result: LookupResult | None = None
+) -> str:
+    res = result.resolution if result is not None else None
     lines = [
         "## status: not_found",
         "## stage: lookup",
         f"## charge: {norm.raw_key}",
-        f"- {_NOT_FOUND_HINT}",
-        "- 양형기준 비등재 (48 카테고리 미등재) — 권고 적용 안 됨.",
     ]
+    alias_note = norm.alias_resolved or (res.alias_from if res is not None else None)
+    if alias_note:
+        lines.append(f"- note: 죄명 표기 해석 {alias_note[0]} → {alias_note[1]}")
+    if res is not None and res.kind == "exact":
+        name = res.key or norm.raw_key
+        if res.law_repealed:
+            lines.append(
+                f"- '{name}' 의 법률은 폐지되었습니다 — 이 이름으로는 양형기준에 등재되어 있지 않습니다."
+                " 후속 법률이 있으면 그 현행 명칭을 `statute_lookup` 으로 확인하고 재호출."
+            )
+        elif res.status == "구법":
+            lines.append(
+                f"- '{name}' 은 옛 죄명표 표기라 양형기준에 등재되어 있지 않습니다"
+                + (f" — 현행 죄명 '{res.successor}' 으로 재호출." if res.successor
+                   else " — 현행 죄명은 `statute_lookup` 으로 확인.")
+            )
+        else:
+            lines.append(
+                f"- '{name}' 은 공식 죄명(대검 죄명표)이지만 양형기준(48개 범죄군)에 등재되지 않았습니다"
+                " — 권고형 없음. 다른 표기로 다시 찾을 필요 없습니다."
+            )
+        lines.append("- 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인.")
+    elif res is not None and res.candidates and res.statute:
+        lines.append(
+            f"- '{res.statute}' 의 공식 죄명 {len(res.candidates)}개는 모두 양형기준(48개 범죄군)에 등재되지 않았습니다"
+            " — 권고형 없음. 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인."
+        )
+    elif res is not None and res.candidates:
+        shown = " · ".join(res.candidates[:6]) + (" 외" if len(res.candidates) > 6 else "")
+        lines.append(
+            f"- '{norm.raw_key}' 을 부속 죄명으로 가진 공식 죄명({shown})은 양형기준에 등재되지 않았습니다"
+            " — 권고형 없음. 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인."
+        )
+    else:
+        lines.append(
+            f"- '{norm.raw_key}' 은 공식 죄명(대검 죄명표)에 없는 표기입니다. 판결문 죄명 표기(예: 특수상해,"
+            " 도로교통법위반(음주운전))로 재호출하고, 법률명만 알면 charge='<법률명>위반' 으로 그 법률의 등재 죄명을 받으세요."
+        )
+        lines.append(f"- {_NOT_FOUND_HINT}")
     return "\n".join(lines)
 
-
-# ---------- numeric charge (charge_numeric) ----------
-#
-# Much of the traffic that found nothing had an integer in `charge` rather
-# than an offence name — a number an earlier tool had handed the caller: an
-# article number from `statute_lookup` (charge=[299,298,297] straight after
-# articles=['297'..'300']), or a charge_id from `sentence_statistics`
-# (charge=[1155], 준강제추행, straight after its candidate list). Answering
-# with the ordinary not_found ("no sentencing guideline") reads as "this
-# offence has no guideline", and callers repeated the same number across
-# turns — five in a row, observed. A distinct status breaks that loop.
-#
-# ⚠ The number is not resolved and carried forward. The id spaces overlap:
-# 형법 §298 is 강제추행 while `sentence_statistics` charge_id 298 is 뇌물수수,
-# so guessing produces a plausible wrong answer. Offering candidates by
-# reverse article lookup would be possible, but comes second — only if this
-# wording turns out not to work.
 
 # Cap on a charge list, the same policy value as statute_lookup's "answer the
 # first eight".
@@ -3069,18 +3145,6 @@ _MULTI_CHARGE_ITEM_CAP = 8
 def _format_multiple_charges_response(
     conn: sqlite3.Connection, items: list[str]
 ) -> str:
-    """A list of charges: report per-item matching rather than looking up the
-    joined string, and send the caller back one charge at a time.
-
-    Joining through `coerce_str` ("주거침입, 퇴거불응") makes a single key that
-    cannot exist, and the call fell through to not_found. Of eighteen calls
-    that produced nothing in one day, fourteen had this shape: the candidates
-    held the right answer for each part, but nothing said one charge per call,
-    so half of them repeated the list until they gave up. Saying which items
-    match exactly removes that round trip, and closes the path from an empty
-    result into a numeric sweep (charge=[1..10] eight times in a row, straight
-    after one such empty result).
-    """
     shown = items[:_MULTI_CHARGE_ITEM_CAP]
     lines = [
         "## status: multiple_charges",
@@ -3094,15 +3158,11 @@ def _format_multiple_charges_response(
     ]
     for item in shown:
         norm = _normalize_charge(conn, item)
-        # Digits left after the quotes come off ('"298"') take the numeric
-        # hint, exactly as they do on the single-charge path.
-        if _numeric_charge_tokens(item) is not None or _numeric_charge_tokens(norm.key) is not None:
+        if (numeric_charge_tokens(item) is not None or numeric_charge_tokens(norm.key) is not None
+                or ARTICLE_REF_RE.search(item)):
             lines.append(f"- {item}: 숫자 — 죄명 문자열을 넣으세요")
             continue
         result = _lookup_charge(conn, norm.key)
-        # Re-call on raw_key, not norm.key: the latter has the suffix split
-        # off, so '살인미수' would come back as '살인' and calling that loses
-        # the attempt reduction.
         if result.status == "exact":
             lines.append(
                 f"- {norm.key}: 매칭 ok — charge='{norm.raw_key}' 로 재호출"
@@ -3112,33 +3172,19 @@ def _format_multiple_charges_response(
                 f"- {norm.key}: 매칭 ok(조항·카테고리 후보 여러 개) —"
                 f" charge='{norm.raw_key}' 로 재호출하면 후보를 안내합니다")
         elif result.status == "fuzzy_candidates":
-            cands = ", ".join(c["charge_key"] for c in result.candidates[:3])
-            lines.append(f"- {norm.key}: 정확 일치 없음 — 유사 후보: {cands}")
-        else:
+            cands = ", ".join(dict.fromkeys(result.candidate_names[:3]))
+            why = "괄호 없는 표기" if (result.resolution is not None and result.resolution.kind == "exact") else "공식 죄명이 아님"
+            lines.append(f"- {norm.key}: {why} — 이 법률의 등재 죄명: {cands}")
+        elif result.resolution is not None and result.resolution.kind == "exact":
             lines.append(
-                f"- {norm.key}: 양형기준 비등재(권고 없음) — 실선고 분포는"
+                f"- {norm.key}: 공식 죄명이지만 양형기준 비등재(권고 없음) — 실선고 분포는"
                 f" sentence_statistics(charges='{norm.key}') 로 확인 가능")
+        else:
+            lines.append(f"- {norm.key}: 공식 죄명(대검 죄명표)에 없는 표기 — 판결문 죄명 표기로 재호출")
     if len(items) > len(shown):
         lines.append(
             f"- (나머지 {len(items) - len(shown)}개 생략: {', '.join(items[len(shown):])})")
     return "\n".join(lines)
-
-
-_NUMERIC_CHARGE_TOKEN_RE = re.compile(r"^\d{1,5}(?:(?:의|-)\d{1,3})?$")
-_NUMERIC_CHARGE_SEP_RE = re.compile(r"[\s\[\]()'\"‚,，·;/]+")
-
-
-def _numeric_charge_tokens(charge: str) -> list[str] | None:
-    """The tokens, if `charge` is nothing but numbers; None otherwise.
-
-    One letter anywhere — Hangul or Latin — makes it an offence name and
-    leaves it to the ordinary lookup. Branch forms like '297의2' count as
-    numeric.
-    """
-    parts = [p for p in _NUMERIC_CHARGE_SEP_RE.split(charge) if p]
-    if not parts or not all(_NUMERIC_CHARGE_TOKEN_RE.match(p) for p in parts):
-        return None
-    return list(dict.fromkeys(parts))[:8]
 
 
 def _format_charge_numeric_response(charge: str, tokens: list[str]) -> str:
@@ -3268,7 +3314,8 @@ def compute_sentencing_range(
       charge: 판결문 form 죄명 (예: 살인, 도로교통법위반(음주운전)). 정규화는 도구 내부에서 처리.
         **한 호출에 하나** — 여러 죄는 죄명별로 각각 호출. 리스트로 오면 계산하지 않고
         죄명별 매칭 현황으로 유도한다(multiple_charges). 경합 사안은 죄명별로 각각 계산.
-        **숫자·ID 불가** — 조문 번호나 charge_id 가 아닌 한국어 죄명 문자열을 넣으세요.
+        법률명만 알면 '<법률명>위반' — 그 법률의 등재 죄명 후보를 돌려준다(not_found_with_candidates).
+        **숫자·ID 불가** — 조문 번호나 식별자 숫자가 아닌 한국어 죄명 문자열을 넣으세요.
         숫자가 오면 계산하지 않고 재호출을 유도한다(charge_numeric).
       offense_date: 행위 일자 (예: '2013.7.30', '2013-07-30', '20130730'). 지정 시
         행위시 조문 본문·시점본 정량 반영 — 형법 §1 ① "범죄의 성립과 처벌은 행위시의
@@ -3312,8 +3359,8 @@ def compute_sentencing_range(
     if isinstance(charge, (list, tuple)):
         deduped = list(dict.fromkeys(
             s for s in (coerce_str(x) for x in charge) if s))
-        non_numeric = [s for s in deduped if _numeric_charge_tokens(s) is None]
-        numeric_items = [s for s in deduped if _numeric_charge_tokens(s) is not None]
+        non_numeric = [s for s in deduped if numeric_charge_tokens(s) is None]
+        numeric_items = [s for s in deduped if numeric_charge_tokens(s) is not None]
 
         if len(non_numeric) == 1 and len(numeric_items) >= 1:
             # Single non-numeric charge combined with numbers: use the charge and discard numbers.
@@ -3348,9 +3395,12 @@ def compute_sentencing_range(
             "- charge 인자 필요. 판결문 form 죄명 (예: 살인, 도로교통법위반(음주운전))."
         )
 
-    numeric_tokens = _numeric_charge_tokens(charge)
+    numeric_tokens = numeric_charge_tokens(charge)
     if numeric_tokens is not None:
         return _format_charge_numeric_response(charge, numeric_tokens)
+    article_ref = ARTICLE_REF_RE.search(charge) if charge_items is None else None
+    if article_ref:
+        return _format_charge_numeric_response(charge, [article_ref.group(1)])
 
     conn = open_db()
     try:
@@ -3367,7 +3417,7 @@ def compute_sentencing_range(
         # ('"298"'). Letting that through as an unlisted charge revives the
         # "no guideline for this offence" misreading that charge_numeric cuts,
         # so it goes to the same hint.
-        residual_numeric = _numeric_charge_tokens(norm.key)
+        residual_numeric = numeric_charge_tokens(norm.key)
         if residual_numeric is not None:
             return _format_charge_numeric_response(charge, residual_numeric)
         result = _lookup_charge(conn, norm.key, sg_category_id=sg_category_id)
@@ -3532,9 +3582,9 @@ def compute_sentencing_range(
             return _format_wrong_cat_response(norm, result.rows, sg_category_id)
 
         if result.status == "fuzzy_candidates":
-            return _format_fuzzy_response(norm, result.candidates)
+            return _format_fuzzy_response(norm, result)
 
-        return _format_not_found_response(norm)
+        return _format_not_found_response(norm, result)
     finally:
         conn.close()
 

@@ -353,9 +353,13 @@ def test_statute_outline_never_prints_a_null_article_number(ctx):
 
 
 def test_sentence_statistics_returns_candidates(ctx):
-    """A charge string yields charge_id candidates, not statistics."""
-    out = tools.sentence_statistics(ctx, charges="절도")
-    assert "candidates" in out or "charge_id" in out
+    """An umbrella term yields charge candidates, while an exact charge returns statistics."""
+    out = tools.sentence_statistics(ctx, charges="성폭력")
+    assert "## status: candidates" in out
+    assert "후보 죄명" in out
+
+    out_exact = tools.sentence_statistics(ctx, charges="절도")
+    assert "## status: low_n_grid" in out_exact or "## status: ok" in out_exact
 
 
 def test_compute_sentencing_range_lookup_stage(ctx):

@@ -149,12 +149,13 @@ _DESC_STATUTE_LOOKUP = (
     "url만 인용 링크로 쓰고, `text_kind: 공식 … 원문`인 조문·행정규칙 본문만 직접인용하세요."
 )
 _DESC_SENTENCE_STATISTICS = (
-    "양형 선고 통계 — charges 또는 charge_id 중 하나는 필수. ① charges 하나로 정제된 죄명 후보(charge_id+표본수)를 반환(status=candidates), "
-    "② 후보에서 고른 charge_id 하나를 주면 그 죄명 하나만 유죄인 피고인의 1심 선고 분포(표본 30↑=형종별 평균·표준편차·집유율 + 11분위 비교판례 / 미만=개별 사례 그리드). "
-    "죄명이 이미 특정되면 곧바로 통계가 옵니다. 형량 전망·구형/양형 근거·자기 사건 위치를 가늠할 때 결론 전에 호출"
-    "(compute_sentencing_range 공식 '범위'를 실데이터로 보완). status=candidates는 통계가 아니라 선택지 — 사안에 맞는 charge_id 하나로 재호출. "
-    "죄명·charge_id는 한 번에 하나씩. 경합 사안의 죄명별 단독 분포를 합산·평균·1.5배해 경합범 분포로 만들지 마세요. 형법 38조는 가장 중한 죄 장기(벌금은 다액)의 1/2까지 가중하되 각 죄 장기·다액 합계를 넘지 못하게 하는 처단형 상한이지 통계 결합식이 아닙니다. status=low_n_grid는 단독 개별 사례라 일반화 금지.\n"
-    "Args: charges=죄명 텍스트 하나(후보 검색용; 구어 '보이스피싱·몰카·마약'·카테고리 '성범죄'·법률명 '도로교통법위반'도 인식). charge_id=후보에서 고른 pool id 하나(int; 통계 조회용, charges와 택일). "
+    "양형 선고 통계 — charges(죄명 하나) 필수. 죄명이 판결문·공소장 표기(대검 죄명표: 형법은 '특수상해', 특별법은 '도로교통법위반(음주운전)')면 "
+    "곧바로 그 죄명 하나만 유죄인 피고인의 1심 선고 분포(표본 30↑=형종별 평균·표준편차·집유율 + 11분위 비교판례 / 미만=개별 사례 그리드)와 관련 죄명 목록. "
+    "법률명만 주면('스토킹처벌법위반') 그 법률의 공식 죄명 중 표본 있는 후보(status=candidates) — 후보 이름 하나를 charges 에 그대로 넣어 재호출. "
+    "약칭·구어('정보통신망법위반(명예훼손)'·'몰카'·'보이스피싱')도 풀어 줍니다. 형량 전망·구형/양형 근거·자기 사건 위치를 가늠할 때 결론 전에 호출"
+    "(compute_sentencing_range 공식 '범위'를 실데이터로 보완). "
+    "죄명은 한 번에 하나씩. 경합 사안의 죄명별 단독 분포를 합산·평균·1.5배해 경합범 분포로 만들지 마세요. 형법 38조는 가장 중한 죄 장기(벌금은 다액)의 1/2까지 가중하되 각 죄 장기·다액 합계를 넘지 못하게 하는 처단형 상한이지 통계 결합식이 아닙니다. status=low_n_grid는 단독 개별 사례라 일반화 금지.\n"
+    "Args: charges=죄명 하나(공식 표기·약칭·구어) 또는 법률명. "
     "year_from/year_to=판결 연도 범위. reference_year=비교 판례·그리드 기준 연도(가까운 사건 우선; None=최근).\n"
     "비교 판례·그리드의 url만 인용 링크로, 집계 분포 수치는 링크 없이 제시."
 )
@@ -165,7 +166,7 @@ _DESC_COMPUTE_SENTENCING_RANGE = (
     "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
     "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 호출당 하나"
     "(여러 죄는 각각 호출; list면 죄명별 유도[multiple_charges]), 숫자·ID 불가"
-    "(조문번호·charge_id 아님; 숫자면 유도[charge_numeric]). "
+    "(조문번호·식별자 아님; 숫자면 유도[charge_numeric]). "
     "offense_date=행위 일자(지정 시 행위시 조문). "
     "sg_category_id·statute_choice·branch_key·reference_choice=ambiguous_* 응답이 후보를 줄 때. "
     "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=가중감경 list(lookup enum에서). "
@@ -243,7 +244,6 @@ def statute_lookup(
 )
 def sentence_statistics(
     charges: str | None = None,
-    charge_id: int | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
     reference_year: int | None = None,
@@ -251,7 +251,6 @@ def sentence_statistics(
     return _t.sentence_statistics(
         _ctx(),
         charges=charges,
-        charge_id=charge_id,
         year_from=year_from,
         year_to=year_to,
         reference_year=reference_year,
