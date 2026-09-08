@@ -37,7 +37,6 @@ from pydantic_ai import RunContext
 from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
 from ._coerce import coerce_int, coerce_list, coerce_str, to_iso_date
-from ._dedup import dedup_guard
 from ._morph import kiwi as _kiwi
 
 # There is deliberately no kind filter, and a `NOTICE_KINDS` set used to sit
@@ -1901,7 +1900,6 @@ def _format_response_md(resp: dict[str, Any]) -> str:
 
 # ---------- public tool ----------
 
-@dedup_guard("statute_lookup")
 def statute_lookup(
     ctx: RunContext[HarnessDeps],
     query: str | None = None,

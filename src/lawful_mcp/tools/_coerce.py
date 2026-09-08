@@ -151,22 +151,35 @@ def coerce_dict(v: Any) -> dict | None:
 
 
 def coerce_dict_list(v: Any) -> list[dict] | None:
-    """Normalise a list-of-dicts argument, dropping elements that are not dicts.
+    """Normalise a list-of-dicts argument, promoting strings and dropping non-dicts.
 
-    When a model sends scalars where objects belong (``'["48"]'``), those
-    elements are discarded with a warning rather than reaching a caller that
-    would do ``elem.get(...)`` on them.
+    String elements are promoted to ``{"kind": x.strip()}``. Models often emit
+    enum names as a list of strings (e.g. ``['누범_가중']`` or ``'누범_가중'``).
+    Previously dropping non-dicts caused statutory modifications to silently vanish.
+    If the promoted kind is invalid, downstream explicitly reports INVALID, which is
+    safer and actionable.
 
-    An empty result returns None, not an empty list. The difference matters:
-    None reads as "not supplied", so the caller stays at the earlier stage and
-    re-offers the enum for the model to correct itself, whereas an empty list
-    would silently advance a stage with no selections made.
+    Other non-dict items (numbers, nested lists) are dropped with a warning.
+    An empty result returns None, not an empty list, so the caller treats it as
+    unsupplied and remains at the lookup stage rather than quietly advancing.
     """
     items = coerce_list(v)
     if not items:
         return None
-    out = [x for x in items if isinstance(x, dict)]
-    dropped = len(items) - len(out)
+    out: list[dict] = []
+    promoted = dropped = 0
+    for x in items:
+        if isinstance(x, dict):
+            out.append(x)
+        elif isinstance(x, str) and x.strip():
+            # Promote bare string element to {"kind": ...}. The sole consumer is
+            # statutory_modifications, where `kind` is the identifying key.
+            out.append({"kind": x.strip()})
+            promoted += 1
+        else:
+            dropped += 1
+    if promoted:
+        _warn(v, f"list[dict] ({promoted} string element(s) promoted to kind)")
     if dropped:
         _warn(v, f"list[dict] ({dropped} non-dict element(s) dropped)")
     return out or None

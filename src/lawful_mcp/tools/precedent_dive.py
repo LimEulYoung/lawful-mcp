@@ -19,7 +19,6 @@ from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
 from ..schemas import DIVE_SUMMARY_MAX_CHARS
 from ._coerce import coerce_int, coerce_str
-from ._dedup import dedup_guard
 
 
 # Body truncation, head and tail. Judgment length is heavily skewed: p99 is
@@ -123,7 +122,6 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-@dedup_guard("precedent_dive")
 async def precedent_dive(
     ctx: RunContext[HarnessDeps],
     case_id: int,

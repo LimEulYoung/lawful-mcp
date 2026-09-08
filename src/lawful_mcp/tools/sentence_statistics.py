@@ -17,7 +17,6 @@ from .._charge import norm_charge as _norm_charge
 from ._charge_index import ARTICLE_REF_RE, Resolution, numeric_charge_tokens, official_index, strip_charge_decorations
 from ._coerce import coerce_list, coerce_str
 from ..deps import HarnessDeps, open_db
-from ._dedup import dedup_guard
 
 # Constants
 STATS_INSTANCE = "1심"
@@ -74,6 +73,35 @@ def _by_type(rows: list[sqlite3.Row]) -> dict[str, int]:
         st = r["sentence_type"]
         if st in out:
             out[st] += 1
+    return out
+
+
+def _fine_share(rows: list[sqlite3.Row]) -> tuple[int, int] | None:
+    """(Number of sentences, fine %). Denominator excludes not guilty."""
+    dec = [r for r in rows if r["sentence_type"] in ("imprisonment", "fine", "life")]
+    if not dec:
+        return None
+    return len(dec), round(sum(1 for r in dec if r["sentence_type"] == "fine") / len(dec) * 100)
+
+
+def _fine_trend(pool: list[sqlite3.Row]) -> dict[str, Any] | None:
+    """Fine ratio trend over time — overall, recent half, and recorded years.
+
+    Choice of sentence kind (imprisonment vs fine) shifts over time, but filtering
+    by year collapses sample sizes since median count per charge is 2.
+    Instead of exposing year filter arguments, we report the trend over the full pool.
+    """
+    dated = sorted((r for r in pool if r["decision_year"]), key=lambda r: r["decision_year"])
+    if not dated:
+        return None
+    out: dict[str, Any] = {"years": (dated[0]["decision_year"], dated[-1]["decision_year"])}
+    whole = _fine_share(dated)
+    if whole:
+        out["all"] = whole
+    half = dated[len(dated) // 2:]
+    recent = _fine_share(half)
+    if recent and len(dated) >= MIN_N_STATS:
+        out["recent"] = (*recent, half[0]["decision_year"], half[-1]["decision_year"])
     return out
 
 
@@ -217,6 +245,16 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     for blk in resp.get("charge_blocks") or []:
         lines.append(f"## charge: {blk['charge']}")
         lines.append(f"- n: {blk['n']} (단일 죄명)")
+        tr = blk.get("fine_trend")
+        if tr:
+            if tr.get("all"):
+                n_all, p_all = tr["all"]
+                share = f"- 벌금 비율: 전체 {p_all}% (n={n_all})"
+                if tr.get("recent"):
+                    n_r, p_r, y0, y1 = tr["recent"]
+                    share += f" · 최근 절반 {p_r}% ({y0}~{y1}, n={n_r})"
+                lines.append(share)
+            lines.append(f"- 수록 연도: {tr['years'][0]}~{tr['years'][1]}")
         bt = blk.get("by_type")
         if bt:
             lines.append(
@@ -294,12 +332,9 @@ def _coerce_single_str(x: Any) -> str | None:
     return coerce_str(x)
 
 
-@dedup_guard("sentence_statistics")
 def sentence_statistics(
     ctx: RunContext[HarnessDeps],
     charges: str | None = None,
-    year_from: int | None = None,
-    year_to: int | None = None,
     reference_year: int | None = None,
 ) -> str:
     """단일 죄명 1심 선고 분포 — charges(죄명 하나)가 필수입니다. 죄명이 공식 표기면 곧바로 통계
@@ -322,9 +357,9 @@ def sentence_statistics(
 
     Args:
       charges: 죄명 하나(공식 표기·약칭·구어) 또는 법률명('스토킹처벌법위반' → 그 법률의 죄명 후보).
-      year_from: 판결 연도 범위 필터 시작.
-      year_to: 판결 연도 범위 필터 끝. year_from 과 함께 또는 단독 사용.
       reference_year: 비교 case·그리드 선택의 연도 기준 — 가까운 사건 우선. None 이면 최근 우선.
+        연도로 **좁히는** 인자는 없습니다 — 풀이 죄명당 중앙값 2건이라 연도로 자르면 통계가
+        사라집니다. 시간 변화는 응답의 `벌금 비율`(전체·최근 절반)과 `수록 연도`가 싣습니다.
     """
     q_raw = _coerce_single_str(charges)
     if not q_raw:
@@ -357,10 +392,10 @@ def sentence_statistics(
                              "build_sample_db.py 를 돌린 뒤 다시 호출하세요."]})
         res = index.resolve(qnorm)
         if res.kind == "exact":
-            resp = _stats_for_name(conn, index, res, year_from=year_from, year_to=year_to,
+            resp = _stats_for_name(conn, index, res,
                                    exclude_ids=exclude_ids, reference_year=reference_year)
         elif res.kind == "statute_exact":
-            resp = _law_candidates(conn, index, res, qnorm, year_from=year_from, year_to=year_to,
+            resp = _law_candidates(conn, index, res, qnorm,
                                    exclude_ids=exclude_ids)
         else:
             resp = {"status": "no_data", "unmatched_charges": [{"input": qnorm}],
@@ -386,8 +421,7 @@ def _pool_norms(conn: sqlite3.Connection, name: str) -> list[str]:
 
 
 def _solo_counts(
-    conn: sqlite3.Connection, names: list[str],
-    year_from: int | None, year_to: int | None, exclude: frozenset[int],
+    conn: sqlite3.Connection, names: list[str], exclude: frozenset[int],
 ) -> dict[str, int]:
     if not names:
         return {}
@@ -411,12 +445,6 @@ def _solo_counts(
           AND pd.sentence_type IN ('imprisonment','fine','not_guilty','life')
     """
     params: list[Any] = [*norms, STATS_INSTANCE]
-    if year_from is not None:
-        sql += " AND pc.decision_year >= ?"
-        params.append(year_from)
-    if year_to is not None:
-        sql += " AND pc.decision_year <= ?"
-        params.append(year_to)
     if exclude:
         sql += f" AND pd.case_id NOT IN ({','.join('?' * len(exclude))})"
         params.extend(exclude)
@@ -442,12 +470,12 @@ def _name_items(index, names: list[str], counts: dict[str, int]) -> list[dict[st
 
 def _stats_for_name(
     conn: sqlite3.Connection, index, res: Resolution, *,
-    year_from: int | None, year_to: int | None, exclude_ids: frozenset[int], reference_year: int | None,
+    exclude_ids: frozenset[int], reference_year: int | None,
 ) -> dict[str, Any]:
     name = res.key or ""
     warnings: list[str] = []
     blk, is_stats, is_grid = _build_block(
-        conn, name, _pool_norms(conn, name), year_from=year_from, year_to=year_to,
+        conn, name, _pool_norms(conn, name),
         exclude_ids=exclude_ids, reference_year=reference_year, warnings=warnings)
     resp = _finish_dict([blk], is_stats, is_grid, warnings)
     notes_top: list[str] = []
@@ -470,7 +498,7 @@ def _stats_for_name(
     related_names.extend(name + suf for suf in ("교사", "방조"))
     related_names = [x for x in dict.fromkeys(related_names) if x != name]
     if related_names:
-        counts = _solo_counts(conn, related_names, year_from, year_to, exclude_ids)
+        counts = _solo_counts(conn, related_names, exclude_ids)
         resp["related"] = _name_items(index, related_names, counts)
     if resp.get("status") == "no_data":
         resp.setdefault("warnings", []).append(
@@ -481,17 +509,17 @@ def _stats_for_name(
 
 def _law_candidates(
     conn: sqlite3.Connection, index, res: Resolution, qnorm: str, *,
-    year_from: int | None, year_to: int | None, exclude_ids: frozenset[int],
+    exclude_ids: frozenset[int],
 ) -> dict[str, Any]:
     names = list(res.candidates)
-    counts = _solo_counts(conn, names, year_from, year_to, exclude_ids)
+    counts = _solo_counts(conn, names, exclude_ids)
     items = _name_items(index, names, counts)
     statute = res.statute
     warnings: list[str] = []
     if statute:
         bare = statute.replace(" ", "") + "위반"
         if bare not in names:
-            bare_n = _solo_counts(conn, [bare], year_from, year_to, exclude_ids).get(bare, 0)
+            bare_n = _solo_counts(conn, [bare], exclude_ids).get(bare, 0)
             if bare_n:
                 warnings.append(f"괄호 없는 '{bare}' 표기 {bare_n}건은 세부 죄명을 알 수 없어 제외했습니다.")
     if res.sub:
@@ -513,8 +541,6 @@ def _law_candidates(
 def _fetch_samples(
     conn: sqlite3.Connection,
     charge_norms: str | list[str],
-    year_from: int | None,
-    year_to: int | None,
     exclude_case_ids: frozenset[int] | None = None,
 ) -> list[sqlite3.Row]:
     norms = [charge_norms] if isinstance(charge_norms, str) else list(charge_norms)
@@ -539,12 +565,6 @@ def _fetch_samples(
     """
     params: list[Any] = [*norms, STATS_INSTANCE]
 
-    if year_from is not None:
-        sql += " AND pc.decision_year >= ?"
-        params.append(year_from)
-    if year_to is not None:
-        sql += " AND pc.decision_year <= ?"
-        params.append(year_to)
     if exclude_case_ids:
         marks = ",".join("?" * len(exclude_case_ids))
         sql += f" AND pd.case_id NOT IN ({marks})"
@@ -555,11 +575,13 @@ def _fetch_samples(
 
 def _build_block(
     conn: sqlite3.Connection, label: str, norms: list[str], *,
-    year_from: int | None, year_to: int | None, exclude_ids: frozenset[int],
-    reference_year: int | None, warnings: list[str],
+    exclude_ids: frozenset[int], reference_year: int | None, warnings: list[str],
 ) -> tuple[dict[str, Any], bool, bool]:
-    singles = _fetch_samples(conn, norms, year_from, year_to, exclude_ids)
+    singles = _fetch_samples(conn, norms, exclude_ids)
     blk: dict[str, Any] = {"charge": label, "n": len(singles)}
+    trend = _fine_trend(singles)
+    if trend:
+        blk["fine_trend"] = trend
     is_stats = is_grid = False
     if len(singles) >= MIN_N_STATS:
         is_stats = True

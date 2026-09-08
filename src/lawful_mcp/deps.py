@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -54,10 +53,6 @@ class HarnessDeps:
     embed: "OpenAI | LazyClient"
     rerank: "httpx.Client | LazyClient"
     dive_subagent: "Agent | None"
-    # Last (tool_name, args_json) pairs, read by the dedup guard to reject an
-    # identical immediate repeat. Per-call, so a client's legitimate retry of
-    # the same arguments is not blocked.
-    recent_calls: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=10))
 
 
 def open_db(
@@ -155,9 +150,8 @@ def build_dive_subagent() -> "Agent | None":
 def build_deps(dive_subagent: "Agent | None" = None) -> HarnessDeps:
     """Fresh dependencies for one tool call.
 
-    Per-call, so the dedup guard's ``recent_calls`` does not accumulate
-    across calls. The dive sub-agent is passed in because building a model
-    client per call would be wasteful.
+    The dive sub-agent is passed in because building a model client per call
+    would be wasteful.
     """
     return HarnessDeps(
         embed=LazyClient(open_embed_client),

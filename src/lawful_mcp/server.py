@@ -105,7 +105,7 @@ def _ctx() -> SimpleNamespace:
 
     The tools take a pydantic-ai ``RunContext`` but only ever read ``.deps``
     and ``.usage``, so a namespace with those two fields is enough. Fresh per
-    call, so the dedup guard does not carry state between calls.
+    call.
     """
     return SimpleNamespace(deps=build_deps(_dive_subagent), usage=None)
 
@@ -156,7 +156,9 @@ _DESC_SENTENCE_STATISTICS = (
     "(compute_sentencing_range 공식 '범위'를 실데이터로 보완). "
     "죄명은 한 번에 하나씩. 경합 사안의 죄명별 단독 분포를 합산·평균·1.5배해 경합범 분포로 만들지 마세요. 형법 38조는 가장 중한 죄 장기(벌금은 다액)의 1/2까지 가중하되 각 죄 장기·다액 합계를 넘지 못하게 하는 처단형 상한이지 통계 결합식이 아닙니다. status=low_n_grid는 단독 개별 사례라 일반화 금지.\n"
     "Args: charges=죄명 하나(공식 표기·약칭·구어) 또는 법률명. "
-    "year_from/year_to=판결 연도 범위. reference_year=비교 판례·그리드 기준 연도(가까운 사건 우선; None=최근).\n"
+    "reference_year=비교 판례·그리드 기준 연도(가까운 사건 우선; None=최근). "
+    "연도로 좁히는 인자는 없습니다 — 풀이 죄명당 중앙값 2건이라 자르면 통계가 사라집니다. "
+    "시간 변화는 응답의 `벌금 비율`(전체·최근 절반)과 `수록 연도`가 싣습니다.\n"
     "비교 판례·그리드의 url만 인용 링크로, 집계 분포 수치는 링크 없이 제시."
 )
 _DESC_COMPUTE_SENTENCING_RANGE = (
@@ -244,15 +246,11 @@ def statute_lookup(
 )
 def sentence_statistics(
     charges: str | None = None,
-    year_from: int | None = None,
-    year_to: int | None = None,
     reference_year: int | None = None,
 ) -> str:
     return _t.sentence_statistics(
         _ctx(),
         charges=charges,
-        year_from=year_from,
-        year_to=year_to,
         reference_year=reference_year,
     )
 

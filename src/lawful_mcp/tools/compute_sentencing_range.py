@@ -43,7 +43,6 @@ from ._charge_index import (
     strip_charge_decorations)
 from ._coerce import (
     coerce_dict, coerce_dict_list, coerce_int, coerce_list, coerce_str, to_iso_date)
-from ._dedup import dedup_guard
 
 _log = logging.getLogger(__name__)
 
@@ -94,7 +93,12 @@ def _span_months(lo: int | None, hi: int | None) -> str:
 
 
 def _span_won(lo: int | None, hi: int | None) -> str:
-    """Format a won range: `0~50,000,000원`, `5,000,000원 이하`, or `미상`."""
+    """Format a won range: `50,000,000원 이하`, `5,000,000원 이상`, `1,000,000~5,000,000원`, or `미상`.
+
+    A lower bound of 0 represents no statutory minimum (e.g. '15,000,000원 이하').
+    """
+    if lo == 0:
+        lo = None
     if lo is None and hi is None:
         return "미상"
     if hi is None:
@@ -144,13 +148,22 @@ def _source_label(src: str) -> str:
     return src
 
 
-def _rec_range_line(rec) -> str:
-    """One-line recommended range; None bound means open. Both None means uncalculated."""
+def _rec_range_lines(rec) -> list[str]:
+    """Recommended range lines — emits imprisonment and fine on separate lines.
+
+    The Sentencing Commission sets fine guidelines for only 4 offense groups
+    (traffic, election, stalking, animal protection). For other groups, no fine line
+    is printed in the guideline block to avoid misinterpretation.
+    """
     if rec.min_months is None and rec.max_months is None:
         note = " (사형·무기형)" if rec.has_life else ""
-        return f"- 범위: 권고 형량범위 없음 (상·하한 미산출){note}"
-    return ("- 범위: " + _span_months(rec.min_months, rec.max_months)
-            + (" · 무기 가능" if rec.has_life else ""))
+        lines = [f"- 자유형: 권고 형량범위 없음 (상·하한 미산출){note}"]
+    else:
+        lines = ["- 자유형: " + _span_months(rec.min_months, rec.max_months)
+                 + (" · 무기 가능" if rec.has_life else "")]
+    if rec.fine_min_won is not None or rec.fine_max_won is not None:
+        lines.append("- 벌금: " + _span_won(rec.fine_min_won, rec.fine_max_won))
+    return lines
 
 # ---------- charge_key normalize + suffix split ----------
 
@@ -861,6 +874,58 @@ def _lookup_by_article(
         (name_norm, art, branch),
     ).fetchall()
     return rows[0] if rows else None
+
+
+# ---------- Guideline scope check (sg_categories.applies_to) ----------
+# Sentencing guidelines define their own scope of applicable provisions
+# (e.g. traffic offenses apply to Road Traffic Act §148의2 ② and ③, §152, but not ① repeat offenses).
+# When charge_legal_map attaches an sg_category_id to a provision outside that scope,
+# recommended ranges are not computed, but statutory and modified penalties remain valid.
+# This check is fail-open: if applies_to is empty or unpopulated, validation is bypassed.
+
+
+def _guideline_scope(conn: sqlite3.Connection, cat_id: int | None) -> list[dict] | None:
+    """List of applicable statutory provisions for a category. None if unpopulated (fail-open)."""
+    if cat_id is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT applies_to FROM sg_categories WHERE id = ?", (cat_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or not row["applies_to"]:
+        return None
+    try:
+        scope = json.loads(row["applies_to"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return [x for x in scope if isinstance(x, dict)] or None
+
+
+def _out_of_guideline_scope(conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+    """If row falls outside the guideline scope, returns a 1-line reason; otherwise None."""
+    scope = _guideline_scope(conn, row["sg_category_id"])
+    if scope is None:
+        return None
+    name = (row["statute_name"] or "").replace(" ", "")
+    art, br = row["article_no_num"], row["article_branch"] or 0
+    para = _PARA_TO_INT.get((row["paragraph"] or "").strip())
+    same = [x for x in scope
+            if str(x.get("law", "")).replace(" ", "") == name
+            and x.get("art") == art and (x.get("br") or 0) == br]
+    if not same:
+        covered = " · ".join(dict.fromkeys(
+            f"{x.get('law')} §{x.get('art')}" + (f"의{x['br']}" if x.get("br") else "")
+            for x in scope))[:300]
+        return f"이 조항은 양형기준 적용 대상이 아닙니다 — 기준이 담는 것: {covered}"
+    paras = sorted({n for x in same for n in (x.get("paras") or [])})
+    if not paras or para is None or para in paras:
+        return None
+    return (f"이 조항의 제{para}항은 양형기준 적용 대상이 아닙니다 — "
+            f"기준이 담는 항: {', '.join(f'제{n}항' for n in paras)}")
+
+
+_PARA_TO_INT = {v: int(k) for k, v in _PARA_DIGIT_TO_CIRCLED.items()}
 
 
 # ---------- payload resolver ----------
@@ -1686,6 +1751,11 @@ def _verify_sentence(
         f_hi = processed.fine_max_won
         in_fine = fine_amount >= f_lo and (f_hi is None or fine_amount <= f_hi)
         lines.append(f"- 벌금 처단형({_span_won(f_lo, f_hi)}) 안: {in_fine}")
+        if rec is not None and (rec.fine_min_won is not None or rec.fine_max_won is not None):
+            r_lo, r_hi = rec.fine_min_won, rec.fine_max_won
+            ok = ((r_lo is None or fine_amount >= r_lo)
+                  and (r_hi is None or fine_amount <= r_hi))
+            lines.append(f"- 벌금 권고 영역({_span_won(r_lo or 0, r_hi)}) 안: {ok}")
     return lines
 
 
@@ -1843,6 +1913,19 @@ def _format_branch_option(o: dict) -> str:
     return f"- {key}: {cond}{suffix}"
 
 
+def _reference_choice_form(ref: dict) -> str:
+    """Format reference_choice matching the syntax parsed by _parse_reference_choice.
+
+    Preserves article branch and paragraph so that specific provisions
+    (such as Criminal Act §297의2) are not flattened into their base article.
+    """
+    name = (ref.get("statute_name") or "").replace(" ", "")
+    art = ref.get("article_no_num")
+    branch_str = f"의{ref['article_branch']}" if ref.get("article_branch") else ""
+    para_str = f" {ref['paragraph']}" if ref.get("paragraph") else ""
+    return f"{name}§{art}{branch_str}{para_str}".strip()
+
+
 def _format_reference_option(ref: dict) -> str:
     rname = ref.get("statute_name", "?")
     art = ref.get("article_no_num")
@@ -1853,7 +1936,7 @@ def _format_reference_option(ref: dict) -> str:
     if para:
         art_s += f" {para}"
     tail = f" — {note}" if note else ""
-    return f"- {rname} {art_s}{tail}  (choice form: \"{rname}§{art}\")"
+    return f"- {rname} {art_s}{tail}  (choice form: \"{_reference_choice_form(ref)}\")"
 
 
 def _format_stage_header(
@@ -2324,17 +2407,20 @@ def _format_probation_factor_enum(rows: list[sqlite3.Row]) -> list[str]:
 # automatically from the charge name.
 _STATUTORY_MOD_ENUM: list[str] = [
     "## 형법 §56 가중·감경 사유 enum (`statutory_modifications` 인자 선택용)",
-    "[본조_가중] — 해당 본조 자체에 가중 규정 (상습범·특정범죄가중법 등)",
-    "[특수교사방조_가중] — 특수교사·특수방조 (형법 §34 ②)",
-    "[누범_가중] — 누범 (§35), 자유형 장기 2배",
-    "[법률상_필요감경] — 의무 감경: 방조 (§32 ②), 농아자 (§11) 등",
-    "[법률상_임의감경] — 재량 감경: 미수 (§25 ②), 중지미수 (§26), 자수 (§52), 심신미약 (§10 ②) 등",
-    "[경합범_가중] — §37 전단·§38 ① 2호 (가장 무거운 죄의 장기 1/2 가중). 동종 다행위는 `act_count` 인자로 명시 (자동 적용). 명시 입력도 가능.",
-    "[작량감경] — 정상참작 (§53, 단일 type)",
+    "- 인자 schema: [{kind: <아래 이름 하나>, type: '미수 (§25)' 등, basis: '형법 §25 ②', applied: bool}]",
+    "  예: statutory_modifications=[{\"kind\": \"누범_가중\"}]  ← 이름만 든 리스트(`[\"누범_가중\"]`)가 아니다",
+    "",
+    "kind 이름:",
+    "- `본조_가중` — 해당 본조 자체에 가중 규정 (상습범·특정범죄가중법 등)",
+    "- `특수교사방조_가중` — 특수교사·특수방조 (형법 §34 ②)",
+    "- `누범_가중` — 누범 (§35), 자유형 장기 2배",
+    "- `법률상_필요감경` — 의무 감경: 방조 (§32 ②), 농아자 (§11) 등",
+    "- `법률상_임의감경` — 재량 감경: 미수 (§25 ②), 중지미수 (§26), 자수 (§52), 심신미약 (§10 ②) 등",
+    "- `경합범_가중` — §37 전단·§38 ① 2호 (가장 무거운 죄의 장기 1/2 가중). 동종 다행위는 `act_count` 인자로 명시 (자동 적용). 명시 입력도 가능.",
+    "- `작량감경` — 정상참작 (§53, 단일 type)",
     "",
     "참고:",
     "- charge suffix '미수/방조/교사' 는 도구가 자동 분리 — 명시 안 해도 auto-add",
-    "- 인자 schema: [{kind: <위 6 종>, type: '미수 (§25)' 등, basis: '형법 §25 ②', applied: bool}]",
     "- applied 키 누락 = 기본 적용 (default true). applied=true 명시도 적용.",
     "- applied=false 또는 null 명시 = *주장됐으나 부적용* skip (trace 만).",
     "- 잘못된 kind 또는 같은 (kind, type) 중복은 INVALID / DUPLICATE 로 자동 무시.",
@@ -2691,8 +2777,126 @@ def _format_processed_response(
 
 _INTERSECT_HDR = "## 선고 가능 범위 (처단형 ∩ 권고형)"
 
+# Bold header pattern on raw paragraph in sg_fine_conditions
+_FINE_COND_LABEL_RE = re.compile(r"^\*+[^*]*\*+\s*")
+_FINE_COND_RAW_CAP = 400
+
+
+def _kind_presence(payload_row: sqlite3.Row, processed: ProcessedPenalty) -> tuple[bool, bool]:
+    """Determine whether imprisonment and/or fine are present in options or quantities."""
+    try:
+        raw_kinds = json.loads(payload_row["sentence_kind_options"] or "[]")
+    except (TypeError, json.JSONDecodeError, IndexError, KeyError):
+        raw_kinds = []
+    kinds = set(processed.sentence_kind_options or [])
+    if isinstance(raw_kinds, list):
+        kinds |= {k for k in raw_kinds if isinstance(k, str)}
+    imp = ("imprisonment" in kinds or processed.imp_min_months is not None
+           or processed.imp_max_months is not None or processed.has_life or processed.has_death)
+    fine = ("fine" in kinds or processed.fine_min_won is not None
+            or processed.fine_max_won is not None or bool(processed.fine_formula))
+    return imp, fine
+
+
+def _fine_condition_lines(
+    conn: sqlite3.Connection, leaf_id: int | None, level: str | None
+) -> list[str]:
+    """Lines for conditional fine guidelines from sg_fine_conditions."""
+    if leaf_id is None or leaf_id < 0 or not level:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT condition_text, fine_min_won, fine_max_won, raw_paragraph"
+            " FROM sg_fine_conditions WHERE subtype_id=? AND level=?", (leaf_id, level)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out: list[str] = []
+    for r in rows:
+        cond = (r["condition_text"] or "").strip()
+        span = _span_won(r["fine_min_won"], r["fine_max_won"])
+        out.append(f"- 벌금 선택 조건: {cond} — 벌금 {span}" if cond
+                   else f"- 벌금 선택 조건: 벌금 {span}")
+        raw = (r["raw_paragraph"] or "").strip()
+        if raw:
+            raw = re.sub(r"\s+", " ", _FINE_COND_LABEL_RE.sub("", raw).replace("*", ""))
+            raw = raw.strip().strip("-–—·").strip()
+            out.append(f"  · 양형기준 원문: {raw[:_FINE_COND_RAW_CAP]}")
+    return out
+
+
+def _has_fine_guideline(
+    conn: sqlite3.Connection, leaf_id: int | None, rec: RecommendedRange | None
+) -> bool:
+    """Whether the sentencing guideline sets a fine for this level (ranges or conditional)."""
+    if rec is None:
+        return False
+    if rec.fine_min_won is not None or rec.fine_max_won is not None:
+        return True
+    return bool(_fine_condition_lines(conn, leaf_id, rec.level))
+
+
+def _intersect_lines(
+    processed: ProcessedPenalty,
+    rec: RecommendedRange | None,
+    intersect: tuple[int | None, int | None],
+    *,
+    imp_kind: bool,
+    fine_kind: bool,
+    fine_guideline: bool = False,
+    charge: str = "",
+    fine_paragraphs: list[str] | None = None,
+    mit_applied: bool = False,
+) -> list[str]:
+    """Intersection of statutory and recommended ranges for all applicable sentence kinds."""
+    lines = [_INTERSECT_HDR]
+    lo, hi = intersect
+    if imp_kind:
+        if lo is not None and hi is not None and lo > hi:
+            rec_span = _span_months(rec.min_months, rec.max_months) if rec else "미상"
+            lines.append(
+                f"- 자유형: 처단형 {_span_months(processed.imp_min_months, processed.imp_max_months)} 과"
+                f" 권고형 {rec_span} 이 겹치지 않음 → 처단형 우선 (공통원칙 §02)")
+        elif lo is None and hi is None:
+            lines.append("- 자유형: 범위 미정 (무기·사형 전속 등)")
+        else:
+            lines.append(f"- 자유형: {_span_months(lo, hi)}")
+    if fine_kind:
+        f_lo, f_hi = processed.fine_min_won, processed.fine_max_won
+        if f_hi is not None or f_lo is not None:
+            lo0 = f_lo if f_lo is not None else 0
+            r_lo, r_hi = (rec.fine_min_won, rec.fine_max_won) if rec else (None, None)
+            if r_lo is None and r_hi is None:
+                lines.append(f"- 벌금: {_span_won(lo0, f_hi)}")
+            else:
+                i_lo = max(lo0, r_lo or 0)
+                caps = [x for x in (f_hi, r_hi) if x is not None]
+                i_hi = min(caps) if caps else None
+                if i_hi is not None and i_lo > i_hi:
+                    lines.append(
+                        f"- 벌금: 처단형 {_span_won(lo0, f_hi)} 과 권고형"
+                        f" {_span_won(r_lo or 0, r_hi)} 이 겹치지 않음 → 처단형 우선 (공통원칙 §02)")
+                else:
+                    lines.append(f"- 벌금: {_span_won(i_lo, i_hi)}")
+        elif processed.fine_formula:
+            lines.append(f"- 벌금: {_format_fine_formula(processed.fine_formula)}")
+        elif fine_paragraphs:
+            lines.append("- 벌금: 정량 미상 (조문 본문 — 식 기반 정량):")
+            for p in fine_paragraphs:
+                for line in p.splitlines():
+                    lines.append(f"  > {line}")
+        else:
+            lines.append("- 벌금: 정량 미상 (법정형 벌금 정량 NULL — statute_lookup 조회 권장)")
+        if mit_applied:
+            note = "§55 ① 6호 다액 1/2 자동 반영됨" if processed.fine_formula else "벌금 다액 1/2 (§55 ① 6호)"
+            lines.append(f"  ※ 감경 적용: {note}")
+    if imp_kind and fine_kind and not fine_guideline:
+        call = f'`sentence_statistics(charges="{charge}")`' if charge else "`sentence_statistics`"
+        lines.append(f"  ※ 형종 선택의 실선고 분포는 {call} 로 확인.")
+    return lines
+
 
 def _format_range_block(
+    conn: sqlite3.Connection,
     penalty: EffectivePenalty,
     processed: ProcessedPenalty,
     rec: RecommendedRange | None,
@@ -2726,16 +2930,23 @@ def _format_range_block(
     if rec is None:
         lines.append("- 권고형: 없음 (이 유형에는 권고 형량범위 표가 없음 — 벌금형 전용 등)")
     else:
+        fine_cond = _fine_condition_lines(conn, leaf_id, rec.level)
+        has_fine_rec = rec.fine_min_won is not None or rec.fine_max_won is not None
         lines.append("## 권고형")
         lines.append(f"- 영역: {rec.level}")
-        lines.append(_rec_range_line(rec))
-        lines.append(f"- 특별조정: {'적용' if rec.is_special_adjusted else '없음'}")
+        lines.extend(_rec_range_lines(rec))
+        adj = "적용" if rec.is_special_adjusted else "없음"
+        if rec.is_special_adjusted and (has_fine_rec or fine_cond):
+            adj += " (자유형에만 반영 — 벌금 권고는 표 값 그대로)"
+        lines.append(f"- 특별조정: {adj}")
+        lines.extend(fine_cond)
         if rec.raw_text:
             lines.append(f"- 원문: {_compact_raw_range(rec.raw_text)}")
     return lines
 
 
 def _format_recommended_response(
+    conn: sqlite3.Connection,
     norm: NormalizedCharge,
     row: sqlite3.Row,
     payload_row: sqlite3.Row,
@@ -2749,32 +2960,19 @@ def _format_recommended_response(
     guide_notes: list[str] | None = None,
 ) -> str:
     """The guideline stage: processed range, recommended range, and their overlap."""
+    imp_kind, fine_kind = _kind_presence(payload_row, processed)
     lines = _format_stage_header(norm, row, payload_row, "권고형")
-    lines.extend(_format_range_block(penalty, processed, rec, leaf_id, floor, leaf_label))
-
-    # Their overlap: what may lawfully be imposed.
-    lo, hi = intersect
-    lines.append(_INTERSECT_HDR)
-    if lo is not None and hi is not None and lo > hi:
-        rec_span = _span_months(rec.min_months, rec.max_months) if rec else "미상"
-        lines.append(
-            f"- 자유형: 처단형 {_span_months(processed.imp_min_months, processed.imp_max_months)} 과 "
-            f"권고형 {rec_span} 이 겹치지 않음"
-        )
-        lines.append(
-            "- 양형기준 [공통원칙] §02: 권고가 처단형 벗어나면 *처단형* 우선."
-        )
-    else:
-        lines.append(
-            f"- 자유형: {_span_months(lo, hi)}"
-            + (" — 권고 준수" if rec is not None else " — 권고 미적용")
-        )
-
+    lines.extend(_format_range_block(conn, penalty, processed, rec, leaf_id, floor, leaf_label))
+    lines.extend(_intersect_lines(processed, rec, intersect,
+                                  imp_kind=imp_kind, fine_kind=fine_kind,
+                                  fine_guideline=_has_fine_guideline(conn, leaf_id, rec),
+                                  charge=norm.key))
     lines.extend(_format_guide_notes(guide_notes))
     return "\n".join(lines)
 
 
 def _format_final_response(
+    conn: sqlite3.Connection,
     norm: NormalizedCharge,
     row: sqlite3.Row,
     payload_row: sqlite3.Row,
@@ -2792,44 +2990,13 @@ def _format_final_response(
     guide_notes: list[str] | None = None,
 ) -> str:
     """The final stage: ranges, the proposed sentence checked, and suspension."""
+    imp_kind, fine_kind = _kind_presence(payload_row, processed)
     lines = _format_stage_header(norm, row, payload_row, "final")
-    lines.extend(_format_range_block(penalty, processed, rec, leaf_id, floor, leaf_label))
-
-    lines.append(_INTERSECT_HDR)
-    import json as _json
-    try:
-        raw_kinds = _json.loads(payload_row["sentence_kind_options"] or "[]")
-    except (TypeError, _json.JSONDecodeError):
-        raw_kinds = []
-    kinds_eff = set(processed.sentence_kind_options or []) | set(raw_kinds)
-
-    lo, hi = intersect
-    if "imprisonment" in kinds_eff:
-        if lo is not None and hi is not None and lo > hi:
-            lines.append("- 자유형: 처단형과 권고형이 겹치지 않음 → 처단형 우선 (공통원칙 §02)")
-        elif lo is None and hi is None:
-            lines.append("- 자유형: 범위 미정 (무기·사형 전속 등)")
-        else:
-            lines.append(f"- 자유형: {_span_months(lo, hi)}")
-
-    if "fine" in kinds_eff or processed.fine_min_won or processed.fine_max_won or processed.fine_formula:
-        f_lo = processed.fine_min_won
-        f_hi = processed.fine_max_won
-        if f_hi is not None or f_lo is not None:
-            lines.append(f"- 벌금: {_span_won(f_lo if f_lo is not None else 0, f_hi)}")
-        elif processed.fine_formula:
-            lines.append(f"- 벌금: {_format_fine_formula(processed.fine_formula)}")
-        elif fine_paragraphs:
-            lines.append("- 벌금: 정량 미상 (조문 본문 — 식 기반 정량):")
-            for p in fine_paragraphs:
-                for line in p.splitlines():
-                    lines.append(f"  > {line}")
-        else:
-            lines.append("- 벌금: 정량 미상 (법정형 벌금 정량 NULL — statute_lookup 조회 권장)")
-        if mit_applied:
-            note = "§55 ① 6호 다액 1/2 자동 반영됨" if processed.fine_formula else "벌금 다액 1/2 (§55 ① 6호)"
-            lines.append(f"  ※ 감경 적용: {note}")
-        lines.append("- 자유형·벌금 중 형종 선택은 재량 (둘 다 법정형 안)")
+    lines.extend(_format_range_block(conn, penalty, processed, rec, leaf_id, floor, leaf_label))
+    lines.extend(_intersect_lines(processed, rec, intersect, imp_kind=imp_kind, fine_kind=fine_kind,
+                                  fine_guideline=_has_fine_guideline(conn, leaf_id, rec),
+                                  charge=norm.key,
+                                  fine_paragraphs=fine_paragraphs, mit_applied=mit_applied))
 
     # The proposed sentence, checked.
     lines.append("## 선고형 검증")
@@ -2909,14 +3076,21 @@ def _format_pending_response(
     return "\n".join(lines)
 
 
+def _branch_options(r: sqlite3.Row) -> list[dict]:
+    """Branch options for a row, or empty list if none or invalid JSON."""
+    if not r["has_conditional_branch"]:
+        return []
+    try:
+        opts = json.loads(r["branch_options"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [o for o in opts if isinstance(o, dict)]
+
+
 def _penalty_brief(r: sqlite3.Row) -> str:
     """One-line penalty summary, so a caller can tell the candidates apart."""
     if r["has_conditional_branch"]:
-        try:
-            n = len(json.loads(r["branch_options"] or "[]"))
-        except (TypeError, json.JSONDecodeError):
-            n = 0
-        return f"분기형 {n}옵션"
+        return f"분기형 {len(_branch_options(r))}옵션"
     rm = r["reference_mode"]
     if rm and rm != "정보":
         return rm
@@ -2938,18 +3112,30 @@ def _penalty_brief(r: sqlite3.Row) -> str:
     return " · ".join(parts) or "정량 미상"
 
 
+def _indent_option(line: str) -> str:
+    """Indent an option line under a candidate row."""
+    return "    · " + line[2:]
+
+
+# Character budget for inline expansion of branches/references in candidate lists.
+_CANDIDATE_EXPAND_CHAR_BUDGET = 1200
+
+
+def _reference_options(r: sqlite3.Row) -> list[dict]:
+    """Referenced underlying offense options for a row, or empty list."""
+    if r["has_conditional_branch"] or r["reference_mode"] not in ("가중", "준용", "공동가중"):
+        return []
+    try:
+        opts = json.loads(r["reference_articles"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [o for o in opts
+            if isinstance(o, dict) and o.get("article_no_num") is not None]
+
+
 def _candidate_line(r: sqlite3.Row, with_cat: bool = False) -> str:
     """One candidate line: provision, penalty, conduct described, and how to
     choose it.
-
-    `act_descriptor` is a conduct label derived from the corpus — from the text
-    of the article's items and the titles of the provisions it references. It
-    is shown so that a family of provisions cited by article number alone, as
-    drug offences tend to be, can still be navigated by what the conduct was:
-    수출입 against 매매 against 소지 against 사용. Absent, it is omitted. The
-    `notes` column, being free prose, is not loaded at all, for the reason
-    `_format_lookup_response` gives — conduct is described from verified fields
-    or not at all.
     """
     cat = f"sg_category_id={r['sg_category_id']}  " if with_cat else ""
     act = (r["act_descriptor"] or "").strip()
@@ -2959,8 +3145,42 @@ def _candidate_line(r: sqlite3.Row, with_cat: bool = False) -> str:
             f"statute_choice={_format_statute_choice_form(r)!r}")
 
 
+def _candidate_block(rows: list[sqlite3.Row], *, with_cat: bool = False,
+                     dated: bool = False) -> list[str]:
+    """Format ## candidates section with inline branch/reference options under budget."""
+    lines = ["## candidates"]
+    if dated:
+        lines.append("- ⚠ 아래 분기·원범죄는 **현행 조문** 기준입니다. offense_date 의 행위시 조문에"
+                     " 그 분기가 없으면 선택은 무시되고 조문 전체 정량으로 계산합니다.")
+    per_row = [(_branch_options(r), _reference_options(r), r) for r in rows]
+    extra = [line
+             for opts, refs, _ in per_row
+             for line in [_indent_option(_format_branch_option(o)) for o in opts]
+             + [_indent_option(_format_reference_option(x)) for x in refs]]
+    show = bool(extra) and sum(len(x) + 1 for x in extra) <= _CANDIDATE_EXPAND_CHAR_BUDGET
+    example: tuple[sqlite3.Row, str, str] | None = None
+    for opts, refs, r in per_row:
+        lines.append(_candidate_line(r, with_cat=with_cat))
+        if not show:
+            continue
+        lines.extend(_indent_option(_format_branch_option(o)) for o in opts)
+        lines.extend(_indent_option(_format_reference_option(x)) for x in refs)
+        if example is None and opts:
+            example = (r, "branch_key", _branch_key_label(opts[0].get("key", "")))
+        elif example is None and refs:
+            example = (r, "reference_choice", _reference_choice_form(refs[0]))
+    if example:
+        row, arg, key = example
+        cat = f"sg_category_id={row['sg_category_id']}, " if with_cat else ""
+        label = "분기" if arg == "branch_key" else "원범죄"
+        lines.append(
+            f"## 호출: 조항과 {label}를 한 호출에 같이 넣으면 한 번에 계산합니다 — "
+            f"{cat}statute_choice={_format_statute_choice_form(row)!r}, {arg}={key!r}")
+    return lines
+
+
 def _format_cross_cat_response(
-    norm: NormalizedCharge, rows: list[sqlite3.Row]
+    norm: NormalizedCharge, rows: list[sqlite3.Row], *, dated: bool = False
 ) -> str:
     cats = sorted({r["sg_category_id"] for r in rows})
     lines = [
@@ -2969,23 +3189,14 @@ def _format_cross_cat_response(
         f"## charge: {norm.raw_key}",
         f"- 동일 charge_key 가 {len(cats)} 카테고리에 존재 (총 {len(rows)} row). "
         "sg_category_id 명시 후 재호출. 같은 카테고리에 여러 row 면 statute_choice 도 명시.",
-        "## candidates",
     ]
-    for r in rows:
-        lines.append(_candidate_line(r, with_cat=True))
+    lines.extend(_candidate_block(rows, with_cat=True, dated=dated))
     return "\n".join(lines)
 
 
 def _format_same_cat_multi_row_response(
-    norm: NormalizedCharge, rows: list[sqlite3.Row]
+    norm: NormalizedCharge, rows: list[sqlite3.Row], *, dated: bool = False
 ) -> str:
-    """Several provisions within one category: which provision, not which
-    category.
-
-    상해 falls under 형법 §257 ① and 폭처법 §2 ③ (누범상해) alike, both in the
-    same violent-offence category. The caller states which, having read the
-    facts for the form the conduct took and whether there is a prior record.
-    """
     cat = rows[0]["sg_category_id"]
     lines = [
         "## status: ambiguous_statute",
@@ -2993,10 +3204,8 @@ def _format_same_cat_multi_row_response(
         f"## charge: {norm.raw_key}",
         f"- 같은 sg_category_id={cat} 안에 {len(rows)} row 존재 (조항/항 모호). "
         "facts 의 행위·전과 보고 statute_choice 인자로 명시 후 재호출.",
-        "## candidates",
     ]
-    for r in rows:
-        lines.append(_candidate_line(r))
+    lines.extend(_candidate_block(rows, dated=dated))
     return "\n".join(lines)
 
 
@@ -3271,7 +3480,6 @@ OptStrArg = Annotated[str | None, BeforeValidator(_coerce_optional_str_arg)]
 
 # ---------- public tool ----------
 
-@dedup_guard("compute_sentencing_range")
 def compute_sentencing_range(
     ctx: RunContext[HarnessDeps],
     # charge is ChargeArg (above) — wire schema string and required, lists folded before validation.
@@ -3465,6 +3673,18 @@ def compute_sentencing_range(
             # Record any correction to the general-part ceiling.
             if art42_trace and penalty:
                 penalty.trace.insert(0, art42_trace)
+            if penalty is not None:
+                era = (f" (행위시 시점본 {version_meta['effective_date']})"
+                       if version_meta and not version_meta.get('empty_version') else "")
+                if branch_key and not payload_row["has_conditional_branch"]:
+                    penalty.trace.append(
+                        f"## ⚠ branch_key={branch_key!r} 미적용 — 이 조문에는 분기가 없습니다"
+                        f"{era}. 아래 정량은 조문 전체의 것입니다.")
+                if reference_choice and not (payload_row["reference_mode"]
+                                             in ("가중", "준용", "공동가중")):
+                    penalty.trace.append(
+                        f"## ⚠ reference_choice={reference_choice!r} 미적용 — 이 조문은 다른 죄의"
+                        f" 형을 끌어쓰지 않습니다{era}.")
             # Provision text, appended to every stage response.
             appendix = _historic_appendix(conn, payload_row, offense_date)
 
@@ -3485,7 +3705,9 @@ def compute_sentencing_range(
             resolved_leaf_id, leaf_notes = _resolve_leaf(
                 conn, payload_row["sg_category_id"], guideline_leaf_id, guideline_type
             )
-            guide_notes = list_notes + leaf_notes
+            out_of_scope = _out_of_guideline_scope(conn, payload_row)
+            scope_notes = [f"- ⚠ 양형기준 없음: {out_of_scope}"] if out_of_scope else []
+            guide_notes = list_notes + leaf_notes + scope_notes
             leaf_label = _get_leaf_label(conn, resolved_leaf_id) if resolved_leaf_id else ""
             needs_processed = statutory_modifications is not None
             needs_recommended = resolved_leaf_id is not None
@@ -3515,11 +3737,12 @@ def compute_sentencing_range(
                 conn, resolved_leaf_id, factors,
                 legal_floor_months=floor,
                 is_attempted=norm.modifiers.get("is_attempted", False),
-            ) if resolved_leaf_id is not None else None
+            ) if (resolved_leaf_id is not None and not out_of_scope) else None
             intersect = _intersect_with_processed(rec, processed)
 
             if not needs_final:
                 return _format_recommended_response(
+                    conn,
                     norm,
                     row,
                     payload_row,
@@ -3527,7 +3750,7 @@ def compute_sentencing_range(
                     processed,
                     rec,
                     intersect,
-                    resolved_leaf_id,
+                    resolved_leaf_id or -1,
                     floor,
                     leaf_label=leaf_label,
                     guide_notes=guide_notes,
@@ -3555,6 +3778,7 @@ def compute_sentencing_range(
                 for m in (statutory_modifications or [])
             )
             return _format_final_response(
+                conn,
                 norm,
                 row,
                 payload_row,
@@ -3573,10 +3797,10 @@ def compute_sentencing_range(
             ) + appendix
 
         if result.status == "exact_cross_cat":
-            return _format_cross_cat_response(norm, result.rows)
+            return _format_cross_cat_response(norm, result.rows, dated=bool(offense_date))
 
         if result.status == "exact_same_cat_multi_row":
-            return _format_same_cat_multi_row_response(norm, result.rows)
+            return _format_same_cat_multi_row_response(norm, result.rows, dated=bool(offense_date))
 
         if result.status == "exact_wrong_category":
             return _format_wrong_cat_response(norm, result.rows, sg_category_id)
@@ -3594,10 +3818,9 @@ def compute_sentencing_range(
 #   python -m lawful_mcp.tools.compute_sentencing_range
 
 if __name__ == "__main__":
-    from collections import deque
     from types import SimpleNamespace
 
-    fake_deps = SimpleNamespace(recent_calls=deque(maxlen=10))
+    fake_deps = SimpleNamespace()
     fake_ctx = SimpleNamespace(deps=fake_deps)
 
     cases = [

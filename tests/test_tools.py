@@ -649,3 +649,37 @@ def test_current_protocol_revision_is_served_not_rejected():
 
     anyio.run(run)
 
+
+def test_sentence_statistics_includes_fine_share_and_years(ctx):
+    """sentence_statistics reports fine share and year span, without year filtering."""
+    import inspect
+
+    sig = inspect.signature(tools.sentence_statistics)
+    assert "year_from" not in sig.parameters
+    assert "year_to" not in sig.parameters
+
+    out = tools.sentence_statistics(ctx, charges="절도")
+    assert "벌금 비율:" in out
+    assert "수록 연도:" in out
+
+
+def test_statutory_modifications_promotes_string_element(ctx):
+    """String elements in statutory_modifications are promoted to dict with kind."""
+    out = tools.compute_sentencing_range(
+        ctx,
+        charge="절도",
+        statutory_modifications=["누범_가중"],
+    )
+    assert "## status: ok" in out
+    assert "누범_가중" in out
+    assert "1~144월" in out
+
+
+def test_compute_sentencing_range_reference_choice_guidance(ctx):
+    """Reference choice suggestions provide the exact form accepted by the tool."""
+    out = tools.compute_sentencing_range(ctx, charge="상습공갈")
+    assert "## status: needs_reference_choice" in out
+    assert 'choice form: "형법§347"' in out
+    assert '호출: reference_choice="형법§347"' in out
+
+

@@ -33,7 +33,6 @@ from pydantic_ai import RunContext
 from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
 from ._coerce import coerce_int, coerce_str
-from ._dedup import dedup_guard
 from ._morph import kiwi as _kiwi
 
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/llama-nemotron-embed-1b-v2")
@@ -979,7 +978,6 @@ def _format_response_md(resp: dict[str, Any]) -> str:
 
 # ---------- public tool ----------
 
-@dedup_guard("precedent_search")
 def precedent_search(
     ctx: RunContext[HarnessDeps],
     query: str | None = None,

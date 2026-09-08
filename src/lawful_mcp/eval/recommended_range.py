@@ -55,6 +55,13 @@ class RecommendedRange:
     has_life: bool
     is_special_adjusted: bool  # whether the second-stage adjustment applied
     raw_text: str
+    # Recommended fine range — only 4 offense groups (traffic, election, stalking,
+    # animal protection; 53 out of 1,308 sg_ranges rows) have fine guidelines.
+    # For other offenses this is None by design (not missing data). Special
+    # adjustment applies strictly to imprisonment, as guideline manuals do not
+    # define adjustment rules for fines.
+    fine_min_won: int | None = None
+    fine_max_won: int | None = None
 
 
 def _net(counts: dict[tuple[str, str], int], kinds: set[str]) -> int:
@@ -102,11 +109,18 @@ def _special_adjusted(level: Level, factors: Sequence[AppliedFactor]) -> bool:
 def _fetch_range_row(
     conn: sqlite3.Connection, leaf_id: int, level: Level
 ) -> sqlite3.Row | None:
+    """Read a range row. Uses SELECT * and _opt to tolerate schemas without fine columns."""
     return conn.execute(
-        "SELECT level, min_months, max_months, is_open_low, is_unbounded_high,"
-        " has_life, raw_text FROM sg_ranges WHERE subtype_id=? AND level=?",
-        (leaf_id, level),
+        "SELECT * FROM sg_ranges WHERE subtype_id=? AND level=?", (leaf_id, level),
     ).fetchone()
+
+
+def _opt(row: sqlite3.Row, key: str):
+    """Safely read an optional column from a row, returning None if absent."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 def determine_range(
@@ -121,13 +135,6 @@ def determine_range(
     ``legal_floor_months``: the statutory minimum. Where the recommended
     range would fall below it, the guidelines defer to the statute, so the
     floor is raised. None disables the correction.
-
-    ``is_attempted``: the discount for an attempt is data, not code. Which
-    offence groups get one, and by how much, is read from
-    ``sg_categories.attempt_recommend_discount``.
-
-    Returns None for a leaf with no range row — a fine-only leaf, for
-    instance.
     """
     level = _select_level(factors)
     base = _fetch_range_row(conn, leaf_id, level)
@@ -183,7 +190,11 @@ def determine_range(
         max_months=final_max,
         has_life=has_life,
         is_special_adjusted=adj,
-        raw_text=base["raw_text"],
+        raw_text=_opt(base, "raw_text"),
+        # Fine bounds pass straight from the table — special adjustment,
+        # attempt discount, and statutory floor apply strictly to imprisonment.
+        fine_min_won=_opt(base, "fine_min_won"),
+        fine_max_won=_opt(base, "fine_max_won"),
     )
 
 
