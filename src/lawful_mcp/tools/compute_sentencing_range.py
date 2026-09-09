@@ -1846,12 +1846,7 @@ def _probation_recommendation(
     has_imp = sentence_months is not None
     has_fine = fine_amount is not None
     if not has_imp and not has_fine:
-        # Do not stop at "there was nothing to work with" — say what to send.
-        # Measured across 42 runs on two models, this four-quadrant rule never
-        # ran once: one model never sent `sentence_months`, the other never sent
-        # `probation_factors`. Neither had ever been asked.
-        lines.append("- 집행유예 판단: 건너뜀 — 선고형을 `sentence_months`"
-                     "(또는 `fine_amount`)로 주면 판단한다")
+        lines.append("- 집행유예 판단: 선고형(sentence_months·fine_amount) 미지정 — 건너뜀")
         return lines
 
     imp_ok = has_imp and sentence_months <= _PROBATION_IMP_CAP_MONTHS
@@ -1880,8 +1875,7 @@ def _probation_recommendation(
         return lines
 
     if not probation_factors:
-        lines.append("- 4분면 룰 미적용 — 집행유예 참작사유 목록에서 골라"
-                     " `probation_factors` 로 주면 계산한다")
+        lines.append("- probation_factors 미지정 — 4분면 룰 적용 불가")
         return lines
 
     mp = len(probation_factors.get("major_positive") or [])
@@ -2447,17 +2441,18 @@ def _format_probation_factor_enum(rows: list[sqlite3.Row], *, protocol: bool = T
         f"## 집행유예 4분면 enum ({len(rows)}개 — `probation_factors` 선택용)",
         _schema_line(PROBATION_FACTOR_KEYS),
         "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출.",
-    # `protocol=False` still says **how to call back with this list**. The rule
-    # for that branch is to carry nothing that cannot be acted on, and this list
-    # can be: it is the same tool's `probation_factors` argument. Give the list
-    # without saying what to do with it and a model reads past it — measured
-    # across 42 runs, the four-quadrant rule ran 0 times.
-    ] if protocol else [
-        f"## 집행유예 참작사유 ({len(rows)}개)",
-        "선고형이 정해지면 아래에서 고른 사유를 `probation_factors` 로, 형량을"
-        " `sentence_months` 로 함께 주면 집행유예 권고 여부를 계산한다"
-        " (양형기준 공통원칙 §05 4분면).",
-    ])
+    # `protocol=False` does **not** say how to call back with this list — saying
+    # so does not work. Measured: the four-quadrant rule ran 0 times across 42
+    # runs, so "give the sentence and the factors together and it computes" went
+    # in here and the 42 were run again. The rule still ran **0 times**, use of
+    # `probation_factors` on one model went 3 → 0, and suspension accuracy fell
+    # 45.5 → 36.4% (11 cases, so the drop is not conclusive, but there was no
+    # evidence of improvement at all). Reverted.
+    #   To whoever tries again: rewording is not the way. The rule needs
+    #   `sentence_months` and `probation_factors` **both**, and by the time a
+    #   model fixes a sentence it has already settled on its answer — reading the
+    #   invitation then does not buy another call. The order is structurally wrong.
+    ] if protocol else [f"## 집행유예 참작사유 ({len(rows)}개)"])
     for key in sorted(
         groups, key=lambda k: (order_pole[k[0]], order_dir[k[1]], k[2], k[3])
     ):

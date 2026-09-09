@@ -61,14 +61,14 @@ from .statutes import statute_lookup
 
 # Response budget, in characters. Over it, `_articles_section` and `_trim` fold.
 #
-# Measured over all 677 charges: longest 12,812 (아동학대처벌법), median 7,935,
-# 11 charges over 12,000, none over 13,000 — **1.4% of headroom (188 characters)**.
+# Measured over all 677 charges: longest 12,699 (아동학대처벌법), median 7,822,
+# 12 charges over 12,000, none over 13,000 — **2.3% of headroom (301 characters)**.
 # One more constant line in the response grows all 677 at once (two lines about
 # repeat offences cost exactly +97 characters across 673 of them). Anyone adding
 # a section should read that headroom first and re-measure after; whether it
 # still fits is what `test_sentencing_analysis` checks.
-# Staying under is `_trim`'s job, but trimming means **folding**. 21 of the 677
-# actually folded (3%: 15 general suspension factors, 6 ordinary factors, 0
+# Staying under is `_trim`'s job, but trimming means **folding**. 19 of the 677
+# actually folded (2.8%: 13 general suspension factors, 6 ordinary factors, 0
 # conditions), so it is still the exception — if that share climbs noticeably,
 # it is time to raise the budget.
 BUDGET = 13_000

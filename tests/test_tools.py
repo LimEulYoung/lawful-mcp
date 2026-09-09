@@ -749,12 +749,12 @@ def test_sentencing_analysis_needs_a_charge(ctx):
     assert "charge_numeric" in tools.sentencing_analysis(ctx, charge="[299,298,297]")
 
 
-def test_probation_says_what_it_needs_rather_than_what_is_missing(ctx):
-    """The line may not stop at 'nothing to work with': across two models the
-    four-quadrant rule never ran once, because nothing had ever been asked for."""
-    out = tools.sentencing_analysis(
-        ctx, charge="사기", guideline_type="일반사기 1유형", sentence_months=12)
-    assert "`probation_factors` 로 주면 계산한다" in out
+def test_the_suspension_list_carries_no_call_back_invitation(ctx):
+    """Inviting the call back was tried and reverted: the rule needs the sentence
+    and the factors together, and by then a model has settled on its answer."""
+    out = tools.sentencing_analysis(ctx, charge="사기")
+    assert "## 집행유예 참작사유" in out
+    assert "주면 집행유예 권고 여부를 계산한다" not in out
 
 
 def test_a_sentence_is_checked_against_the_processed_range_when_the_two_do_not_overlap():
