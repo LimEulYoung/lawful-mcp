@@ -7,15 +7,14 @@
 시행 중이던 조문을 확인하고, 사실관계만 던져도 비슷한 판결을 찾아옵니다. 판결문을
 읽고 물어본 것에 답하고, 양형 범위도 법원이 계산하는 순서 그대로 뽑아냅니다.
 
-읽기만 하는 도구 다섯 개입니다.
+읽기만 하는 도구 네 개입니다.
 
 | 도구 | 하는 일 |
 |---|---|
 | `precedent_search` | 사실관계·죄명·법원·연도·사건번호로 판결 찾기 |
 | `precedent_dive` | 판결문 한 건을 읽고 물어본 것에 답하기 |
 | `statute_lookup` | 법령·행정규칙 조문, 현행 또는 특정 시점 |
-| `sentence_statistics` | 죄명별 1심 선고형이 실제로 어떻게 나왔는지 |
-| `compute_sentencing_range` | 법정형 → 처단형 → 양형기준 권고형 → 검증 |
+| `sentencing_analysis` | 죄명 하나로 법정형·양형기준·양형인자·실선고 분포를 한 응답에, 인자를 더하면 처단형·권고형·선고형 계산 |
 
 무료 법률AI 서비스 [로풀 (Lawful)](https://lawful.crow-tit.com)이 실제로 돌리고 있는
 시스템입니다. 연구용 프로토타입 [`legal_mcp`](https://github.com/LimEulYoung/legal_mcp)에서
@@ -27,7 +26,7 @@
 서비스합니다. 호출 횟수 제한은 없습니다. 붙는 길은 셋입니다.
 
 **Claude·ChatGPT 웹 — 코드 없이.** 커스텀 커넥터에 아래 주소를 넣고 OAuth
-로그인만 하면 도구 5종이 붙습니다. API 키도 필요 없습니다.
+로그인만 하면 도구 4종이 붙습니다. API 키도 필요 없습니다.
 
 ```
 https://mcp.crow-tit.com/mcp
@@ -85,7 +84,7 @@ lawful-mcp --transport http --port 8100
 
 ### dive 도구에는 모델이 필요합니다
 
-다섯 중 넷은 DB만 읽습니다. `precedent_dive` 하나만 공개된 판결문을 언어 모델에
+넷 중 셋은 DB만 읽습니다. `precedent_dive` 하나만 공개된 판결문을 언어 모델에
 넘겨 답을 뽑아내기 때문에 엔드포인트가 있어야 합니다.
 
 ```bash

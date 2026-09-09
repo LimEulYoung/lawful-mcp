@@ -1,5 +1,10 @@
 """First-instance sentencing distribution for a single charge (no concurrent offences).
 
+**Not a registered tool.** The only sentencing surface a model sees is
+``sentencing_analysis``; this is the distribution engine behind it. That is why
+the guidance in these responses names the *tool's* ``charge`` argument and not
+this function's ``charges`` — the argument names a model sees are the tool's.
+
 Offence keys are official charge names (Supreme Prosecutors' Office Directive No. 1516,
 resolved via `_charge_index`). Judgment charge strings are deterministically mapped
 to official names via `charge_norm_map`.
@@ -23,6 +28,39 @@ STATS_INSTANCE = "1심"
 MIN_N_STATS = 30
 GRID_MAX = 15
 RELATED_MAX = 15
+
+# ---------- correction metadata (schema extension) ----------
+# Columns a labelling pass adds to `prec_defendants`:
+#   term_kind            '징역' | '금고'. The schema had no column for 금고, so those
+#                        sentences were stored as 징역. Negligence offences
+#                        (업무상과실치사, 교통사고처리특례법위반) are nearly all 금고.
+#   sentence_months_min  lower term of an indeterminate juvenile sentence; only the
+#                        upper term was being kept.
+#   data_quality         excluded:*   the row is not a sentence at all (an order
+#                                     reopening a case, say)
+#                        unverified:* the stored term matches no sentence in the
+#                                     disposition (split sentences summed, etc.)
+# A corpus need not carry them, so they are read only when present — without them
+# this module behaves exactly as it did before.
+
+
+def _has_quality_cols(conn: sqlite3.Connection) -> bool:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(prec_defendants)")}
+    return {"term_kind", "data_quality", "sentence_months_min"} <= cols
+
+
+# Dropped from the sample: these rows cannot be corrected, and counting them
+# pollutes the distribution. Measured: without this predicate more than half of
+# the life/death sample came from reopening orders quoting the original judgment.
+_QUALITY_WHERE = (
+    " AND (pd.data_quality IS NULL"
+    " OR pd.data_quality NOT LIKE 'excluded:%' AND pd.data_quality NOT LIKE 'unverified:%')"
+)
+
+
+def _row_get(row: sqlite3.Row, key: str) -> Any:
+    """Read a column an older schema may not have."""
+    return row[key] if key in row.keys() else None
 
 
 def _percentile(sorted_vals: list[int], p: float) -> int | None:
@@ -73,6 +111,18 @@ def _by_type(rows: list[sqlite3.Row]) -> dict[str, int]:
         st = r["sentence_type"]
         if st in out:
             out[st] += 1
+    return out
+
+
+def _term_kinds(rows: list[sqlite3.Row]) -> dict[str, int]:
+    """Split custodial sentences into 징역 and 금고. 금고 carries no labour, so
+    folding it into '징역' states something untrue about the sample."""
+    out: dict[str, int] = {}
+    for r in rows:
+        if r["sentence_type"] != "imprisonment":
+            continue
+        k = _row_get(r, "term_kind") or "징역"
+        out[k] = out.get(k, 0) + 1
     return out
 
 
@@ -175,7 +225,15 @@ REASON_MAX = 160
 def _sentence_str(row: sqlite3.Row) -> str:
     st = row["sentence_type"]
     if st == "imprisonment":
-        s = f"징역 {row['sentence_months']}월"
+        kind = _row_get(row, "term_kind") or "징역"
+        months = row["sentence_months"]
+        low = _row_get(row, "sentence_months_min")
+        if months is None:
+            s = kind
+        elif low is not None:
+            s = f"{kind} 장기 {months}월·단기 {low}월"   # one indeterminate juvenile sentence
+        else:
+            s = f"{kind} {months}월"
         if row["probation"]:
             pm = row["probation_months"]
             s += f" 집유{pm}월" if pm is not None else " 집유"
@@ -185,7 +243,11 @@ def _sentence_str(row: sqlite3.Row) -> str:
         return f"벌금 {amt:,}원" if amt is not None else "벌금"
     if st == "life":
         return "무기징역/사형"
-    return "무죄"
+    if st == "not_guilty":
+        return "무죄"
+    # 선고유예·공소기각·형면제 used to print as "무죄". When the disposition is
+    # unknown, say that rather than flatten it into an acquittal.
+    return _row_get(row, "disposition_kind") or "그 밖의 주문"
 
 
 def _short_case_no(case_number: str | None) -> str:
@@ -198,8 +260,13 @@ def _short_case_no(case_number: str | None) -> str:
 
 
 def _case_lines(row: sqlite3.Row) -> list[str]:
+    # No defendant_id. It is an anonymised label that only means something inside
+    # its own judgment (`피고인`, `A`, `甲`, `7`, `(피고인②)` — every judgment picks
+    # its own), so in a one-line case list there is nothing for it to point at:
+    # 15 of 33 sampled lines were the bare word `피고인`. The old `· def A` also
+    # leaked a Python keyword into a response meant to read as prose.
     lines = [
-        f"  case: {_short_case_no(row['case_number'])} ({row['decision_year']}) · def {row['defendant_id']}",
+        f"  case: {_short_case_no(row['case_number'])} ({row['decision_year']})",
         f"  url: {config.case_url_base()}/cases/{row['case_id']}",
         f"  sentence: {_sentence_str(row)}",
     ]
@@ -260,6 +327,14 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append(
                 "- by_type: " + " / ".join(f"{k} {v}" for k, v in bt.items() if v)
             )
+        tk = blk.get("term_kinds") or {}
+        if tk.get("금고"):
+            # The imprisonment figures below count 징역 and 금고 together. Unsaid,
+            # a model copies them out as a '징역 average' (negligence offences are
+            # mostly 금고).
+            lines.append(
+                f"- 자유형 형종: 징역 {tk.get('징역', 0)} / 금고 {tk['금고']} "
+                "(아래 수치는 둘을 합한 분포 — 금고는 정역 없는 다른 형이다)")
         imp = blk.get("imprisonment")
         if imp:
             lines.append(
@@ -291,7 +366,7 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     if related:
         lines.append(
             "## 관련 죄명 (같은 죄의 미수·상습·특수형, 같은 법률의 다른 죄, 이 이름을 품은 특별법 죄 — "
-            "해당하면 charges 로 통계)")
+            "해당하면 그 이름으로 다시 호출)")
         for c in related[:RELATED_MAX]:
             lines.append(name_line(c))
         if len(related) > RELATED_MAX:
@@ -365,7 +440,7 @@ def sentence_statistics(
     if not q_raw:
         return _format_response_md({
             "status": "missing_input",
-            "warnings": ["charges(죄명 하나)가 필요합니다."],
+            "warnings": ["죄명 하나가 필요합니다."],
         })
     qnorm = _norm_charge(q_raw)
     qnorm, _bracket, _quotes = strip_charge_decorations(qnorm)
@@ -373,13 +448,13 @@ def sentence_statistics(
         return _format_response_md({
             "status": "charge_numeric",
             "warnings": [
-                "charges 에는 죄명 문자열을 넣으세요(예: charges='강제추행'). "
+                "charge 에는 죄명 문자열을 넣으세요(예: charge='강제추행'). "
                 "조문 번호·식별자 숫자로는 통계를 찾지 않습니다.",
             ],
         })
     if not qnorm:
         return _format_response_md(
-            {"status": "no_data", "warnings": ["charges 정규화 후 비어있음"]})
+            {"status": "no_data", "warnings": ["죄명 정규화 후 비어있음"]})
 
     conn = open_db()
     try:
@@ -401,7 +476,7 @@ def sentence_statistics(
             resp = {"status": "no_data", "unmatched_charges": [{"input": qnorm}],
                     "warnings": [f"'{qnorm}' 은 공식 죄명(대검 죄명표)에 없는 표기입니다 — 판결문 죄명 표기"
                                  "(예: 특수상해, 도로교통법위반(음주운전))로 재호출하고, 법률명만 알면"
-                                 " charges='<법률명>위반' 으로 그 법률의 죄명 후보를 받으세요."]}
+                                 " charge='<법률명>위반' 으로 그 법률의 죄명 후보를 받으세요."]}
         if res.alias_from:
             resp["query_resolved"] = f"{res.alias_from[0]} → {res.alias_from[1]}"
         return _format_response_md(resp)
@@ -443,7 +518,7 @@ def _solo_counts(
         JOIN prec_cases pc ON pc.id = pd.case_id
         WHERE pdc.charge_norm IN ({marks}) AND ps.instance = ? AND pd.n_charges = 1
           AND pd.sentence_type IN ('imprisonment','fine','not_guilty','life')
-    """
+    """ + (_QUALITY_WHERE if _has_quality_cols(conn) else "")
     params: list[Any] = [*norms, STATS_INSTANCE]
     if exclude:
         sql += f" AND pd.case_id NOT IN ({','.join('?' * len(exclude))})"
@@ -547,12 +622,14 @@ def _fetch_samples(
     if not norms:
         return []
     marks = ",".join("?" * len(norms))
+    has_q = _has_quality_cols(conn)
+    extra = ", pd.term_kind, pd.sentence_months_min, pd.data_quality" if has_q else ""
     sql = f"""
         SELECT DISTINCT
             pd.case_id, pd.defendant_id, pd.n_charges,
             pd.sentence_type, pd.sentence_months, pd.fine_amount,
             pd.probation, pd.probation_months, pd.sentencing_reason,
-            pc.case_number, pc.court_name, pc.decision_year
+            pc.case_number, pc.court_name, pc.decision_year{extra}
         FROM prec_defendant_charges pdc
         JOIN prec_defendants pd
           ON pd.case_id = pdc.case_id AND pd.defendant_id = pdc.defendant_id
@@ -562,7 +639,7 @@ def _fetch_samples(
           AND ps.instance = ?
           AND pd.n_charges = 1
           AND pd.sentence_type IN ('imprisonment','fine','not_guilty','life')
-    """
+    """ + (_QUALITY_WHERE if has_q else "")
     params: list[Any] = [*norms, STATS_INSTANCE]
 
     if exclude_case_ids:
@@ -587,6 +664,7 @@ def _build_block(
         is_stats = True
         bt = _by_type(singles)
         blk["by_type"] = bt
+        blk["term_kinds"] = _term_kinds(singles)
         blk["imprisonment"] = _imprisonment_stats(
             [r for r in singles if r["sentence_type"] == "imprisonment"]) or None
         blk["fine"] = _fine_stats(

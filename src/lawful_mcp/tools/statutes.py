@@ -1918,7 +1918,7 @@ def statute_lookup(
       기억으로 서술하려 할 때도. 조문은 개정되므로 현행 본문은 이 도구만 압니다.
     - 죄명·법조 식별 후 정확한 조문 확인. 행위 시점이 문제되면 offense_date 로 시점본 확인.
     - 조문을 확인했으면 그 요건이 실제 사건에서 어떻게 판단됐는지는 precedent_search 로 이어
-      확인하세요 — 조문과 판례는 택일이 아닙니다. 양형기준은 compute_sentencing_range.
+      확인하세요 — 조문과 판례는 택일이 아닙니다. 양형기준은 sentencing_analysis.
 
     규칙:
     - query 또는 statute_id 중 하나는 필수입니다. 둘 다 없으면 임의 법령 목록을 반환하지 않고

@@ -1,4 +1,4 @@
-"""MCP application — five read-only corpus tools over stdio or HTTP.
+"""MCP application — four read-only corpus tools over stdio or HTTP.
 
 No authentication and no metering: this server is meant to run next to the
 client that uses it, against a corpus you hold. (The hosted deployment puts
@@ -40,8 +40,8 @@ _EXTRA_HOSTS = [
 _INSTRUCTIONS = (
     "한국 법률 검색 도구 모음 — 판례·법령·행정규칙(고시·훈령·예규)·양형기준 corpus 기반. "
     "판례 검색(precedent_search) 후 필요할 때 본문 생성요약(precedent_dive), "
-    "법령·행정규칙 조문(statute_lookup), 양형 분포(sentence_statistics), "
-    "양형기준 계산(compute_sentencing_range). 판례 출처 표기는 도구가 반환한 url만 사용."
+    "법령·행정규칙 조문(statute_lookup), 양형(sentencing_analysis — 기준·인자·실선고 분포를 "
+    "한 응답에, 인자를 더하면 처단형·권고형·선고형 계산). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
 
 mcp = MCPServer("lawful-mcp", instructions=_INSTRUCTIONS)
@@ -148,33 +148,34 @@ _DESC_STATUTE_LOOKUP = (
     "offense_date=행위 일자(예 '2013.7.30') 지정 시 행위시점 조문, 미지정 시 현행.\n"
     "url만 인용 링크로 쓰고, `text_kind: 공식 … 원문`인 조문·행정규칙 본문만 직접인용하세요."
 )
-_DESC_SENTENCE_STATISTICS = (
-    "양형 선고 통계 — charges(죄명 하나) 필수. 죄명이 판결문·공소장 표기(대검 죄명표: 형법은 '특수상해', 특별법은 '도로교통법위반(음주운전)')면 "
-    "곧바로 그 죄명 하나만 유죄인 피고인의 1심 선고 분포(표본 30↑=형종별 평균·표준편차·집유율 + 11분위 비교판례 / 미만=개별 사례 그리드)와 관련 죄명 목록. "
-    "법률명만 주면('스토킹처벌법위반') 그 법률의 공식 죄명 중 표본 있는 후보(status=candidates) — 후보 이름 하나를 charges 에 그대로 넣어 재호출. "
-    "약칭·구어('정보통신망법위반(명예훼손)'·'몰카'·'보이스피싱')도 풀어 줍니다. 형량 전망·구형/양형 근거·자기 사건 위치를 가늠할 때 결론 전에 호출"
-    "(compute_sentencing_range 공식 '범위'를 실데이터로 보완). "
-    "죄명은 한 번에 하나씩. 경합 사안의 죄명별 단독 분포를 합산·평균·1.5배해 경합범 분포로 만들지 마세요. 형법 38조는 가장 중한 죄 장기(벌금은 다액)의 1/2까지 가중하되 각 죄 장기·다액 합계를 넘지 못하게 하는 처단형 상한이지 통계 결합식이 아닙니다. status=low_n_grid는 단독 개별 사례라 일반화 금지.\n"
-    "Args: charges=죄명 하나(공식 표기·약칭·구어) 또는 법률명. "
-    "reference_year=비교 판례·그리드 기준 연도(가까운 사건 우선; None=최근). "
-    "연도로 좁히는 인자는 없습니다 — 풀이 죄명당 중앙값 2건이라 자르면 통계가 사라집니다. "
-    "시간 변화는 응답의 `벌금 비율`(전체·최근 절반)과 `수록 연도`가 싣습니다.\n"
-    "비교 판례·그리드의 url만 인용 링크로, 집계 분포 수치는 링크 없이 제시."
-)
-_DESC_COMPUTE_SENTENCING_RANGE = (
-    "통합 양형 도구 — 죄명에서 법정형→처단형→권고형→선고 검증까지, 인자를 채울수록 깊은 단계로 자동 진행: "
-    "charge만=lookup(법정형·권고범위·인자 enum) / +statutory_modifications=처단형(형법§56 순서 적용) / "
-    "+guideline_type·guideline_factors=권고형 / +sentence_months·fine_amount(+probation_factors)=final(선고형·집행유예 검증). "
-    "결과는 양형기준이 정한 '범위'(예측 아님). 호출 간 상태가 없으므로 후속 호출마다 charge와 확정 선택·플래그·offense_date를 반복하고 새 인자를 추가.\n"
-    "Args: charge=판결문형 죄명 문자열(예 '살인','도로교통법위반(음주운전)') — 호출당 하나"
-    "(여러 죄는 각각 호출; list면 죄명별 유도[multiple_charges]), 숫자·ID 불가"
-    "(조문번호·식별자 아님; 숫자면 유도[charge_numeric]). "
-    "offense_date=행위 일자(지정 시 행위시 조문). "
-    "sg_category_id·statute_choice·branch_key·reference_choice=ambiguous_* 응답이 후보를 줄 때. "
-    "is_attempted·is_accessory·is_solicitor=미수·방조·교사. statutory_modifications=가중감경 list(lookup enum에서). "
-    "guideline_type·guideline_leaf_id·guideline_factors=권고유형(lookup 목록 명칭 그대로)·leaf_id·특별인자. "
-    "sentence_months=검증 선고형(자유형·월)·fine_amount=벌금(원)·probation_factors=집행유예 인자(dict). act_count=동종 다행위 수(≥2면 경합범 가중 자동).\n"
-    "후속 단계 값은 이전 응답 enum에 있는 key만 쓰고 추측 금지. 응답의 '출처'(해설서 PDF)가 있으면 인용 링크로 제시."
+_DESC_SENTENCING_ANALYSIS = (
+    "양형 — 죄명 하나로 판단에 필요한 것을 한 응답에: 법정형, 형법 §56 처단형 계산방법, 대법원 양형기준의 "
+    "범죄유형별 권고 형량범위, 양형인자, 집행유예 참작사유, 근거 조문 원문, 1심 실선고 분포와 비교판례."
+    " 형량·구형·양형 의견을 볼 때 결론 전에 죄명만으로 부르고, "
+    "유형·양형인자가 정해지면 계산 인자를 더해 다시 부르세요 — 두 번째 응답은 그 사건의 처단형·권고형·"
+    "선고 가능 범위·집행유예만 싣고 기준 본문을 반복하지 않습니다. 조항·분기가 여럿이면 되묻지 않고 후보 정량을 전부 싣습니다. 권고범위는 공식 기준의 '범위'이지 예측이 아니고 실선고 분포는 표본의 관측입니다. "
+    "죄명은 판결문 표기로 한 번에 하나씩(형법 '특수상해', 특별법 '도로교통법위반(음주운전)'). 법률명만 주면"
+    "('스토킹처벌법위반') 그 법률의 죄명 후보를 돌려줍니다. 경합 사안은 죄명별로 각각 호출하고 죄명별 분포를 "
+    "합산·평균해 경합범 분포로 만들지 마세요.\n"
+    "Args: charge=죄명 하나(숫자·ID 불가). offense_date=행위 일자(예 '2013.7.30') 지정 시 행위시 조문·정량. "
+    "statute_choice·branch_key·reference_choice·sg_category_id=후보가 여럿일 때 좁히는 값. "
+    "is_attempted·is_accessory·is_solicitor=미수·방조·교사. "
+    "statutory_modifications=형법 §56 가중·감경 list(예 [{\"kind\": \"누범_가중\"}]). "
+    "guideline_type=응답 목록의 따옴표 안 유형 명칭 그대로. "
+    # The eight key names are spelled out **here**. A pydantic-ai agent reads them
+    # from the tool docstring, but for an MCP client this description is all there
+    # is, and a briefing response is `protocol=False` so it carries no schema line
+    # either. Leave them out and a client invents names, paying one more
+    # `bad_factor_key` round trip — breaking this tool's promise not to ask back,
+    # on the MCP surface alone.
+    "guideline_factors=특별양형인자 dict — key 는 special_act_aggravators·"
+    "special_act_mitigators·special_actor_aggravators·special_actor_mitigators 넷뿐. "
+    "probation_factors=집행유예 참작사유 dict — key 는 major_positive·major_negative·"
+    "general_positive·general_negative 넷뿐. 값은 응답의 해당 그룹 아래 문장 그대로 넣고, "
+    "이 여덟 밖의 key 는 계산 없이 되돌아옵니다. "
+    "sentence_months·fine_amount=검증할 선고형. act_count=같은 죄명의 별개 행위 수"
+    "(2 이상이면 경합범 가중). reference_year=비교 판례 기준 연도.\n"
+    "판례·조문 url만 인용 링크로 쓰세요."
 )
 _DESC_PRECEDENT_DIVE = (
     "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 500자 내외 생성 요약을 반환. "
@@ -237,73 +238,54 @@ def statute_lookup(
 
 
 @_tool(
-    _DESC_SENTENCE_STATISTICS,
-    title="양형 선고 통계",
+    _DESC_SENTENCING_ANALYSIS,
+    title="양형 분석",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
 )
-def sentence_statistics(
-    charges: str | None = None,
-    reference_year: int | None = None,
-) -> str:
-    return _t.sentence_statistics(
-        _ctx(),
-        charges=charges,
-        reference_year=reference_year,
-    )
-
-
-@_tool(
-    _DESC_COMPUTE_SENTENCING_RANGE,
-    title="양형기준 범위 계산",
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
-)
-def compute_sentencing_range(
+def sentencing_analysis(
     # charge shares the same ChargeArg as the core tool (wire schema `string` and required;
     # lists are folded by BeforeValidator before schema validation). Sibling string arguments
     # remain narrow: widening is only beneficial when an answer is prepared for the wide value.
     charge: ChargeArg,
-    sg_category_id: int | None = None,
     statute_choice: str | None = None,
     branch_key: str | None = None,
     reference_choice: str | None = None,
+    sg_category_id: int | None = None,
+    offense_date: str | None = None,
     is_attempted: bool = False,
     is_accessory: bool = False,
     is_solicitor: bool = False,
     statutory_modifications: list[dict] | None = None,
-    guideline_leaf_id: int | None = None,
     guideline_type: str | None = None,
     guideline_factors: dict | None = None,
+    probation_factors: dict | None = None,
     sentence_months: int | None = None,
     fine_amount: int | None = None,
-    probation_factors: dict | None = None,
     act_count: int = 1,
-    offense_date: str | None = None,
+    reference_year: int | None = None,
 ) -> str:
-    return _t.compute_sentencing_range(
+    return _t.sentencing_analysis(
         _ctx(),
         charge=charge,
-        sg_category_id=sg_category_id,
         statute_choice=statute_choice,
         branch_key=branch_key,
         reference_choice=reference_choice,
+        sg_category_id=sg_category_id,
+        offense_date=offense_date,
         is_attempted=is_attempted,
         is_accessory=is_accessory,
         is_solicitor=is_solicitor,
         statutory_modifications=statutory_modifications,
-        guideline_leaf_id=guideline_leaf_id,
         guideline_type=guideline_type,
         guideline_factors=guideline_factors,
+        probation_factors=probation_factors,
         sentence_months=sentence_months,
         fine_amount=fine_amount,
-        probation_factors=probation_factors,
         act_count=act_count,
-        offense_date=offense_date,
+        reference_year=reference_year,
     )
 
 

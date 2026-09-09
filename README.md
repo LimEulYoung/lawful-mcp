@@ -8,15 +8,14 @@ stood on a given date, find judgments by the facts of a case, read one
 judgment and answer a question about it, and compute a sentencing range the
 way a Korean court does.
 
-Five read-only tools:
+Four read-only tools:
 
 | Tool | What it does |
 |---|---|
 | `precedent_search` | Find judgments by facts, charge, court, year or case number |
 | `precedent_dive` | Read one judgment body and answer a question about it |
 | `statute_lookup` | Statute and administrative-rule articles, current or as of a date |
-| `sentence_statistics` | Observed first-instance sentencing distribution for a charge |
-| `compute_sentencing_range` | Statutory range → processed range → guideline range → verification |
+| `sentencing_analysis` | Everything a sentence turns on for one charge — statutory range, the guideline, the factors, the observed sentences — and the arithmetic once the findings are supplied |
 
 This is the production system behind [로풀 (Lawful)](https://lawful.crow-tit.com),
 a free Korean legal-AI service, and the descendant of the research prototype in
@@ -29,7 +28,7 @@ administrative rules, sentencing guidelines) is served for you. No rate
 limits. Three ways in:
 
 **Claude / ChatGPT on the web — no code.** Add a custom connector with this
-URL, sign in with OAuth when asked, and the five tools appear. No API key
+URL, sign in with OAuth when asked, and the four tools appear. No API key
 needed:
 
 ```
@@ -88,7 +87,7 @@ Nothing is required; the defaults use the bundled corpus.
 
 ### The dive tool needs a model
 
-Four of the five tools are pure database reads. `precedent_dive` sends one
+Three of the four tools are pure database reads. `precedent_dive` sends one
 public judgment body to a language model and asks it to extract an answer,
 so it needs an endpoint:
 

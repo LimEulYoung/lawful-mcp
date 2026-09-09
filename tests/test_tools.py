@@ -462,17 +462,16 @@ def test_charge_is_string_and_required():
             return {b["type"] for b in prop["anyOf"] if "type" in b}
         return {prop["type"]} if "type" in prop else set()
 
-    schema = schemas["compute_sentencing_range"]
-    assert types("compute_sentencing_range", "charge") == {"string"}
+    schema = schemas["sentencing_analysis"]
+    assert types("sentencing_analysis", "charge") == {"string"}
     assert "charge" in schema.get("required", [])
 
     for tool, field in (
         ("precedent_search", "query"),
         ("precedent_search", "case_number"),
         ("precedent_search", "court_name"),
-        ("sentence_statistics", "charges"),
-        ("compute_sentencing_range", "statute_choice"),
-        ("compute_sentencing_range", "offense_date"),
+        ("sentencing_analysis", "statute_choice"),
+        ("sentencing_analysis", "offense_date"),
     ):
         assert "array" not in types(tool, field), f"{tool}.{field}"
 
@@ -490,10 +489,10 @@ def test_real_array_charge_folds_before_validation(monkeypatch):
         seen.update(kw)
         return ""
 
-    monkeypatch.setattr(tools, "compute_sentencing_range", _stub)
-    anyio.run(server.mcp.call_tool, "compute_sentencing_range", {"charge": ["살인"]})
+    monkeypatch.setattr(tools, "sentencing_analysis", _stub)
+    anyio.run(server.mcp.call_tool, "sentencing_analysis", {"charge": ["살인"]})
     assert seen["charge"] == "살인"
-    anyio.run(server.mcp.call_tool, "compute_sentencing_range", {"charge": ["주거침입", "절도"]})
+    anyio.run(server.mcp.call_tool, "sentencing_analysis", {"charge": ["주거침입", "절도"]})
     assert coerce_list(seen["charge"]) == ["주거침입", "절도"]
 
 
@@ -502,7 +501,7 @@ def test_sentencing_optional_string_args_have_no_array_branch_and_fold_lists():
     import json
     from pydantic_ai.tools import Tool
 
-    t = Tool(tools.compute_sentencing_range)
+    t = Tool(tools.sentencing_analysis)
     props = t.tool_def.parameters_json_schema["properties"]
     for name in ("branch_key", "statute_choice", "reference_choice", "guideline_type", "offense_date"):
         kinds = {b.get("type") for b in props[name]["anyOf"]}
@@ -596,7 +595,7 @@ def test_mcp_layer_lets_a_json_looking_charge_through():
 
     async def call(value):
         return await server.mcp.call_tool(
-            "compute_sentencing_range", {"charge": value})
+            "sentencing_analysis", {"charge": value})
 
     assert "charge_numeric" in str(anyio.run(call, "[299,298,297]"))
     assert "charge_numeric" in str(anyio.run(call, "298"))
@@ -683,3 +682,111 @@ def test_compute_sentencing_range_reference_choice_guidance(ctx):
     assert '호출: reference_choice="형법§347"' in out
 
 
+
+
+# ---------- sentencing_analysis: the one registered sentencing tool ----------
+
+
+def test_sentencing_analysis_answers_a_charge_in_one_response(ctx):
+    """A charge alone returns the whole picture, within budget, and carries
+    nothing addressed to a call that cannot be made."""
+    from lawful_mcp.tools.sentencing_analysis import BUDGET
+
+    out = tools.sentencing_analysis(ctx, charge="사기")
+    assert out.startswith("## status: ok")
+    assert "## stage: brief" in out
+    for section in ("## 양형 판단 흐름", "## 법정형", "## 처단형 계산방법",
+                    "## 권고 형량범위 — 범죄유형별", "## 특별양형인자",
+                    "## 집행유예 참작사유", "## 실선고 통계"):
+        assert section in out, section
+    assert len(out) <= BUDGET
+
+    # `protocol=False` leftovers: an argument schema, the key beside a group
+    # heading, the id whose only use is a next call.
+    for leftover in ("- schema:", "sg_category_id:", "→ special_act_aggravators",
+                     "그대로 넣어 호출"):
+        assert leftover not in out, leftover
+
+
+def test_sentencing_analysis_lists_every_branch_instead_of_asking(ctx):
+    """Where the provision has branches the response carries all of them with the
+    arguments that select each — the point of the tool is not asking back."""
+    out = tools.sentencing_analysis(ctx, charge="도로교통법위반(음주운전)")
+    assert out.startswith("## status: ok")
+    assert "## 법정형 — 조항·분기별" in out
+    assert 'statute_choice="' in out
+    keys = re.findall(r'branch_key="([^"]+)"', out)
+    assert len(keys) >= 2 and len(set(keys)) == len(keys)
+    # Each row carries its own numbers; none of them is a question.
+    assert out.count("자유형 ") >= len(keys)
+    assert "needs_branch_key" not in out
+
+
+def test_sentencing_analysis_calculates_without_reprinting_the_guideline(ctx):
+    """The second call computes the case and leaves the reference text behind."""
+    out = tools.sentencing_analysis(
+        ctx, charge="사기", guideline_type="일반사기 1유형", sentence_months=12)
+    assert "## stage: calc" in out
+    assert "## 선고형 검증" in out
+    assert "- 선고 가능 범위(6~18월) 안: True" in out
+    for repeated in ("## 양형 판단 흐름", "## 특별양형인자", "## 실선고 통계"):
+        assert repeated not in out, repeated
+
+
+def test_sentencing_analysis_hands_back_unknown_factor_keys(ctx):
+    """A group heading used as a dict key computes `ok` with nothing counted, so
+    the keys are checked before any arithmetic runs."""
+    out = tools.sentencing_analysis(
+        ctx, charge="사기", guideline_type="일반사기 1유형",
+        guideline_factors={"감경": ["피해 회복"]})
+    assert out.startswith("## status: bad_factor_key")
+    assert "`감경`" in out
+    assert "[특별/행위/감경] → special_act_mitigators" in out
+
+
+def test_sentencing_analysis_needs_a_charge(ctx):
+    assert "missing_input" in tools.sentencing_analysis(ctx, charge="")
+    assert "charge_numeric" in tools.sentencing_analysis(ctx, charge="[299,298,297]")
+
+
+def test_probation_says_what_it_needs_rather_than_what_is_missing(ctx):
+    """The line may not stop at 'nothing to work with': across two models the
+    four-quadrant rule never ran once, because nothing had ever been asked for."""
+    out = tools.sentencing_analysis(
+        ctx, charge="사기", guideline_type="일반사기 1유형", sentence_months=12)
+    assert "`probation_factors` 로 주면 계산한다" in out
+
+
+def test_a_sentence_is_checked_against_the_processed_range_when_the_two_do_not_overlap():
+    """An empty intersection is not a range. Printed raw it reads 18~12월, and the
+    verdict about it means nothing — the processed range governs (공통원칙 §02)."""
+    import importlib
+    csr = importlib.import_module("lawful_mcp.tools.compute_sentencing_range")
+
+    processed = csr.ProcessedPenalty(
+        imp_min_months=0, imp_max_months=12, fine_min_won=None, fine_max_won=None,
+        has_life=False, has_death=False, sentence_kind_options=["imprisonment"])
+    lines = csr._verify_sentence(
+        sentence_months=6, fine_amount=None, processed=processed, rec=None,
+        intersect=(18, 12))
+    span = next(l for l in lines if l.startswith("- 선고 가능 범위"))
+    assert "18~12월" not in span
+    assert "0~12월" in span and "처단형 우선" in span
+    assert span.endswith("안: True")
+
+
+def test_sentence_statistics_runs_without_the_correction_columns(ctx):
+    """The bundled sample predates term_kind/data_quality/sentence_months_min, so
+    the distribution must still run and simply report every term as 징역."""
+    import importlib
+    ss = importlib.import_module("lawful_mcp.tools.sentence_statistics")
+
+    conn = open_db()
+    try:
+        assert not ss._has_quality_cols(conn)
+    finally:
+        conn.close()
+
+    out = tools.sentence_statistics(ctx, charges="절도")
+    assert "## status:" in out
+    assert "자유형 형종:" not in out          # nothing to report without the column

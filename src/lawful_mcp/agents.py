@@ -11,19 +11,21 @@ from pydantic_ai import Agent
 from .prompts import DIVE_PROMPT
 from .schemas import DiveResult
 from .tools import (
-    compute_sentencing_range,
     precedent_dive,
     precedent_search,
-    sentence_statistics,
+    sentencing_analysis,
     statute_lookup,
 )
 
+# **This list is the source.** ``server`` declares its own wrappers because the
+# MCP descriptions are compressed, but the set of names has to match this one:
+# add a tool to only one of them and the two surfaces drift apart, and from then
+# on nobody knows which is authoritative.
 TOOLS = [
-    compute_sentencing_range,
+    sentencing_analysis,
     statute_lookup,
     precedent_search,
     precedent_dive,
-    sentence_statistics,
 ]
 
 

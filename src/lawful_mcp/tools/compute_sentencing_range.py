@@ -1,5 +1,17 @@
 """Sentencing arithmetic, from a charge to a verified sentence.
 
+**Not a registered tool.** The only sentencing surface a model sees is
+``sentencing_analysis``; this is the engine behind it. Two consequences:
+
+  * a response never names a sibling tool. There is one name to call,
+    ``TOOL_NAME``.
+  * called with ``protocol=False`` a response carries nothing addressed to a
+    *next* call — argument schemas, the key beside each group heading, "call
+    again with…", ``sg_category_id``. Left where they cannot be acted on, a
+    model prepares a call that does not exist. They are dropped inside the
+    formatters rather than stripped from the finished string by regex: a regex
+    goes quietly blind the day the wording changes.
+
 Korean sentencing runs through four stages, and this tool advances through
 them as the caller supplies more: give it a charge and it returns the
 statutory range; add the statutory adjustments and it applies them in the
@@ -45,6 +57,11 @@ from ._coerce import (
     coerce_dict, coerce_dict_list, coerce_int, coerce_list, coerce_str, to_iso_date)
 
 _log = logging.getLogger(__name__)
+
+# The name a model sees, which is not this engine's own function name (see the
+# module docstring). Responses say "call again" with this and nothing else, so
+# renaming the tool is a one-line change here.
+TOOL_NAME = "sentencing_analysis"
 
 
 def _rid(row) -> str:
@@ -1098,10 +1115,12 @@ def _resolve_payload(
                 return None, PendingResolution(
                     kind="branch_invalid",
                     options=p_opts,
-                    message=f"branch_key={branch_key!r} 는 원범죄 {ref_label} 의 호가 아님.",
+                    message=(f"branch_key={branch_key!r} 는 원범죄 {ref_label} 의 호 목록에 없습니다 — "
+                             "목록의 키를 문자열 하나로 그대로 넣으세요."),
                 )
-            base = _penalty_from_branch(chosen_b, branch_key=branch_key)
-            branch_note = f" [{branch_key} 호: {chosen_b.get('cond', '')[:40]}]"
+            b_key = chosen_b.get("key", branch_key)
+            base = _penalty_from_branch(chosen_b, branch_key=b_key)
+            branch_note = f" [{_branch_key_label(b_key)} 호: {chosen_b.get('cond', '')[:40]}]"
         else:
             base = _penalty_from_row(parent, source=f"reference_{rm}")
         adjusted = _apply_multiplier(base, mult)
@@ -1578,6 +1597,26 @@ def _format_processed_penalty_lines(p: ProcessedPenalty) -> list[str]:
 
 # ---------- the recommended range: guideline leaf and factors ----------
 
+# The dict keys `guideline_factors` and `probation_factors` accept. **These two
+# tuples are the source**: the schema line in the response, the conversion
+# functions below, and the argument check in `sentencing_analysis` all read them.
+#
+# There are responses that do not carry these names (`protocol=False`). Handed an
+# unknown key there, `.get()` returns an empty list and **the factors vanish
+# whole, leaving "기본영역"** — measured: `{"감경": [...]}` and `{"zzz": [...]}`
+# both came back `status: ok` in the default band. So the calling surface checks
+# the keys and hands them back (`sentencing_analysis._bad_factor_keys`).
+GUIDELINE_FACTOR_KEYS = ("special_act_aggravators", "special_act_mitigators",
+                         "special_actor_aggravators", "special_actor_mitigators")
+PROBATION_FACTOR_KEYS = ("major_positive", "major_negative",
+                         "general_positive", "general_negative")
+
+
+def _schema_line(keys: tuple[str, ...]) -> str:
+    """`- schema: {a: [text...], b: [...], ...}` — built from the tuples above."""
+    rest = ", ".join(f"{k}: [...]" for k in keys[1:])
+    return f"- schema: {{{keys[0]}: [text...], {rest}}}"
+
 
 def _convert_factors_to_applied(
     guideline_factors: dict | None,
@@ -1725,12 +1764,24 @@ def _verify_sentence(
     if sentence_months is not None:
         lines.append(f"- 선고형(자유형): {sentence_months}월")
         lo, hi = intersect
+        # When the processed and recommended ranges do not overlap, `intersect` is
+        # an empty span with the floor above the ceiling. Printed as is it reads
+        # `선고 가능 범위(18~12월)`, an impossible range, and the `안: True/False`
+        # about it means nothing (measured: processed 0~12월 ∩ recommended 18~36월).
+        # The processed range governs here — where the recommended range falls
+        # outside it, its floor and ceiling are the ones that bind. The block just
+        # above (`_intersect_lines`) already decides it that way, so decide the
+        # same way here rather than let the two lines disagree.
+        span_note = ""
+        if lo is not None and hi is not None and lo > hi:
+            lo, hi = processed.imp_min_months or 0, processed.imp_max_months
+            span_note = ", 처단형 우선 — 공통원칙 §02"
         in_intersect = True
         if lo is not None and sentence_months < lo:
             in_intersect = False
         if hi is not None and sentence_months > hi:
             in_intersect = False
-        lines.append(f"- 선고 가능 범위({_span_months(lo, hi)}) 안: {in_intersect}")
+        lines.append(f"- 선고 가능 범위({_span_months(lo, hi)}{span_note}) 안: {in_intersect}")
 
         if rec is not None:
             ok = in_range(sentence_months, rec)
@@ -1795,7 +1846,12 @@ def _probation_recommendation(
     has_imp = sentence_months is not None
     has_fine = fine_amount is not None
     if not has_imp and not has_fine:
-        lines.append("- 집행유예 판단: 선고형(sentence_months·fine_amount) 미지정 — 건너뜀")
+        # Do not stop at "there was nothing to work with" — say what to send.
+        # Measured across 42 runs on two models, this four-quadrant rule never
+        # ran once: one model never sent `sentence_months`, the other never sent
+        # `probation_factors`. Neither had ever been asked.
+        lines.append("- 집행유예 판단: 건너뜀 — 선고형을 `sentence_months`"
+                     "(또는 `fine_amount`)로 주면 판단한다")
         return lines
 
     imp_ok = has_imp and sentence_months <= _PROBATION_IMP_CAP_MONTHS
@@ -1824,7 +1880,8 @@ def _probation_recommendation(
         return lines
 
     if not probation_factors:
-        lines.append("- probation_factors 미지정 — 4분면 룰 적용 불가")
+        lines.append("- 4분면 룰 미적용 — 집행유예 참작사유 목록에서 골라"
+                     " `probation_factors` 로 주면 계산한다")
         return lines
 
     mp = len(probation_factors.get("major_positive") or [])
@@ -1940,9 +1997,14 @@ def _format_reference_option(ref: dict) -> str:
 
 
 def _format_stage_header(
-    norm: NormalizedCharge, row: sqlite3.Row, payload_row: sqlite3.Row, stage: str
+    norm: NormalizedCharge, row: sqlite3.Row, payload_row: sqlite3.Row, stage: str,
+    *, protocol: bool = True,
 ) -> list[str]:
-    """Response header shared by every stage."""
+    """Response header shared by every stage.
+
+    ``protocol=False`` drops ``sg_category_id``: the value is only useful as an
+    argument to a next call, so where there is no next call it is one more number
+    to copy out."""
     lines: list[str] = [
         "## status: ok",
         f"## stage: {stage}",
@@ -1976,7 +2038,8 @@ def _format_stage_header(
     lines.append(f"## 본조: {_format_article(payload_row)}")
     if payload_row["md_source_name"] and payload_row["md_source_name"] != norm.raw_key:
         lines.append(f"- 매핑 원본 죄명: {payload_row['md_source_name']}")
-    lines.append(f"- sg_category_id: {payload_row['sg_category_id']}")
+    if protocol:
+        lines.append(f"- sg_category_id: {payload_row['sg_category_id']}")
     return lines
 
 
@@ -2084,12 +2147,14 @@ def _range_text(r: sqlite3.Row) -> str:
     return f"{_format_months_kr(lo)}~{_format_months_kr(hi)}"
 
 
-def _format_leaf_candidates(conn: sqlite3.Connection, leaves: list[sqlite3.Row]) -> list[str]:
+def _format_leaf_candidates(conn: sqlite3.Connection, leaves: list[sqlite3.Row],
+                            *, protocol: bool = True) -> list[str]:
     """Format leaf candidate enum in lookup stage."""
     if not leaves:
         return []
     keys = _leaf_keys(leaves)
-    lines = ["## 대법원 양형기준 권고형 범위 (정밀 계산 시 `guideline_type` 에 따옴표 안 명칭 그대로)"]
+    lines = ["## 대법원 양형기준 권고형 범위 (정밀 계산 시 `guideline_type` 에 따옴표 안 명칭 그대로)"
+             if protocol else "## 권고 형량범위 — 범죄유형별"]
     for lf in leaves:
         key = keys[lf["id"]]
         crit = _leaf_criterion(lf)
@@ -2264,7 +2329,7 @@ def _list_factors_for_category(
 # Factors are grouped by scope (special or ordinary), kind (conduct or
 # offender) and direction (aggravating or mitigating). The four lists the
 # caller supplies mirror these groups.
-def _format_factor_enum(factors: list[sqlite3.Row]) -> list[str]:
+def _format_factor_enum(factors: list[sqlite3.Row], *, protocol: bool = True) -> list[str]:
     if not factors:
         return []
     # Group by scope, kind and direction.
@@ -2296,24 +2361,26 @@ def _format_factor_enum(factors: list[sqlite3.Row]) -> list[str]:
     if special:
         lines.append(
             f"## 양형기준 특별인자 enum ({n_special}개 — `guideline_factors` 선택용)"
+            if protocol else f"## 특별양형인자 ({n_special}개)"
         )
-        lines.append(
-            "- schema: {special_act_aggravators: [text...], special_act_mitigators: [...], "
-            "special_actor_aggravators: [...], special_actor_mitigators: [...]}"
-        )
-        lines.append(
-            "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출."
-        )
+        if protocol:
+            lines.append(_schema_line(GUIDELINE_FACTOR_KEYS))
+            lines.append(
+                "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출."
+            )
         for key in sorted(special):
             scope, kind, direction = key
             gf_key = _GF_KEY.get(key, "?")
-            lines.append(f"[{scope}/{kind}/{direction}] → {gf_key}")
+            lines.append(f"[{scope}/{kind}/{direction}] → {gf_key}" if protocol
+                         else f"[{scope}/{kind}/{direction}]")
             for t in groups[key]:
                 lines.append(f"- {t}")
     if general:
         lines.append(
             f"## 양형기준 일반인자 enum ({n_general}개 — 영역 결정 무영향, "
             "선고형 위치 결정 시 reasoning 인용)"
+            if protocol else
+            f"## 일반양형인자 ({n_general}개 — 권고영역 결정에는 쓰지 않고 선고형 위치에 쓴다)"
         )
         for key in sorted(general):
             scope, kind, direction = key
@@ -2350,7 +2417,7 @@ def _list_probation_factors_for_category(
 # pole ∈ {major, general}, direction ∈ {positive, negative}.
 # Mirrors the four lists the caller passes back; the rule that consumes
 # them is in the recommendation function above.
-def _format_probation_factor_enum(rows: list[sqlite3.Row]) -> list[str]:
+def _format_probation_factor_enum(rows: list[sqlite3.Row], *, protocol: bool = True) -> list[str]:
     if not rows:
         return []
     from collections import defaultdict
@@ -2376,18 +2443,27 @@ def _format_probation_factor_enum(rows: list[sqlite3.Row]) -> list[str]:
         ("general", "negative"): "general_negative",
     }
 
-    lines: list[str] = [
+    lines: list[str] = ([
         f"## 집행유예 4분면 enum ({len(rows)}개 — `probation_factors` 선택용)",
-        "- schema: {major_positive: [text...], major_negative: [...], "
-        "general_positive: [...], general_negative: [...]}",
+        _schema_line(PROBATION_FACTOR_KEYS),
         "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출.",
-    ]
+    # `protocol=False` still says **how to call back with this list**. The rule
+    # for that branch is to carry nothing that cannot be acted on, and this list
+    # can be: it is the same tool's `probation_factors` argument. Give the list
+    # without saying what to do with it and a model reads past it — measured
+    # across 42 runs, the four-quadrant rule ran 0 times.
+    ] if protocol else [
+        f"## 집행유예 참작사유 ({len(rows)}개)",
+        "선고형이 정해지면 아래에서 고른 사유를 `probation_factors` 로, 형량을"
+        " `sentence_months` 로 함께 주면 집행유예 권고 여부를 계산한다"
+        " (양형기준 공통원칙 §05 4분면).",
+    ])
     for key in sorted(
         groups, key=lambda k: (order_pole[k[0]], order_dir[k[1]], k[2], k[3])
     ):
         pole, direction, sec, note = key
         pf_key = _PF_KEY.get((pole, direction), "?")
-        head = f"[{pole}/{direction}] → {pf_key}"
+        head = f"[{pole}/{direction}] → {pf_key}" if protocol else f"[{pole}/{direction}]"
         if sec:
             head += f"  (section={sec}"
             if note:
@@ -2415,7 +2491,8 @@ _STATUTORY_MOD_ENUM: list[str] = [
     "- `특수교사방조_가중` — 특수교사·특수방조 (형법 §34 ②)",
     "- `누범_가중` — 누범 (§35), 자유형 장기 2배",
     "- `법률상_필요감경` — 의무 감경: 방조 (§32 ②), 농아자 (§11) 등",
-    "- `법률상_임의감경` — 재량 감경: 미수 (§25 ②), 중지미수 (§26), 자수 (§52), 심신미약 (§10 ②) 등",
+    "- `법률상_임의감경` — 재량 감경: 미수 (§25 ②), 중지미수 (§26), 자수 (§52), 심신미약 (§10 ②),\n"
+    "  사후적 경합범 (§39 ① — 「형을 감경 또는 면제할 수 있다」) 등",
     "- `경합범_가중` — §37 전단·§38 ① 2호 (가장 무거운 죄의 장기 1/2 가중). 동종 다행위는 `act_count` 인자로 명시 (자동 적용). 명시 입력도 가능.",
     "- `작량감경` — 정상참작 (§53, 단일 type)",
     "",
@@ -2427,8 +2504,11 @@ _STATUTORY_MOD_ENUM: list[str] = [
 ]
 
 
-def _format_modifier_enum() -> list[str]:
-    return list(_STATUTORY_MOD_ENUM)
+def _format_modifier_enum(*, protocol: bool = True) -> list[str]:
+    """Empty under `protocol=False`: the section is argument names and a schema,
+    so where it cannot be acted on it is dead text end to end. The prose account
+    of §56 is built by `sentencing_analysis` from the same `_MOD_ORDER`/`_MOD_MULT`."""
+    return list(_STATUTORY_MOD_ENUM) if protocol else []
 
 
 def _lookup_historic_article(
@@ -2685,9 +2765,10 @@ def _format_lookup_response(
     penalty: EffectivePenalty,
     act_count: int = 1,
     guide_notes: list[str] | None = None,
+    protocol: bool = True,
 ) -> str:
     """The lookup stage, once the provision has resolved."""
-    lines = _format_stage_header(norm, row, payload_row, "lookup")
+    lines = _format_stage_header(norm, row, payload_row, "lookup", protocol=protocol)
 
     # Cite the commentary here: lookup is the first response in every flow.
     src = _manual_source(conn, payload_row["sg_category_id"])
@@ -2709,22 +2790,22 @@ def _format_lookup_response(
 
     # Guideline leaves to choose from on the next call.
     leaves = _list_leaves_for_category(conn, payload_row["sg_category_id"])
-    lines.extend(_format_leaf_candidates(conn, leaves))
+    lines.extend(_format_leaf_candidates(conn, leaves, protocol=protocol))
     lines.extend(_format_guide_notes(guide_notes))
 
     # Factors to choose from. Offered as the union across the category,
     # since they barely differ between leaves within one.
     factors = _list_factors_for_category(conn, payload_row["sg_category_id"])
-    lines.extend(_format_factor_enum(factors))
+    lines.extend(_format_factor_enum(factors, protocol=protocol))
 
     # Suspension factors to choose from.
     prob_factors = _list_probation_factors_for_category(
         conn, payload_row["sg_category_id"]
     )
-    lines.extend(_format_probation_factor_enum(prob_factors))
+    lines.extend(_format_probation_factor_enum(prob_factors, protocol=protocol))
 
     # Statutory adjustments to choose from; the same for every offence.
-    lines.extend(_format_modifier_enum())
+    lines.extend(_format_modifier_enum(protocol=protocol))
 
     # Flag that multiple-offence aggravation will apply.
     if act_count >= 2:
@@ -2745,13 +2826,13 @@ def _format_processed_response(
     penalty: EffectivePenalty,
     processed: ProcessedPenalty,
     guide_notes: list[str] | None = None,
+    protocol: bool = True,
 ) -> str:
     """The processed-range stage: statutory range, adjustments applied, result."""
-    lines = _format_stage_header(norm, row, payload_row, "처단형")
+    lines = _format_stage_header(norm, row, payload_row, "처단형", protocol=protocol)
 
     # Statutory range, after resolution.
     if penalty.trace:
-        lines.append("## 법정형 산출 trace")
         lines.extend(penalty.trace)
     pen_lines = _format_penalty(penalty)
     if pen_lines:
@@ -2890,8 +2971,7 @@ def _intersect_lines(
             note = "§55 ① 6호 다액 1/2 자동 반영됨" if processed.fine_formula else "벌금 다액 1/2 (§55 ① 6호)"
             lines.append(f"  ※ 감경 적용: {note}")
     if imp_kind and fine_kind and not fine_guideline:
-        call = f'`sentence_statistics(charges="{charge}")`' if charge else "`sentence_statistics`"
-        lines.append(f"  ※ 형종 선택의 실선고 분포는 {call} 로 확인.")
+        lines.append("  ※ 형종 선택의 실선고 분포는 양형 분석 응답의 「실선고 통계」 절을 보세요.")
     return lines
 
 
@@ -2958,10 +3038,11 @@ def _format_recommended_response(
     floor: int | None,
     leaf_label: str = "",
     guide_notes: list[str] | None = None,
+    protocol: bool = True,
 ) -> str:
     """The guideline stage: processed range, recommended range, and their overlap."""
     imp_kind, fine_kind = _kind_presence(payload_row, processed)
-    lines = _format_stage_header(norm, row, payload_row, "권고형")
+    lines = _format_stage_header(norm, row, payload_row, "권고형", protocol=protocol)
     lines.extend(_format_range_block(conn, penalty, processed, rec, leaf_id, floor, leaf_label))
     lines.extend(_intersect_lines(processed, rec, intersect,
                                   imp_kind=imp_kind, fine_kind=fine_kind,
@@ -2988,10 +3069,11 @@ def _format_final_response(
     mit_applied: bool = False,
     leaf_label: str = "",
     guide_notes: list[str] | None = None,
+    protocol: bool = True,
 ) -> str:
     """The final stage: ranges, the proposed sentence checked, and suspension."""
     imp_kind, fine_kind = _kind_presence(payload_row, processed)
-    lines = _format_stage_header(norm, row, payload_row, "final")
+    lines = _format_stage_header(norm, row, payload_row, "final", protocol=protocol)
     lines.extend(_format_range_block(conn, penalty, processed, rec, leaf_id, floor, leaf_label))
     lines.extend(_intersect_lines(processed, rec, intersect, imp_kind=imp_kind, fine_kind=fine_kind,
                                   fine_guideline=_has_fine_guideline(conn, leaf_id, rec),
@@ -3066,7 +3148,7 @@ def _format_pending_response(
         lines.append("## 가중 수식어 (modifier) — 독립 법정형 없음, base 죄에 부착")
         lines.append(f"- 이 죄명은 *{basis}* 가중 규정 — 자기 형량 없이 *어떤 base 죄든* 그 형을 가중.")
         lines.append("## 처리 절차 (2-step):")
-        lines.append("  1) 실제 base 죄(행위에 해당하는 성범죄 등)를 charge 인자로 compute_sentencing_range 재호출")
+        lines.append(f"  1) 실제 base 죄(행위에 해당하는 성범죄 등)를 charge 인자로 {TOOL_NAME} 재호출")
         lines.append(
             f"  2) 그 호출에 statutory_modifications=[{{\"kind\": \"{mk}\", "
             f"\"type\": \"{basis}\", \"basis\": \"{basis}\", \"applied\": true}}] 추가"
@@ -3325,17 +3407,17 @@ def _format_not_found_response(
                 f"- '{name}' 은 공식 죄명(대검 죄명표)이지만 양형기준(48개 범죄군)에 등재되지 않았습니다"
                 " — 권고형 없음. 다른 표기로 다시 찾을 필요 없습니다."
             )
-        lines.append("- 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인.")
+        lines.append("- 권고형만 없습니다 — 법정형·조문 원문·실선고 분포는 아래 절에 함께 싣습니다.")
     elif res is not None and res.candidates and res.statute:
         lines.append(
             f"- '{res.statute}' 의 공식 죄명 {len(res.candidates)}개는 모두 양형기준(48개 범죄군)에 등재되지 않았습니다"
-            " — 권고형 없음. 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인."
+            " — 권고형 없음. 법정형·조문·실선고 분포는 아래 절에 함께 싣습니다."
         )
     elif res is not None and res.candidates:
         shown = " · ".join(res.candidates[:6]) + (" 외" if len(res.candidates) > 6 else "")
         lines.append(
             f"- '{norm.raw_key}' 을 부속 죄명으로 가진 공식 죄명({shown})은 양형기준에 등재되지 않았습니다"
-            " — 권고형 없음. 법정형은 `statute_lookup`, 실선고 분포는 `sentence_statistics` 로 확인."
+            " — 권고형 없음. 법정형·조문·실선고 분포는 아래 절에 함께 싣습니다."
         )
     else:
         lines.append(
@@ -3386,8 +3468,8 @@ def _format_multiple_charges_response(
             lines.append(f"- {norm.key}: {why} — 이 법률의 등재 죄명: {cands}")
         elif result.resolution is not None and result.resolution.kind == "exact":
             lines.append(
-                f"- {norm.key}: 공식 죄명이지만 양형기준 비등재(권고 없음) — 실선고 분포는"
-                f" sentence_statistics(charges='{norm.key}') 로 확인 가능")
+                f"- {norm.key}: 공식 죄명이지만 양형기준 비등재(권고 없음) — "
+                f"charge='{norm.key}' 로 따로 호출하면 법정형·실선고 분포는 받습니다")
         else:
             lines.append(f"- {norm.key}: 공식 죄명(대검 죄명표)에 없는 표기 — 판결문 죄명 표기로 재호출")
     if len(items) > len(shown):
@@ -3413,7 +3495,7 @@ def _format_charge_numeric_response(charge: str, tokens: list[str]) -> str:
     elif len(tokens) > 1:
         lines.append("- 죄명은 호출당 하나입니다 — 여러 죄는 각각 호출하세요.")
     lines.append(
-        "- 정확한 죄명 표기를 모르면 sentence_statistics(charges=키워드) 로 후보를 찾으세요."
+        "- 정확한 죄명 표기를 모르면 charge='<법률명>위반' 으로 그 법률의 죄명 후보를 받으세요."
     )
     return "\n".join(lines)
 
@@ -3503,6 +3585,8 @@ def compute_sentencing_range(
     probation_factors: dict | str | list | None = None,
     act_count: int | str | list = 1,
     offense_date: OptStrArg = None,
+    *,
+    protocol: bool = True,
 ) -> str:
     """통합 양형 도구 — 죄명에서 출발해 법정형 → 처단형 → 권고형(양형기준) → 선고 검증까지 단계별 계산.
 
@@ -3716,7 +3800,7 @@ def compute_sentencing_range(
             if not (needs_processed or needs_recommended or needs_final):
                 return _format_lookup_response(
                     conn, norm, row, payload_row, penalty, act_count=act_count,
-                    guide_notes=guide_notes,
+                    guide_notes=guide_notes, protocol=protocol,
                 ) + appendix
 
             # Always computed: the later stages build on it.
@@ -3728,6 +3812,7 @@ def compute_sentencing_range(
             if not (needs_recommended or needs_final):
                 return _format_processed_response(
                     norm, row, payload_row, penalty, processed, guide_notes=guide_notes,
+                    protocol=protocol,
                 ) + appendix
 
             # The guideline recommendation.
@@ -3754,6 +3839,7 @@ def compute_sentencing_range(
                     floor,
                     leaf_label=leaf_label,
                     guide_notes=guide_notes,
+                    protocol=protocol,
                 ) + appendix
 
             # final stage
@@ -3794,6 +3880,7 @@ def compute_sentencing_range(
                 mit_applied=mit_applied,
                 leaf_label=leaf_label,
                 guide_notes=guide_notes,
+                protocol=protocol,
             ) + appendix
 
         if result.status == "exact_cross_cat":
@@ -3809,6 +3896,123 @@ def compute_sentencing_range(
             return _format_fuzzy_response(norm, result)
 
         return _format_not_found_response(norm, result)
+    finally:
+        conn.close()
+
+
+# ---------- enumerating the candidates (the seam sentencing_analysis calls) ----------
+# This is what lets the sentencing surface stop asking. The tool used to halt at
+# `needs_branch_key` and put the question back: in a benchmark of 20 free-form
+# drink-driving calls, 16 stopped at that first gate and answered without ever
+# seeing the guideline. Here the candidates are laid out instead, and
+# `sentencing_analysis` walks all of them into one response.
+#
+# The candidates come from the structures `_lookup_charge` and `_resolve_payload`
+# already hold — never from a regex over a finished response, which would go
+# quietly to zero the day the wording changes.
+
+
+@dataclass
+class Candidate:
+    """One provision/branch the facts will settle on. The values feed straight
+    back into this module's arguments."""
+
+    statute_choice: str | None = None
+    branch_key: str | None = None
+    reference_choice: str | None = None
+    label: str = ""            # the branch condition, as a person reads it
+    article: str = ""          # '형법 §347' — for display
+    statute_id: int | None = None
+    article_no: str = ""       # '347', '148의2' — the statute_lookup argument
+
+
+def sentencing_candidates(
+    charge: str,
+    *,
+    sg_category_id: int | None = None,
+    statute_choice: str | None = None,
+    branch_key: str | None = None,
+    reference_choice: str | None = None,
+    offense_date: str | None = None,
+    is_attempted: bool = False,
+    is_accessory: bool = False,
+    is_solicitor: bool = False,
+) -> list[Candidate]:
+    """Charge to candidate list. Empty when the charge does not resolve, and the
+    caller then uses the engine's own guidance response.
+
+    Anything the caller already narrowed (statute_choice, branch_key,
+    reference_choice) returns only that branch.
+    """
+    # Numbers and article references turn back **before the database opens** —
+    # the same contract as the engine's `charge_numeric` guidance, whose response
+    # the caller uses. An empty candidate list means "there is nothing here to
+    # compute".
+    if not charge or numeric_charge_tokens(charge) is not None or ARTICLE_REF_RE.search(charge):
+        return []
+    conn = open_db()
+    try:
+        norm = _normalize_charge(
+            conn, charge, is_attempted=is_attempted,
+            is_accessory=is_accessory, is_solicitor=is_solicitor)
+        if numeric_charge_tokens(norm.key) is not None:
+            return []
+        result = _lookup_charge(conn, norm.key, sg_category_id=sg_category_id)
+        if result.status == "exact":
+            pairs = [(statute_choice, result.rows[0])]
+        elif result.status in ("exact_cross_cat", "exact_same_cat_multi_row"):
+            if statute_choice:
+                chosen = _parse_statute_choice(statute_choice, result.rows)
+                pairs = [(statute_choice, chosen)] if chosen is not None else []
+            else:
+                pairs = [(_format_statute_choice_form(r), r) for r in result.rows]
+        else:
+            return []
+
+        offense_iso = to_iso_date(offense_date)
+        # (did this provision actually accept the caller's branch_key, candidate)
+        out: list[tuple[bool, Candidate]] = []
+        for choice, row in pairs:
+            if row is None:
+                continue
+            payload_row = _resolve_alias(conn, row)
+            payload_row, _vm, _art42 = _get_versioned_payload(conn, payload_row, offense_iso)
+            art_no = str(payload_row["article_no_num"]) + (
+                f"의{payload_row['article_branch']}" if payload_row["article_branch"] else "")
+            base = dict(statute_choice=choice, article=_format_article(payload_row),
+                        statute_id=payload_row["statute_id"], article_no=art_no)
+            _penalty, pending = _resolve_payload(
+                conn, payload_row, branch_key=branch_key, reference_choice=reference_choice)
+            if pending is not None and pending.kind in ("branch", "branch_invalid") and pending.options:
+                out += [(False, Candidate(branch_key=_branch_key_label(o.get("key")),
+                                          label=(o.get("cond") or "").strip(), **base))
+                        for o in pending.options]
+            elif (pending is not None
+                  and pending.kind in ("reference", "reference_invalid") and pending.options):
+                out += [(False, Candidate(reference_choice=_reference_choice_form(ref),
+                                          label=(ref.get("note") or ""), **base))
+                        for ref in pending.options]
+            else:
+                # A branch that resolved. **Only a provision that has branches**
+                # accepted the key; carrying it on one that has none puts a
+                # meaningless token in the response.
+                has_branch = bool(payload_row["has_conditional_branch"])
+                out.append((has_branch, Candidate(
+                    branch_key=branch_key if has_branch else None,
+                    reference_choice=reference_choice, **base)))
+
+        # **When the caller gave a branch_key, keep only provisions that took it.**
+        # Otherwise the narrowing is ignored and the wrong provision leads:
+        # measured, a model gave drink-driving `branch_key="3-1"` (§148의2 ③,
+        # 0.2%+, first offence) and `§148의2 ① 3-1` stood alongside it, putting
+        # the repeat-offence range (24~72월) first in a first-offence case. ①
+        # has no 3-1 branch, so that reading was never an answer.
+        # If no provision took it the key is simply wrong, and filtering here
+        # would leave an empty list — which the caller reads as "the charge did
+        # not resolve", and it goes back to asking. Return the branches instead.
+        if branch_key and any(honored for honored, _c in out):
+            return [c for honored, c in out if honored]
+        return [c for _honored, c in out]
     finally:
         conn.close()
 
