@@ -85,7 +85,39 @@ PREVIEW_FALLBACK_CHARS = 200                                         # cut used 
 # curve flattens: another 31 characters for 5%.
 HOLDING_MAX_CHARS = 300
 
-from ._fts import safe_fts_query as _safe_fts_query
+from ._fts import (
+    _FTS_OPERATORS as _FTS_OPERATOR_WORDS,
+    query_tokens as _query_tokens,
+    quoted_and as _quoted_and,
+    quoted_or as _quoted_or,
+)
+
+# BM25 column weights, in `prec_cases_fts` column order
+# (case_name, content_md, summary, reference_statute, generated_summary).
+# Unweighted, a title hit loses to how often the words appear in a body:
+# measured 2026-09-12 over 40 title queries, weighting the title took
+# same-title cases in the top 20 from 208 to 266 (+28%) with body-phrase
+# recall unchanged (35/40). `음주운전` stopped answering with a 1996 forgery
+# case and started answering with the drunk-driving traffic-law case.
+# `generated_summary` (AI-written) is already kept out of the display;
+# ranking it low keeps it from outranking the summaries the court wrote or
+# the statutes cited.
+BM25_WEIGHTS = (10.0, 1.0, 2.0, 2.0, 0.5)
+
+
+def bm25_expr(table: str, weights: Sequence[float] | None = None) -> str:
+    """A ``bm25(table, …)`` expression from a column-weight vector.
+
+    One owner for the weights, so no ranker writes them out by hand. The
+    vector is 1:1 with the table's columns and the caller supplies their own
+    (statute articles pass ``statutes._ART_BM25_WEIGHTS``). ``weights=None``
+    reads the module constant *at call time*, which lets an evaluation A/B
+    swap it out.
+    ⚠ ``prec_cases_morph_fts`` is contentless and single-column, so weights
+    mean nothing there — that one keeps plain ``bm25(prec_cases_morph_fts)``.
+    """
+    ws = BM25_WEIGHTS if weights is None else weights
+    return f"bm25({table}, {', '.join(str(float(w)) for w in ws)})"
 
 
 # ---------- direct routing by case number ----------
@@ -167,17 +199,21 @@ def _case_no_in_query_hint(query: str | None) -> str | None:
 # ---------- rankers ----------
 
 def _fts_rank(conn: sqlite3.Connection, query: str, limit: int) -> list[int]:
-    safe = _safe_fts_query(query)
-    words = [w for w in safe.split() if len(w) >= 3]
+    """AND-mode BM25 ranking (the hybrid/eval path).
+
+    ⚠ Tokens are quoted before they are joined — a leftover operator word
+    breaks the expression (`_fts.py` module docstring).
+    """
+    words = [w for w in _query_tokens(query) if len(w) >= 3]
     if not words:
         return []
     rows = conn.execute(
-        """
+        f"""
         SELECT rowid FROM prec_cases_fts
         WHERE prec_cases_fts MATCH ?
-        ORDER BY bm25(prec_cases_fts) LIMIT ?
+        ORDER BY {bm25_expr('prec_cases_fts')} LIMIT ?
         """,
-        (safe, limit),
+        (_quoted_and(words), limit),
     ).fetchall()
     return [r["rowid"] for r in rows]
 
@@ -190,11 +226,14 @@ def _or_match(query: str) -> str:
     Searching bag-of-words instead took known-item recall from 0.11 to 1.00
     over 140 queries. Tokens are at least three characters (the trigram
     floor), deduplicated and capped.
+
+    ⚠ The tokens are quoted (`_quoted_or`). `safe_fts_query` only drops
+    punctuation, so 'AND'/'NOT' survive as tokens, and joining them bare makes
+    FTS5 read them as syntax — a syntax error instead of a search
+    (measured 2026-09-12).
     """
-    toks = [w for w in _safe_fts_query(query).split() if len(w) >= 3]
-    seen: set[str] = set()
-    toks = [t for t in toks if not (t in seen or seen.add(t))][:FTS_OR_MAX_TOKENS]
-    return " OR ".join(toks)
+    toks = [w for w in _query_tokens(query) if len(w) >= 3][:FTS_OR_MAX_TOKENS]
+    return _quoted_or(toks)
 
 
 _FILTER_TABLE: str | None = None
@@ -253,15 +292,15 @@ def _fts_or_rank(
     # only when there are filters.
     if len(cond) == 1:
         rows = conn.execute(
-            "SELECT rowid FROM prec_cases_fts WHERE prec_cases_fts MATCH ? "
-            "ORDER BY bm25(prec_cases_fts) LIMIT ?",
+            f"SELECT rowid FROM prec_cases_fts WHERE prec_cases_fts MATCH ? "
+            f"ORDER BY {bm25_expr('prec_cases_fts')} LIMIT ?",
             (match, limit),
         ).fetchall()
         return [r["rowid"] for r in rows]
     # Join the slim metadata table, not the one carrying judgment bodies.
     sql = (
         f"SELECT f.rowid FROM prec_cases_fts f JOIN {_filter_table(conn)} c ON c.id = f.rowid "
-        f"WHERE {' AND '.join(cond)} ORDER BY bm25(f.prec_cases_fts) LIMIT ?"
+        f"WHERE {' AND '.join(cond)} ORDER BY {bm25_expr('f.prec_cases_fts')} LIMIT ?"
     )
     rows = conn.execute(sql, (*args, limit)).fetchall()
     return [r["rowid"] for r in rows]
@@ -280,16 +319,20 @@ _MORPH_KEEP_TAGS = ("NNG", "NNP", "NNB", "NR", "NP", "SL", "SN", "SH", "XR", "VV
 def _morph_match(query: str) -> str:
     """Build an OR match expression from morphemes; no length floor here.
 
-    Each token is quoted so a morpheme that happens to spell an FTS5
-    operator is read as a search term rather than as syntax.
+    ⚠ Operator words are dropped **first**. Kiwi hands back 'AND'/'OR'/'NOT'
+    as content morphemes (SL) and the index really does hold those tokens
+    ('AND' 1,257 times, 'OR' 499). Quoting alone would keep the expression
+    valid, but they are rare enough to carry a large IDF and drag in
+    unrelated English prose.
     """
     try:
-        toks = [t.form.strip() for t in _kiwi().tokenize(query or "")
-                if t.tag in _MORPH_KEEP_TAGS and t.form.strip()]
+        toks = [f for t in _kiwi().tokenize(query or "")
+                if t.tag in _MORPH_KEEP_TAGS and (f := t.form.strip())
+                and f.upper() not in _FTS_OPERATOR_WORDS]
     except Exception:
         return ""
     toks = list(dict.fromkeys(toks))[:FTS_OR_MAX_TOKENS]
-    return " OR ".join(f'"{t}"' for t in toks)
+    return _quoted_or(toks)
 
 
 def _morph_rank(
@@ -423,11 +466,15 @@ def _preview_terms(query: str) -> list[str]:
 
     Longest first — a longer term is more distinctive, so it makes the
     better centre for a window.
+
+    Operator words are dropped: left in, the excerpt anchors on the literal
+    characters 'AND'.
     """
-    toks = [w for w in _safe_fts_query(query).split() if len(w) >= 3]
+    toks = [w for w in _query_tokens(query) if len(w) >= 3]
     try:
-        toks += [t.form for t in _kiwi().tokenize(query or "")
-                 if t.tag in _MORPH_KEEP_TAGS and t.form.strip()]
+        toks += [f for t in _kiwi().tokenize(query or "")
+                 if t.tag in _MORPH_KEEP_TAGS and (f := t.form.strip())
+                 and f.upper() not in _FTS_OPERATOR_WORDS]
     except Exception:
         pass
     return sorted({t for t in toks if t}, key=len, reverse=True)
@@ -901,8 +948,15 @@ _MARKUP_RE = re.compile(r"</?\s*br\s*/?\s*>", re.I)
 
 
 def _strip_markup(text: str) -> str:
-    """Strip HTML fragments that come through in corpus text."""
-    return _MARKUP_RE.sub(" ", str(text or "")).strip()
+    """Strip HTML fragments that come through in corpus text.
+
+    ⚠ Whitespace is collapsed too. 29.5% of `reference_statute` values
+    (23,591 of 79,939) carry newlines — the source writes them as
+    ``[1]\\n민법 제839조의2,\\n…`` — and without collapsing, the markdown-KV
+    contract of one line per field breaks and the same value goes out over
+    several lines.
+    """
+    return " ".join(_MARKUP_RE.sub(" ", str(text or "")).split())
 
 
 _PREVIEW_KINDS = {

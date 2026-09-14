@@ -11,11 +11,12 @@ enough that adding them cost context without improving answers.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from pydantic_ai import RunContext
 
-from ..config import case_url_base
+from ..config import case_url_base, dive_timeout_s
 from ..deps import HarnessDeps, open_db
 from ..schemas import DIVE_SUMMARY_MAX_CHARS
 from ._coerce import coerce_int, coerce_str
@@ -187,7 +188,32 @@ async def precedent_dive(
         f"{body_text}"
     )
 
-    result = await ctx.deps.dive_subagent.run(user_prompt, usage=ctx.usage)
+    # The wait is capped by us, not by the library. pydantic-ai's httpx client
+    # allows a 600-second read and the OpenAI SDK retries a timeout twice, so
+    # one call could sit here for up to 30 minutes — the whole turn dies with
+    # it. The cap comes from `config.dive_timeout_s()`; the timeout response
+    # below is fail-open, the same shape as a summary that never arrives.
+    try:
+        result = await asyncio.wait_for(
+            ctx.deps.dive_subagent.run(user_prompt, usage=ctx.usage),
+            timeout=dive_timeout_s())
+    except asyncio.TimeoutError:
+        # Fail open — the summary did not arrive, so the tool did not die, it
+        # just could not read the body. Both `status` and `message` say so, so
+        # the model can tell it apart from "read it and it was not there".
+        timeout = dive_timeout_s()
+        return _format_response_md({
+            "status": "timeout",
+            "case_id": case_id,
+            "case_number": case["case_number"],
+            "case_name": case["case_name"],
+            "court_level": case["court_level"],
+            "year": case["year"],
+            "reference_statute": case["reference_statute"],
+            "message": (f"{timeout:.0f}초 안에 본문 요약이 오지 않았습니다 — 이 판례의 "
+                        "본문은 읽지 못한 것으로 취급하고, 판례 검색 발췌로 답하거나 다른 "
+                        "판례를 확인하세요."),
+        })
     dive = result.output  # DiveResult
 
     return _format_response_md({

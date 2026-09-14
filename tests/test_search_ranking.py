@@ -10,6 +10,7 @@ import re
 import sqlite3
 
 from lawful_mcp.tools import statutes
+from lawful_mcp.tools import _fts
 # Imported by name: `tools/__init__` exports the tool function under the same
 # name as its module, so `from ... import precedent_search` gives the function.
 from lawful_mcp.tools.precedent_search import (
@@ -18,6 +19,7 @@ from lawful_mcp.tools.precedent_search import (
     _holdings_items,
     _pick_holding,
     _set_holding,
+    bm25_expr,
 )
 
 
@@ -289,3 +291,91 @@ def test_holding_absent_when_the_case_has_none():
     })
     assert "  holding: [1] 법원이 쓴 쟁점 요약" in rendered
     assert rendered.count("holding:") == 1, rendered
+
+
+# ---------- FTS expressions ----------
+#
+# Punctuation stripping alone leaves the FTS5 boolean operators in place, and
+# `사기 AND` / `개인정보 AND (보호법 OR)` came back as syntax errors out of both
+# search tools (measured 2026-09-12). These lock the expression builders that
+# every MATCH call goes through.
+
+def test_query_tokens_drop_operators_and_duplicates():
+    assert _fts.query_tokens("손해배상 AND 위자료 or 손해배상") == ["손해배상", "위자료"]
+    assert _fts.query_tokens("사기 AND") == ["사기"]
+    assert _fts.query_tokens("") == []
+
+
+def test_match_expressions_quote_every_term():
+    """Quoting makes the expression valid by construction."""
+    assert _fts.quoted_and(["사기", "위자료"]) == '"사기" "위자료"'
+    assert _fts.quoted_or(["사기", "위자료"]) == '"사기" OR "위자료"'
+    # Even a term that spells an operator is inert once quoted.
+    assert _fts.quoted_and(["NOT"]) == '"NOT"'
+
+
+def test_bm25_expression_owns_the_column_weights():
+    """One owner for the weight vectors, so no ranker writes them by hand."""
+    assert bm25_expr("prec_cases_fts") == "bm25(prec_cases_fts, 10.0, 1.0, 2.0, 2.0, 0.5)"
+    assert bm25_expr("st_articles_fts", statutes._ART_BM25_WEIGHTS) == \
+        "bm25(st_articles_fts, 3.0, 1.0)"
+
+
+# ---------- name ranking ----------
+
+def test_name_ranking_drops_substring_coincidences():
+    """'사기' inside 「공공감사기준」 is a coincidence, not a name match.
+
+    Substring matching credited it, and the same shape put 「도시철도운전규칙」
+    first for `음주운전`. Splitting the name with the same analyser as the
+    query tells [공공, 감사, 기준] from [보험, 사기, 방지, 특별법].
+    """
+    rows = [
+        {"name": "공공감사기준", "short_name": None, "name_in_query": 0, "fts_hits": 0},
+        {"name": "보험사기방지 특별법", "short_name": None, "name_in_query": 0, "fts_hits": 0},
+    ]
+    kept = statutes._rank_name_rows(rows, "사기", 5)
+    assert [r["name"] for r in kept] == ["보험사기방지 특별법"]
+
+
+def test_text_hits_outrank_a_partial_name():
+    """A name-only candidate sorts below one whose text actually matched.
+
+    This is the merge bug in miniature: the corpus raised 도로교통법 to first,
+    and the merge — scoring names alone — put 「도시철도운전규칙」 back on top.
+    """
+    rows = [
+        {"name": "도시철도운전규칙", "short_name": None, "name_in_query": 0, "fts_hits": 0},
+        {"name": "도로교통법", "short_name": None, "name_in_query": 0, "fts_hits": 12},
+    ]
+    assert [r["name"] for r in statutes._rank_name_rows(rows, "음주운전", 5)] == \
+        ["도로교통법", "도시철도운전규칙"]
+    merged = statutes._merge_law_notice_matches(rows, "음주운전", 5)
+    assert [m["name"] for m in merged] == ["도로교통법", "도시철도운전규칙"]
+
+
+def test_name_rank_key_tiers():
+    """Containment → full token coverage → text hits → partial coverage."""
+    k = statutes._name_rank_key
+    contained = k((0, -3), 3, 0, 3, 5)
+    full_cover = k((1, 0), 0, 9, 3, 5)
+    text_hit = k((1, 1), 0, 9, 3, 5)
+    partial = k((1, 1), 0, 0, 3, 5)
+    assert contained < full_cover < text_hit < partial
+
+
+def test_article_label_normalises_load_generations():
+    """'58', '58의2' and '제58조' all reach the reader as 제58조[의2]."""
+    assert statutes._article_label("58", None) == "제58조"
+    assert statutes._article_label("58의2", 2) == "제58조의2"
+    assert statutes._article_label("제58조", None) == "제58조"
+    assert statutes._article_label("58", 2) == "제58조의2"
+
+
+def test_reference_statute_keeps_one_field_per_item():
+    """Corpus values carry newlines (23,591 of 79,939 do); markdown-KV is one
+    line per field, so they have to be folded."""
+    from lawful_mcp.tools.precedent_search import _strip_markup
+    assert _strip_markup("[1]\n민법 제839조의2,\n[2] 민법 제843조") == \
+        "[1] 민법 제839조의2, [2] 민법 제843조"
+    assert _strip_markup("가<br/>나") == "가 나"

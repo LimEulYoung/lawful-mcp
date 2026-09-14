@@ -15,6 +15,8 @@ Environment variables:
                      is not registered and the other four still run.
   DIVE_BASE_URL      Base URL of that endpoint (OpenAI-compatible).
   DIVE_MODEL         Model name to request.
+  DIVE_TIMEOUT       Seconds to wait for that model before giving up and
+                     returning the excerpt alone. Defaults to 15.
   USE_DENSE          Set to 1 to enable the embedding + rerank retrieval
                      path in ``precedent_search``. Off by default: the
                      lexical path (trigram + morpheme RRF) scored on par in
@@ -32,6 +34,11 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_CORPUS_DB = _ROOT / "data" / "fixture.db"
+
+# Seconds the dive summary waits before the tool answers with the excerpt
+# alone. 15s is 1.5x the measured range (6.6–10.2s) and is a product choice:
+# the call happens mid-turn, where being late is itself the harm.
+DEFAULT_DIVE_TIMEOUT_S = 15.0
 
 # Citation links in tool output point at the hosted corpus browser. Case and
 # statute ids are the published corpus ids, so links resolve for the fixture
@@ -65,3 +72,18 @@ def dive_config() -> tuple[str, str, str] | None:
     if not base_url or not model:
         return None
     return (base_url, api_key, model)
+
+
+def dive_timeout_s() -> float:
+    """Seconds ``precedent_dive`` waits for its summary before giving up.
+
+    Without a cap of our own the wait is the library's: pydantic-ai builds an
+    httpx client with a 600-second read timeout and the OpenAI SDK retries a
+    timeout twice, so one call could hang for up to 30 minutes. A malformed
+    value falls back to the default rather than taking the server down.
+    """
+    try:
+        value = float(os.environ.get("DIVE_TIMEOUT", "") or DEFAULT_DIVE_TIMEOUT_S)
+    except ValueError:
+        return DEFAULT_DIVE_TIMEOUT_S
+    return value if value > 0 else DEFAULT_DIVE_TIMEOUT_S

@@ -28,6 +28,7 @@ same law fills the page.
 from __future__ import annotations
 
 import datetime
+import functools
 import re
 import sqlite3
 from typing import Any
@@ -37,7 +38,16 @@ from pydantic_ai import RunContext
 from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
 from ._coerce import coerce_int, coerce_list, coerce_str, to_iso_date
+from ._fts import query_tokens as _query_tokens, quoted_and as _quoted_and
 from ._morph import kiwi as _kiwi
+from .precedent_search import bm25_expr  # one owner for BM25 weights, shared with case search
+
+# BM25 column weights for the article index, in `st_articles_fts` column order
+# (title, article_text). An article whose *title* carries the query word
+# ('제26조(해고의 예고)') outranks one the word merely brushes in the body.
+# `st_notice_articles_fts` has a single column; SQLite ignores extra weights,
+# so the same vector is passed there.
+_ART_BM25_WEIGHTS = (3.0, 1.0)
 
 # There is deliberately no kind filter, and a `NOTICE_KINDS` set used to sit
 # here to support one. Narrowing by kind is not worth reviving: the column
@@ -156,8 +166,6 @@ _NOTICE_CURRENT = "COALESCE(n.history_status,'현행')='현행'"
 
 
 # ---------- helpers ----------
-
-from ._fts import safe_fts_query
 
 
 # ---------- law names: abbreviations and morpheme tokens ----------
@@ -821,7 +829,7 @@ def _matched_article_previews(
             WITH best AS (
               SELECT a.{parent_col} AS pid, a.id AS aid,
                      ROW_NUMBER() OVER (PARTITION BY a.{parent_col}
-                                        ORDER BY bm25({fts_table})) AS rn
+                                        ORDER BY {bm25_expr(fts_table, _ART_BM25_WEIGHTS)}) AS rn
               FROM {fts_table} f JOIN {art_table} a ON a.id = f.rowid
               WHERE {fts_table} MATCH ? AND a.{parent_col} IN ({ph})
             )
@@ -895,8 +903,14 @@ def _search_statutes(
         FROM st_statutes s
         LEFT JOIN fts_hits h ON h.statute_id = s.id
         """
-        safe_q = safe_fts_query(query)
-        fts_query_str = safe_q if _fts_query_ok(safe_q) else "x" * 1000
+        # The article FTS expression is a quoted AND over operator-free
+        # tokens. `safe_fts_query` alone leaves 'AND'/'NOT' in place and the
+        # MATCH dies with a syntax error (measured 2026-09-12: an unhandled
+        # exception out of statute_lookup). When every token is below the
+        # trigram floor no article can match, and the CTE is skipped with an
+        # unreachable token — an empty string is itself an FTS5 error.
+        art_match = _quoted_and(_query_tokens(query))
+        fts_query_str = art_match if (art_match and _fts_query_ok(art_match)) else "x" * 1000
         # A candidate matches on the name, on an abbreviation the query
         # contains, or in the text — not necessarily all three. The
         # abbreviation needs its own clause because its characters need not
@@ -904,12 +918,17 @@ def _search_statutes(
         # 증여세법」), so a token LIKE never reaches it.
         where_parts.append(f"(({name_or}) OR {short_in_q} > 0 OR h.hits > 0)")
         sql += "WHERE " + " AND ".join(where_parts) + "\n"
-        # Rank by whether the query contains the name whole, longest first,
-        # then how many query tokens the name covers, then name length, then
-        # text hits. An exact match is the first key's maximum, so it has no
-        # column of its own (`_name_in_query_sql`).
+        # Candidate window only — the final order is `_rank_name_rows`, which
+        # knows about morpheme boundaries. Keys: the query contains the name
+        # whole, then text hits, then token coverage, then name length.
+        # ⚠ `fts_hits` sits **above** `length(name)`: the old order raised a
+        # law whose name was merely grazed over the law whose text actually
+        # matched (measured 2026-09-12: `음주운전` put 도시철도운전규칙 first
+        # with 도로교통법 sixth, and `부당해고` put 부당이득세법 first). An
+        # exact match is the first key's maximum, so it has no column of its
+        # own (`_name_in_query_sql`).
         sql += """
-        ORDER BY name_in_query DESC, name_cover DESC, length(s.name) ASC, fts_hits DESC
+        ORDER BY name_in_query DESC, fts_hits DESC, name_cover DESC, length(s.name) ASC
         LIMIT ?
         """
         # Parameter order follows the order they appear in the SQL:
@@ -936,7 +955,9 @@ def _search_statutes(
         # keeps them, because on that date they were the law.
         today = _today_iso()
         rows = [r for r in rows if not _is_repealed_as_of(conn, r['law_id'], today)]
-    rows = rows[:limit]
+    # Final order and drop-outs belong to the Python side, which can see
+    # morpheme boundaries; SQL only builds the candidate window.
+    rows = _rank_name_rows(rows, query, limit) if query else rows[:limit]
 
     # A law whose text the query matched previews *that* article; one the query
     # only named previews article 1. The matched side arrives in a single query
@@ -994,6 +1015,11 @@ def _search_statutes(
                 # Is this row the law's current edition, and if not, what is.
                 "is_repealed": r["id"] in repealed,
                 "current": cur_refs.get(r["id"]),
+                # The evidence `_merge_law_notice_matches` reads. On names
+                # alone the merge undoes the corpus-internal order (measured
+                # 2026-09-12 on the test box).
+                "fts_hits": r["fts_hits"],
+                "name_in_query": r["name_in_query"],
             }
         )
     return out
@@ -1017,8 +1043,10 @@ def _search_notices(
         cover_sql = " + ".join(f"({name_norm} LIKE ?)" for _ in like_terms)
         name_or = " OR ".join(f"{name_norm} LIKE ?" for _ in like_terms)
         like_params = [f"%{t}%" for t in like_terms]
-        safe_q = safe_fts_query(query)
-        fts_query_str = safe_q if _fts_query_ok(safe_q) else "x" * 1000
+        # Same expression as the statute search above — operator-free tokens,
+        # quoted, so a query that used FTS5 syntax cannot kill the MATCH.
+        art_match = _quoted_and(_query_tokens(query))
+        fts_query_str = art_match if (art_match and _fts_query_ok(art_match)) else "x" * 1000
         sql = f"""
         WITH fts_hits AS (
           SELECT a.notice_id, COUNT(*) AS hits
@@ -1037,7 +1065,7 @@ def _search_notices(
         WHERE n.has_text_content = 1
           AND {_NOTICE_CURRENT}
           AND (({name_or}) OR h.hits > 0)
-        ORDER BY name_in_query DESC, name_cover DESC, length(n.name) ASC, fts_hits DESC
+        ORDER BY name_in_query DESC, fts_hits DESC, name_cover DESC, length(n.name) ASC
         LIMIT ?
         """
         # The same key as the statute search. If only one side knew about
@@ -1046,6 +1074,9 @@ def _search_notices(
             sql,
             [fts_query_str, *like_params, *spans, *like_params, limit],
         ).fetchall()
+        # Same rule as the laws: `_rank_name_rows` owns the order and the
+        # drop-outs (rules have no official abbreviation, hence `alt_key=""`).
+        rows = _rank_name_rows(rows, query, limit, alt_key="")
     else:
         rows = conn.execute(
             """
@@ -1086,9 +1117,50 @@ def _search_notices(
                 "agency": r["issuing_agency"],
                 "effective_date": r["effective_date"],
                 "preview": preview,
+                # Evidence the merge reads (same keys as the statute side).
+                "fts_hits": r["fts_hits"],
+                "name_in_query": r["name_in_query"],
             }
         )
     return out
+
+
+@functools.lru_cache(maxsize=100_000)
+def _name_morphemes(name: str) -> frozenset[str]:
+    """A law or rule **name** as its set of content morphemes — the one place
+    name-side boundaries are decided.
+
+    Why the name has to be analysed: matching a query token with
+    ``LIKE '%token%'`` accepts coincidences that run through the middle of a
+    word. Measured 2026-09-12: `사기` reached 「공공감사기준」,
+    「자원봉사기본법」 and 「군사기밀 보호법」 (inside 감사기준, 봉사기본 and
+    군사기밀), and `음주운전` ranked 「도시철도운전규칙」 first with the traffic
+    law sixth. Split with the same analyser, '감사기준' is [감사, 기준] and has
+    no '사기', while 「보험사기방지 특별법」 is [보험, 사기, 방지, 특별, 법] and
+    does — which is the difference between a coincidence and a match.
+
+    Without Kiwi this is empty and callers fall back to substring matching.
+    """
+    try:
+        return frozenset(
+            _strip_dots(t.form) for t in _kiwi().tokenize(name or "")
+            if t.tag in ("NNG", "NNP") and len(_strip_dots(t.form)) >= 2
+        )
+    except Exception:
+        return frozenset()
+
+
+def _name_token_hits(name: str, tokens: list[str], n_norm: str) -> int:
+    """How many query tokens the name carries, counted on **morpheme
+    boundaries** — a coincidence in the middle of a word does not count.
+
+    `n_norm` is the name with spaces and interpuncts removed, the fallback
+    used when there is no analyser.
+    """
+    morph = _name_morphemes(name)
+    if morph:
+        return sum(1 for t in tokens if t in morph)
+    return sum(1 for t in tokens if t in n_norm)
 
 
 def _name_cover_key(name: str, q_norm: str, tokens: list[str], spans=()):
@@ -1106,6 +1178,10 @@ def _name_cover_key(name: str, q_norm: str, tokens: list[str], spans=()):
     cross word boundaries (「상법」 inside '손해배상 법률'). Interpuncts come out
     here too, matching `_name_norm_sql`: stripping only spaces meant names
     like 「초ㆍ중등교육법」 never took the containment branch at all.
+
+    ⚠ Coverage is counted on the **name's morpheme boundaries**
+    (`_name_token_hits`). The substring count this replaced credited '사기'
+    to 「공공감사기준」 and '운전' to 「도시철도운전규칙」 (2026-09-12).
     """
     n = _strip_dots((name or "").replace(" ", ""))
     if n and n in spans:
@@ -1113,13 +1189,85 @@ def _name_cover_key(name: str, q_norm: str, tokens: list[str], spans=()):
         # query — so it needs no case of its own.
         return (0, -len(n))
     if tokens:
-        cover = sum(1 for t in tokens if t in n)
+        cover = _name_token_hits(name, tokens, n)
         return (1, len(tokens) - cover)        # fewer missing tokens sorts higher
     return (1, 0) if (q_norm and q_norm in n) else (2, 0)
 
 
+def _name_rank_key(cover_key, name_in_query: int, fts_hits: int, n_tokens: int, name_len: int):
+    """The four-step name-and-text sort key (lower first), shared by each
+    corpus's internal sort and by the merge.
+
+    ① the query contains the name whole (`name_in_query`) — longer name first,
+       the more specific mention
+    ② every query token is a morpheme of the name — more text hits first, then
+       the shorter name
+    ③ the article text matched (`fts_hits`) — fewer missing tokens, then more
+       text hits
+    ④ partial name coverage — fewer missing tokens, then the shorter name
+
+    ⚠ This is the **only** definition of the order, read by `_rank_name_rows`
+    (inside each corpus) and `_merge_law_notice_matches` (between the two).
+    When they drift apart the merge undoes the search — which is what
+    happened (2026-09-12: the corpus raised 도로교통법 to first and the merge,
+    looking only at names, put the rule back on top).
+    """
+    if name_in_query:
+        return (0, cover_key[1], 0, 0)
+    deficiency = cover_key[1] if cover_key[0] == 1 else n_tokens
+    if cover_key[0] == 1 and deficiency == 0:
+        return (1, -int(fts_hits or 0), 0, name_len)
+    if fts_hits:
+        return (2, deficiency, -int(fts_hits or 0), name_len)
+    return (3, deficiency, 0, name_len)
+
+
+def _rank_name_rows(rows, query: str, limit: int, *, alt_key: str = "short_name"):
+    """Reorder by name relevance (morpheme boundaries) → text hits → name
+    length, and drop the rows with no evidence at all.
+
+    Why the SQL sort cannot finish the job: the right coverage count needs the
+    **name's** morpheme boundaries (「공공감사기준」 has no '사기' — it is
+    [감사, 기준]), and that needs Kiwi, which SQL does not have. So SQL builds
+    a **candidate window** whose first keys (`name_in_query`, then `fts_hits`)
+    keep every supported row inside it, and this decides the final order and
+    the drop-outs.
+
+    Drop-out rule: the query contains the name whole (`name_in_query`), or the
+    name's morphemes carry the query tokens, or the article text matched
+    (`fts_hits`). Anything else goes — before this, grazing the middle of a
+    name was enough to be a candidate (`사기` → 「공공감사기준」).
+
+    ⚠ A row pushed outside the candidate window does not come back, which is
+    why the SQL sort leads with `name_in_query` and then `fts_hits`.
+    """
+    _, tokens = _statute_name_tokens(query)
+    spans = frozenset(_query_name_spans(query))
+    q_norm = _strip_dots((query or "").replace(" ", ""))
+
+    def name_key(r):
+        best = _name_cover_key(r["name"], q_norm, tokens, spans)
+        alt = r[alt_key] if (alt_key in r.keys() and r[alt_key]) else ""
+        return min(best, _name_cover_key(alt, q_norm, tokens, spans)) if alt else best
+
+    def rank_key(r):
+        return _name_rank_key(name_key(r), r["name_in_query"] or 0, r["fts_hits"] or 0,
+                              len(tokens), len(r["name"] or ""))
+
+    ranked = sorted(rows, key=rank_key)
+    if not tokens:
+        return ranked[:limit]
+    out = []
+    for r in ranked:
+        k = name_key(r)
+        if k[0] == 0 or r["fts_hits"] or k[1] < len(tokens):
+            out.append(r)
+    return out[:limit]
+
+
 def _merge_law_notice_matches(matches, query, limit, name_of=None, alt_name_of=None):
-    """Interleave law and rule results by name relevance, with no fixed share.
+    """Interleave law and rule results by name-and-text relevance, with no
+    fixed share.
 
     The sort is stable, so within one relevance tier the input order
     survives.
@@ -1129,6 +1277,11 @@ def _merge_law_notice_matches(matches, query, limit, name_of=None, alt_name_of=N
     scored on whichever of the two names does better, so the merge does not
     push it back down. Rules have no abbreviation and yield an empty string,
     leaving only the full-name key.
+
+    ⚠ `fts_hits` and `name_in_query` come straight from each corpus's result
+    dicts — the **evidence**, not the names. Scoring names alone let the merge
+    reorder what the searches had just gotten right. Missing keys read as 0,
+    which falls back to the old name-only order.
     """
     if name_of is None:
         name_of = lambda m: m.get("name", "")
@@ -1140,7 +1293,10 @@ def _merge_law_notice_matches(matches, query, limit, name_of=None, alt_name_of=N
     def key(m):
         best = _name_cover_key(name_of(m), normalized, tokens, spans)
         alt = alt_name_of(m)
-        return min(best, _name_cover_key(alt, normalized, tokens, spans)) if alt else best
+        if alt:
+            best = min(best, _name_cover_key(alt, normalized, tokens, spans))
+        return _name_rank_key(best, m.get("name_in_query") or 0, m.get("fts_hits") or 0,
+                              len(tokens), len(name_of(m) or ""))
 
     return sorted(matches, key=key)[:limit]
 
@@ -1493,10 +1649,15 @@ def _detail_statute(
         "missing": missing,
     }
     if missing:
-        result["hint"] = (
-            f"missing {missing} — '{meta['name']}'에 해당 article 없음. "
-            "정확한 조문 번호는 statute_lookup(statute_id, articles=null)로 outline 호출해 확인하세요."
-        )
+        nbrs = _neighbor_articles(conn, meta.get("law_id"), _today_iso(),
+                                  [s for s in specs if not _matched(s)])
+        if nbrs:
+            result["missing_neighbors"] = nbrs
+        else:
+            result["hint"] = (
+                f"missing {missing} — '{meta['name']}'에 해당 article 없음. "
+                "정확한 조문 번호는 statute_lookup(statute_id, articles=null)로 outline 호출해 확인하세요."
+            )
     return result
 
 
@@ -1524,6 +1685,7 @@ def _detail_statute_at_date(
 
     articles: list[dict] = []
     missing: list[str] = []
+    missing_specs: list[tuple[int, int | None]] = []   # for the `missing_neighbors` hint
     for num, branch in specs:
         # No branch requested: resolve the article and every branch under
         # it, each at its own last change.
@@ -1539,6 +1701,7 @@ def _detail_statute_at_date(
             branches = sorted({r['article_branch'] or 0 for r in branches_rows})
             if not branches:
                 missing.append(f"{num}")
+                missing_specs.append((num, None))
                 continue
             for br in branches:
                 r = _get_historic_article(conn, law_id, num, br, offense_iso)
@@ -1550,6 +1713,7 @@ def _detail_statute_at_date(
                 articles.append(_format_historic_article_row(r))
             else:
                 missing.append(f"{num}-{branch}")
+                missing_specs.append((num, branch))
 
     out = {
         "mode": "detail",
@@ -1564,6 +1728,10 @@ def _detail_statute_at_date(
     }
     if asked_iso:
         out["offense_date"] = asked_iso
+    if missing:
+        nbrs = _neighbor_articles(conn, law_id, offense_iso, missing_specs)
+        if nbrs:
+            out["missing_neighbors"] = nbrs
     if repealed:
         out["repealed"] = {
             "effective_date": repealed['effective_date'],
@@ -1575,19 +1743,42 @@ def _detail_statute_at_date(
     # when it was a future amendment, and no renderer ever printed it, so it
     # was computed and dropped.
     cur_ref = _current_version_ref(conn, law_id, meta['id'], meta.get('name'))
-    if cur_ref is None and offense_iso and articles:
+    if cur_ref is None and asked_iso and articles:
         # A dated lookup walks each article separately, so the row can be the
         # current one while the text served is not: 도로교통법 id=557 is the
         # current row, and a 2019 lookup against it returns 2019 wording.
         # Comparing rows alone misses that, and the response loses the line
         # saying which date the text is from.
-        served = max((a.get("eff_date") or "") for a in articles)
-        cur_eff = str(meta.get("effective_date") or "")
-        if served and cur_eff and served != cur_eff:
-            cur_ref = {"id": meta["id"], "name": meta["name"],
-                       "effective_date": cur_eff, "renamed": False}
+        # This ref is the *row that was looked up*, so it carries
+        # `is_served_row` and the renderer prints no "not current" line for
+        # it — that line named the row's own id as the current edition.
+        #
+        # ⚠ The test is `asked_iso`, not `offense_iso` (= the internal as_of).
+        # `offense_iso` is filled in for current lookups too, so gating on it
+        # attached this ref to ordinary lookups and the renderer announced
+        # "현행 아님 — 이 법의 현행은 statute_id=<the row itself>" (measured in
+        # production 2026-09-14: 개인정보 보호법 3699 + 제58조).
+        cur_ref = {"id": meta["id"], "name": meta["name"],
+                   "effective_date": str(meta.get("effective_date") or ""),
+                   "renamed": False, "is_served_row": True}
     if cur_ref:
         out["current_version"] = cur_ref
+    # The row can be the current one while the dated walk served **newer**
+    # wording than the row's snapshot — 개인정보 보호법 header 3699 (a
+    # 2025-10-02 snapshot) with 제58조 from the amendment in force
+    # 2026-09-11. That is a basis date, not "not current": without the
+    # distinction a model reads it as an article-renumbering story.
+    if cur_ref is None or cur_ref.get("is_served_row"):
+        cur_eff = str(meta.get("effective_date") or "")
+        newer = [a for a in articles
+                 if cur_eff and str(a.get("eff_date") or "") > cur_eff]
+        if newer:
+            out["text_basis"] = {
+                "effective_date": max(str(a.get("eff_date") or "") for a in newer),
+                "articles": [_article_label(a.get("no"), a.get("branch"))
+                             for a in newer[:3]],
+                "count": len(newer),
+            }
     return out
 
 
@@ -1709,6 +1900,63 @@ def _fmt_article_no(no: Any, branch: Any) -> str:
     """
     s = str(no)
     return f"{s}-{branch}" if branch and "의" not in s else s
+
+
+def _article_label(no: Any, branch: Any) -> str:
+    """An article number in the Korean a person reads — '제58조의2'.
+
+    Load generations disagree on where the branch lives: `article_no` may be
+    '58', '58의2' or '제58조', with the branch as its own column. Pull the
+    number out and write it back in one shape.
+    """
+    s = _fmt_article_no(no, branch).replace(" ", "").replace("-", "의")
+    m = re.fullmatch(r"제?(\d+)(?:조?의(\d+))?조?", s)
+    if not m:
+        return s if s.startswith("제") else f"제{s}조"
+    return f"제{m.group(1)}조" + (f"의{m.group(2)}" if m.group(2) else "")
+
+
+# How many neighbouring articles to attach to a missing-article report.
+# Measured in production 2026-09-14: handed only `missing: 59-2`, a model
+# decided the numbering must be wrong, re-asked for 58·59·60·61·70·71, ran
+# five web searches and spent twelve minutes before inventing 제59조의2 and
+# 제70조의2 from memory. Naming the numbers that *do* sit next to the hole
+# ends the round trip in one response.
+_NEIGHBOR_LIMIT = 3
+
+
+def _neighbor_articles(
+    conn: sqlite3.Connection, law_id: str | None, as_of_iso: str | None,
+    specs: list[tuple[int, int | None]], limit: int = _NEIGHBOR_LIMIT,
+) -> list[str]:
+    """Missing article specs -> the article labels that **do** exist around
+    them (nearest first, at most `limit`)."""
+    if not law_id or not specs:
+        return []
+    rows = conn.execute(
+        """SELECT DISTINCT a.article_no, a.article_no_num, a.article_branch
+           FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id
+           WHERE s.law_id=? AND s.effective_date <= ? AND a.article_no_num IS NOT NULL""",
+        (law_id, as_of_iso or "99999999"),
+    ).fetchall()
+    have = sorted({(r["article_no_num"], r["article_branch"] or 0, r["article_no"])
+                   for r in rows})
+    keys = [(n, b) for n, b, _ in have]
+    picked: dict[tuple[int, int], str] = {}
+    for num, branch in specs:
+        key = (num, branch or 0)
+        # Insertion point — where this number should have been — then outwards
+        # left and right, nearest first.
+        i = 0
+        while i < len(keys) and keys[i] < key:
+            i += 1
+        for j in (i - 1, i, i - 2, i + 1, i - 3, i + 2):
+            if 0 <= j < len(have) and len(picked) < limit:
+                n, b, no = have[j]
+                picked.setdefault((n, b), _article_label(no, b))
+        if len(picked) >= limit:
+            break
+    return [picked[k] for k in sorted(picked)]
 
 
 def _statute_web_url(d: dict[str, Any]) -> str | None:
@@ -1842,9 +2090,23 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             # branch here to print it.
             lines.append(f"- 시점 조회: {_fmt_eff_iso(od)} 기준 문언입니다"
                          + (f" — 현행은 {tail}." if tail else "."))
-        elif cv:
+        elif cv and not cv.get("is_served_row"):
+            # `is_served_row` means this ref *is* the row that was looked up.
+            # Printing the line then says "not current" and names that row's
+            # own id as the current one.
             lines.append(f"- 현행 아님 — 이 법의 현행은 {tail}, "
                          f"statute_id={cv.get('id')} 입니다.")
+        tb = resp.get("text_basis")
+        if tb:
+            # The row is current but the wording served is from a newer
+            # amendment. A basis date, not "not current".
+            eff = _fmt_eff_iso(tb.get("effective_date"))
+            labels = tb.get("articles") or []
+            extra = ""
+            if labels:
+                more = int(tb.get("count") or len(labels)) - len(labels)
+                extra = " (" + " · ".join(labels) + (f" 외 {more}건" if more > 0 else "") + ")"
+            lines.append(f"- 문언 기준: {eff} 시행본{extra}")
         rep = resp.get("repealed")
         if rep and rep.get("note"):
             lines.append(f"- 폐지: {rep['note']}")
@@ -1891,7 +2153,14 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append(resp["body"])
         missing = resp.get("missing")
         if missing:
-            lines.append(f"## missing: {', '.join(str(x) for x in missing)}")
+            # A bare `## missing:` line invites "is the number wrong?" retries.
+            # Give the fact and the numbers that *are* there, and the round
+            # trip ends here.
+            lines.append(f"## 없는 조문: {', '.join(str(x) for x in missing)}")
+            lines.append("- 현행·연혁본 어디에도 이 번호의 조문이 없습니다.")
+            nbrs = resp.get("missing_neighbors")
+            if nbrs:
+                lines.append(f"- 근처 조문: {' · '.join(nbrs)}")
         if resp.get("hint"):
             lines.append(f"## hint: {resp['hint']}")
 

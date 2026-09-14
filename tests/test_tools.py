@@ -790,3 +790,116 @@ def test_sentence_statistics_runs_without_the_correction_columns(ctx):
     out = tools.sentence_statistics(ctx, charges="절도")
     assert "## status:" in out
     assert "자유형 형종:" not in out          # nothing to report without the column
+
+
+def test_search_tools_survive_fts_operator_syntax(ctx):
+    """Search syntax a caller types must not kill the tool.
+
+    Punctuation stripping alone left the FTS5 boolean operators in the MATCH
+    expression, so `사기 AND` and `개인정보 AND (보호법 OR)` came back as
+    `sqlite3.OperationalError: fts5: syntax error` out of both search tools
+    (measured 2026-09-12). Search syntax is not rare enough to leave as a 500.
+    """
+    out = tools.precedent_search(ctx, query="사기 AND")
+    assert "## status: ok" in out, out
+    assert "## matches" in out, out
+
+    out = tools.statute_lookup(ctx, query="개인정보 AND (보호법 OR)")
+    assert "## status: ok" in out, out
+    assert "## matches" in out, out
+
+
+def test_missing_article_reports_the_numbers_around_it(ctx):
+    """Naming the neighbours ends the retry loop a bare `missing` starts.
+
+    Handed only `missing: 59-2`, a model re-asked for neighbouring numbers and
+    eventually invented articles from memory. The response now carries the
+    numbers that do exist next to the hole.
+    """
+    conn = open_db()
+    try:
+        sid = conn.execute(
+            """SELECT s.id FROM st_statutes s JOIN st_articles a ON a.statute_id = s.id
+               WHERE s.history_status = '현행'
+               GROUP BY s.id ORDER BY COUNT(*) DESC LIMIT 1"""
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    out = tools.statute_lookup(ctx, statute_id=sid, articles=["9999"])
+    assert "## 없는 조문: 9999" in out, out
+    assert "- 현행·연혁본 어디에도 이 번호의 조문이 없습니다." in out, out
+    assert re.search(r"- 근처 조문: 제\d+조", out), out
+
+
+def test_dated_walk_marks_newer_wording_as_a_basis_date(ctx, monkeypatch):
+    """A current row can serve wording from a newer amendment.
+
+    That is a basis date, not "현행 아님" — saying the latter about the row the
+    caller looked up is a self-contradiction (measured in production
+    2026-09-14: 개인정보 보호법 3699 + 제58조).
+    """
+    import importlib
+    st = importlib.import_module("lawful_mcp.tools.statutes")
+
+    conn = open_db()
+    try:
+        sid = conn.execute(
+            """SELECT s.id FROM st_statutes s JOIN st_articles a ON a.statute_id = s.id
+               WHERE s.history_status = '현행'
+               GROUP BY s.id ORDER BY COUNT(*) DESC LIMIT 1"""
+        ).fetchone()[0]
+        meta = st._statute_meta(conn, sid)
+        num = conn.execute(
+            "SELECT MIN(article_no_num) FROM st_articles WHERE statute_id = ?", (sid,)
+        ).fetchone()[0]
+
+        # The row is current (`_current_version_ref` finds nothing) and the
+        # dated walk serves wording that took effect after the row's snapshot.
+        monkeypatch.setattr(st, "_current_version_ref", lambda *a, **k: None)
+        monkeypatch.setattr(st, "_get_historic_article", lambda *a, **k: {
+            "article_no": str(num), "article_no_num": num, "article_branch": None,
+            "title": "제1조(목적)", "article_text": "① 이 법은 …",
+            "effective_date": "20260911", "history_status": "현행",
+            "change_kind": "일부개정",
+        })
+        out = st._detail_statute_at_date(
+            conn, meta, [(num, None)], st._today_iso(), asked_iso=None)
+    finally:
+        conn.close()
+
+    assert out["text_basis"]["effective_date"] == "20260911", out.get("text_basis")
+    md = st._format_response_md(out)
+    assert "- 문언 기준: 2026-09-11 시행본" in md, md
+    assert "현행 아님" not in md, md
+
+
+def test_precedent_dive_times_out_instead_of_hanging(ctx, monkeypatch):
+    """The wait is ours, not the library's.
+
+    pydantic-ai's httpx client allows a 600-second read and the OpenAI SDK
+    retries a timeout twice, so an unresponsive model could hold one dive call
+    for up to 30 minutes. The tool cuts the wait, answers with `status:
+    timeout`, and leaves the excerpt usable.
+    """
+    import asyncio
+    import importlib
+    dive = importlib.import_module("lawful_mcp.tools.precedent_dive")
+
+    conn = open_db()
+    try:
+        case_id = conn.execute("SELECT id FROM prec_cases ORDER BY id LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+    class SlowSubagent:
+        async def run(self, *args, **kwargs):
+            await asyncio.sleep(30)          # far past the budget below
+
+    monkeypatch.setenv("DIVE_TIMEOUT", "0.05")
+    slow_ctx = SimpleNamespace(
+        deps=SimpleNamespace(dive_subagent=SlowSubagent()), usage=None)
+
+    started = asyncio.run(dive.precedent_dive(slow_ctx, case_id=case_id, question="쟁점"))
+    assert "## status: timeout" in started, started
+    assert "본문은 읽지 못한 것으로 취급" in started, started
