@@ -1,8 +1,9 @@
-"""Environment wiring, in one place.
+"""Corpus paths, citation URLs and dive-model configuration.
 
-Everything this server reads from the environment is declared here so a
-self-hoster can see the whole surface at once. Nothing else in the package
-reads ``os.environ`` for configuration.
+The complete configuration reference is ``.env.example``. HTTP transport
+settings live in ``server.py``; retrieval tuning and optional embedding and
+reranking settings live in ``tools/precedent_search.py`` and ``deps.py``.
+Values come from the process environment; this package does not load .env.
 
 Environment variables:
   CORPUS_DB          Path to the corpus SQLite file. Defaults to the sample
@@ -15,15 +16,15 @@ Environment variables:
                      is not registered and the other three still run.
   DIVE_BASE_URL      Base URL of that endpoint (OpenAI-compatible).
   DIVE_MODEL         Model name to request.
-  DIVE_TIMEOUT       Seconds to wait for that model before giving up and
-                     returning the excerpt alone. Defaults to 15.
+  DIVE_TIMEOUT       Seconds to wait before returning a timeout status with
+                     case metadata and retry guidance. Defaults to 15.
   USE_DENSE          Set to 1 to enable the embedding + rerank retrieval
                      path in ``precedent_search``. Off by default: the
                      lexical path (trigram + morpheme RRF) scored on par in
                      a known-item A/B and needs no external service.
   EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL / EMBED_DIM
   RERANK_BASE_URL / RERANK_API_KEY
-                     Only read when USE_DENSE=1.
+                     Only used when USE_DENSE=1.
 """
 from __future__ import annotations
 
