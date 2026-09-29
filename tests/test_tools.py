@@ -236,7 +236,7 @@ def test_a_rename_is_not_reported_as_a_repeal():
     """`st_backfill_log` records superseded editions loaded after the fact, not
     repeals: 278 of its 738 rows are renames whose successor is alive. A repeal
     is a row in it with no later edition in force — a pending amendment is not
-    one. The sample carries no such table, so build one over it.
+    one. Overlay a controlled register without changing the sample.
     """
     conn = open_db()
     try:
@@ -253,9 +253,8 @@ def test_a_rename_is_not_reported_as_a_repeal():
         conn.close()
 
 
-def test_the_repeal_verdict_fails_soft_without_its_table():
-    """The bundled sample predates `st_backfill_log`, so search must still run
-    and simply label nothing repealed."""
+def test_current_core_laws_are_not_marked_repealed():
+    """Current core laws stay searchable when status records are present."""
     conn = open_db()
     try:
         assert statutes._backfilled_sids(conn, [578, 584]) == set()
@@ -562,13 +561,16 @@ def test_branch_menu_prints_ascii_keys_and_a_folded_list_lands_on_a_valid_key(ct
     from pydantic_ai.tools import Tool
 
     charge = "도로교통법위반(음주운전)"
-    menu = tools.compute_sentencing_range(ctx, charge=charge)
+    # Multiple paragraphs share this charge; test the branches of one article.
+    statute_choice = "도로교통법§148의2 ③"
+    menu = tools.compute_sentencing_range(ctx, charge=charge, statute_choice=statute_choice)
     assert "## status: needs_branch_key" in menu
     assert "- 3-1: " in menu and "- 3-2: " in menu and "- 3-3: " in menu
     assert 'branch_key="3-1"' in menu
 
     folded = Tool(tools.compute_sentencing_range).function_schema.validator.validate_json(
-        json.dumps({"charge": charge, "branch_key": [2]}, ensure_ascii=False)
+        json.dumps({"charge": charge, "statute_choice": statute_choice, "branch_key": [2]},
+                   ensure_ascii=False)
     )
     ok = tools.compute_sentencing_range(ctx, **folded)
     assert "## status: ok" in ok
@@ -577,10 +579,12 @@ def test_branch_menu_prints_ascii_keys_and_a_folded_list_lands_on_a_valid_key(ct
     assert "정량 근거: branch:" not in ok
 
     for raw in ("3-2", "2", "③2"):
-        out = tools.compute_sentencing_range(ctx, charge=charge, branch_key=raw)
+        out = tools.compute_sentencing_range(
+            ctx, charge=charge, statute_choice=statute_choice, branch_key=raw)
         assert "## status: ok" in out, raw
 
-    bad = tools.compute_sentencing_range(ctx, charge=charge, branch_key="9")
+    bad = tools.compute_sentencing_range(
+        ctx, charge=charge, statute_choice=statute_choice, branch_key="9")
     assert "## status: invalid_branch_key" in bad
     assert "branch_key='9' 는 아래 목록에 없습니다" in bad
     assert "문자열 하나로" in bad
@@ -775,13 +779,27 @@ def test_a_sentence_is_checked_against_the_processed_range_when_the_two_do_not_o
     assert span.endswith("안: True")
 
 
-def test_sentence_statistics_runs_without_the_correction_columns(ctx):
-    """The bundled sample predates term_kind/data_quality/sentence_months_min, so
-    the distribution must still run and simply report every term as 징역."""
+def test_sentence_statistics_runs_without_the_correction_columns(ctx, monkeypatch):
+    """Older corpora still run and report every term as 징역.
+
+    Hide the optional columns through a temporary view so this compatibility
+    check remains meaningful after the bundled sample has been refreshed.
+    """
     import importlib
     ss = importlib.import_module("lawful_mcp.tools.sentence_statistics")
 
-    conn = open_db()
+    def legacy_db():
+        conn = open_db()
+        optional = {"term_kind", "data_quality", "sentence_months_min"}
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(prec_defendants)")
+                   if r["name"] not in optional]
+        projection = ", ".join(f'"{name}"' for name in columns)
+        conn.execute(
+            f"CREATE TEMP VIEW prec_defendants AS SELECT {projection} FROM main.prec_defendants")
+        return conn
+
+    monkeypatch.setattr(ss, "open_db", legacy_db)
+    conn = legacy_db()
     try:
         assert not ss._has_quality_cols(conn)
     finally:

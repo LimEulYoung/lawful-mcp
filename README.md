@@ -97,7 +97,7 @@ export DIVE_BASE_URL=https://api.openai.com/v1   # any OpenAI-compatible endpoin
 export DIVE_MODEL=...
 ```
 
-Without those three the tool is not registered and the other four run
+Without those three the tool is not registered and the other three run
 normally.
 
 ## The corpus
@@ -107,7 +107,7 @@ whole thing:
 
 | | Sample (`data/fixture.db`) | Hosted |
 |---|---|---|
-| Judgments | 800 | 220,000+ |
+| Judgments | 700 | 220,000+ |
 | Statutes | 27 core laws, current text | All, with amendment history |
 | Administrative rules | 20 | All |
 | Sentencing guidelines | Complete | Complete |
@@ -115,6 +115,10 @@ whole thing:
 
 The sample is enough to exercise every tool and run the tests. For real work,
 use the hosted corpus.
+
+Statute lookups distinguish repeal from loss of effect, such as expiry, when
+the corpus supplies that information. The sample's lapse register is currently
+empty; expiry and reinstatement are covered by separate test data.
 
 Search combines two lexical indexes: a character-trigram FTS and a
 morpheme FTS built with [Kiwi](https://github.com/bab2min/kiwipiepy), fused

@@ -12,7 +12,7 @@ Environment variables:
                      ids match the published corpus.
   DIVE_API_KEY       API key for the model behind ``precedent_dive``. Any
                      OpenAI-compatible endpoint works. When unset, the tool
-                     is not registered and the other four still run.
+                     is not registered and the other three still run.
   DIVE_BASE_URL      Base URL of that endpoint (OpenAI-compatible).
   DIVE_MODEL         Model name to request.
   DIVE_TIMEOUT       Seconds to wait for that model before giving up and
@@ -62,7 +62,7 @@ def dive_config() -> tuple[str, str, str] | None:
     """(base_url, api_key, model) for the dive sub-agent, or None if unset.
 
     Returning None is a supported state, not an error: the server registers
-    the other four tools and reports the dive tool as unavailable.
+    the other three tools and reports the dive tool as unavailable.
     """
     api_key = os.environ.get("DIVE_API_KEY", "").strip()
     if not api_key:

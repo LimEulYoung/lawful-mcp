@@ -148,6 +148,31 @@ def count(dest: sqlite3.Connection, table: str) -> int:
     return dest.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
 
 
+def copy_statute_status_tables(dest: sqlite3.Connection) -> None:
+    """Copy optional repeal/lapse facts for sampled laws, without load logs.
+
+    Only the fields consumed by the tools belong in the sample. Operational
+    notes and timestamps can exist in the source but are not published.
+    Older sources without these tables remain supported.
+    """
+    tables = (
+        ("st_backfill_log", "statute_id INTEGER, status TEXT",
+         "statute_id, status", "statute_id IN (SELECT id FROM main.st_statutes)"),
+        ("st_lapsed", "law_id TEXT PRIMARY KEY, lapsed_on TEXT NOT NULL, reason TEXT NOT NULL",
+         "law_id, lapsed_on, reason", "law_id IN (SELECT law_id FROM main.st_statutes)"),
+    )
+    for table, schema, columns, scope in tables:
+        if not dest.execute(
+            "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone():
+            continue
+        dest.execute(f"CREATE TABLE main.{table} ({schema})")
+        dest.execute(
+            f"INSERT INTO main.{table} ({columns}) "
+            f"SELECT {columns} FROM src.{table} WHERE {scope}"
+        )
+
+
 def pick_current_snapshot(dest: sqlite3.Connection, law_id: str, as_of_iso: str) -> int | None:
     """Pick the consolidated current version of a law — mirror of the tool.
 
@@ -310,19 +335,7 @@ def main() -> None:
         "INSERT INTO main.st_notice_articles SELECT * FROM src.st_notice_articles "
         "WHERE notice_id IN (SELECT id FROM main.st_notices)"
     )
-    # The record of which superseded editions were loaded after the fact,
-    # narrowed to the laws in this sample. `statute_lookup` reads it to tell a
-    # repeal from a rename, and reads it fail-soft, so a sample built before
-    # this table existed still works — it just never labels anything repealed.
-    try:
-        copy_ddl(dest, "st_backfill_log")
-        dest.execute(
-            "INSERT INTO main.st_backfill_log SELECT * FROM src.st_backfill_log "
-            "WHERE statute_id IN (SELECT id FROM main.st_statutes)"
-        )
-        copy_indexes(dest, "st_backfill_log")
-    except SystemExit:
-        log("st_backfill_log: absent from source, skipped")
+    copy_statute_status_tables(dest)
     for t in ("st_statutes", "st_articles", "st_notices", "st_notice_articles"):
         copy_indexes(dest, t)
     log(

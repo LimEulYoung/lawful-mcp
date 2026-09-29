@@ -60,6 +60,12 @@ _ART_BM25_WEIGHTS = (3.0, 1.0)
 # the response alone exceeds the context it was meant to inform.
 ARTICLES_MAX = 8
 
+# Bound each response at its source so clients can retain the same text in
+# conversation history. Of 5,266 measured calls, 109 exceeded 8,000 characters
+# and the largest reached 39,810. The limit leaves 33% headroom for full legal
+# text; only outliers are shortened, with an explicit recovery instruction.
+RESPONSE_MAX_CHARS = 53_000
+
 # Search results. The caller's limit must not reach SQL unbounded: the
 # search oversamples it eightfold, and version folding then issues a further
 # query per law. A limit of a million would become a scan of eight million
@@ -578,8 +584,8 @@ def _current_version_ref(
 
 def _backfilled_sids(conn: sqlite3.Connection, sids) -> set[int]:
     """The statute ids in `st_backfill_log` — 738 superseded editions loaded
-    after the fact because judgments cite them. Empty when the table is absent,
-    as it is in the bundled sample.
+    after the fact because judgments cite them. Empty when the table is absent
+    from an older corpus.
 
     This is a load record, not a repeal register, and using it as one is wrong.
     The loader's premise was "repealed laws with no successor in force", on the
@@ -604,23 +610,29 @@ def _backfilled_sids(conn: sqlite3.Connection, sids) -> set[int]:
 
 
 def _repealed_sids(conn: sqlite3.Connection, sids) -> set[int]:
-    """Repealed = in the backfill record *and* with no later edition in force.
+    """Mark laws whose latest edition is repealed or whose validity has lapsed.
 
-    Which is what the loader meant in the first place. A successor means the
-    law was not killed but renamed, and then "현행 아님, and here is the current
-    one" is the accurate thing to say rather than a repeal badge. Amendments
-    not yet in force do not count as successors — a pending amendment cannot
-    undo a repeal that already happened.
+    The backfill record also identifies repealed laws with no later edition
+    in force. A live successor can mean a rename, but a repeal edition is
+    not a live successor and must not hide the repeal. Future amendments
+    cannot undo a repeal that has already taken effect.
     """
-    back = _backfilled_sids(conn, sids)
-    if not back:
+    sids = [s for s in sids if s is not None]
+    if not sids:
         return set()
-    ids = sorted(back)
-    q = ("SELECT s.id FROM st_statutes s WHERE s.id IN (%s) AND NOT EXISTS("
-         "SELECT 1 FROM st_statutes s2 WHERE s2.law_id = s.law_id "
-         "AND s2.effective_date > s.effective_date "
-         "AND COALESCE(s2.history_status,'') != '시행예정')" % ",".join("?" * len(ids)))
-    return {r[0] for r in conn.execute(q, ids)}
+    today = _today_iso()
+    marks = ",".join("?" * len(sids))
+    out = {sid for sid, lid in conn.execute(
+        f"SELECT id, law_id FROM st_statutes WHERE id IN ({marks})", sids)
+        if _is_repealed_as_of(conn, lid, today)}
+    back = sorted(_backfilled_sids(conn, sids) - out)
+    if back:
+        q = ("SELECT s.id FROM st_statutes s WHERE s.id IN (%s) AND NOT EXISTS("
+             "SELECT 1 FROM st_statutes s2 WHERE s2.law_id = s.law_id "
+             "AND s2.effective_date > s.effective_date "
+             "AND COALESCE(s2.history_status,'') != '시행예정')" % ",".join("?" * len(back)))
+        out |= {r[0] for r in conn.execute(q, back)}
+    return out
 
 
 def _current_refs(conn: sqlite3.Connection, rows) -> dict[int, dict[str, Any]]:
@@ -702,7 +714,46 @@ def _is_repealed_as_of(
            ORDER BY effective_date DESC LIMIT 1""",
         (law_id, as_of_iso),
     ).fetchone()
-    return bool(r and r['change_kind'] and '폐지' in str(r['change_kind']))
+    if r and r['change_kind'] and '폐지' in str(r['change_kind']):
+        return True
+    return _lapse(conn, law_id, as_of_iso) is not None
+
+
+# Reasons a law can lose effect without a repeal edition.
+_LAPSE_REASONS = {"sunset": "유효기간 만료", "amending_act": "일괄개정 반영 완료",
+                  "reenacted": "같은 이름의 새 법으로 대체", "parent_lapsed": "모법 효력 상실"}
+
+
+def _lapse(conn: sqlite3.Connection, law_id: str | None, as_of_iso: str) -> dict | None:
+    """Return a lapse notice in the same shape as a repeal, or None.
+
+    Expiry, completed amendments and replacement laws need no repeal edition.
+    A new edition in force after the lapse restores the same law_id. Older
+    corpora without the lapse register remain usable.
+    """
+    if not law_id:
+        return None
+    try:
+        r = conn.execute("SELECT lapsed_on, reason FROM st_lapsed WHERE law_id=?", (law_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not r or r[0] > as_of_iso:
+        return None
+    if conn.execute("SELECT 1 FROM st_statutes WHERE law_id=? AND effective_date>=? AND effective_date<=? "
+                    "LIMIT 1", (law_id, r[0], as_of_iso)).fetchone():
+        return None
+    return {"effective_date": r[0], "change_kind": f"효력 상실({_LAPSE_REASONS.get(r[1], r[1])})"}
+
+
+def _repeal_label(conn: sqlite3.Connection, law_id: str | None) -> str:
+    """Label an inactive law after `_repealed_sids` has made the verdict."""
+    today = _today_iso()
+    r = conn.execute("SELECT change_kind FROM st_statutes WHERE law_id=? AND effective_date<=? "
+                     "ORDER BY effective_date DESC LIMIT 1", (law_id, today)).fetchone() if law_id else None
+    if r and r[0] and '폐지' in str(r[0]):
+        return "폐지"
+    lapse = _lapse(conn, law_id, today)
+    return lapse["change_kind"] if lapse else "폐지"
 
 
 def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None) -> list:
@@ -764,7 +815,7 @@ def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | No
            ORDER BY effective_date DESC LIMIT 1""",
         (law_id, target_date),
     ).fetchone()
-    return dict(r) if r else None
+    return dict(r) if r else _lapse(conn, law_id, target_date)
 
 
 # ---------- article previews for the list mode ----------
@@ -1014,6 +1065,7 @@ def _search_statutes(
                 "preview": preview,
                 # Is this row the law's current edition, and if not, what is.
                 "is_repealed": r["id"] in repealed,
+                "repeal_label": _repeal_label(conn, r["law_id"]) if r["id"] in repealed else None,
                 "current": cur_refs.get(r["id"]),
                 # The evidence `_merge_law_notice_matches` reads. On names
                 # alone the merge undoes the corpus-internal order (measured
@@ -2040,7 +2092,9 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                 lines.append(f"  현행 아님 — 이 법의 현행은 {tail}, "
                              f"statute_id={cur.get('id')}")
             elif m.get("is_repealed"):
-                lines.append("  폐지된 법령 — 현행 후속본이 없습니다")
+                label = m.get("repeal_label") or "폐지"
+                lines.append("  폐지된 법령 — 현행 후속본이 없습니다" if label == "폐지"
+                             else f"  {label} — 지금은 효력이 없는 법령입니다")
             url = _statute_web_url(m)
             if url:
                 lines.append(f"  url: {url}")
@@ -2109,7 +2163,8 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append(f"- 문언 기준: {eff} 시행본{extra}")
         rep = resp.get("repealed")
         if rep and rep.get("note"):
-            lines.append(f"- 폐지: {rep['note']}")
+            label = "폐지" if "폐지" in str(rep.get("change_kind") or "") else "효력 상실"
+            lines.append(f"- {label}: {rep['note']}")
 
     if resp.get("content_format"):
         lines.append(f"## content_format: {resp['content_format']}")
@@ -2167,6 +2222,22 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _bounded_response_md(resp: dict[str, Any]) -> str:
+    """Bound the delivered response and explain how to retrieve omitted text.
+
+    Shorten at a line boundary where possible. The notice is part of the
+    budget, and responses within the limit are preserved byte for byte.
+    """
+    md = _format_response_md(resp)
+    if len(md) <= RESPONSE_MAX_CHARS:
+        return md
+    note = (f"\n\n- message: 응답이 {RESPONSE_MAX_CHARS:,}자를 넘어 **꼬리를 생략**했습니다"
+            f"(전체 {len(md):,}자). 빠진 조문·outline 은 articles=[...] 로 나눠 재호출하세요.")
+    keep = RESPONSE_MAX_CHARS - len(note)
+    cut = md.rfind("\n", 0, max(keep, 0))
+    return md[:cut if cut > 0 else max(keep, 0)].rstrip() + note
+
+
 # ---------- public tool ----------
 
 def statute_lookup(
@@ -2210,6 +2281,8 @@ def statute_lookup(
     응답: markdown-KV. 상세 조문·행정규칙 본문은 `text_kind: 공식 … 원문`으로 표시되며 그대로
     직접인용할 수 있습니다. 답에 쓴 조문은 직접 인용이든 요약이든 반환 url(법령/조문 페이지)을
     링크로 함께 제시하세요.
+    응답이 지나치게 길면 **꼬리를 생략하고 그 사실과 사유를 응답 끝에 알립니다** — 그때는
+    생략된 조문을 articles 로 나눠 재호출하세요(생략은 침묵하지 않습니다).
 
     Args:
       query: 법령명·행정규칙명 또는 본문 키워드. id 모를 때 검색용. 받은 목록에서 id 를 골라 재호출.
@@ -2239,7 +2312,7 @@ def statute_lookup(
         # mistakes. Folding the first into missing_input leaves the caller no
         # reason not to send the same malformed id again.
         if statute_id is not None:
-            return _format_response_md({
+            return _bounded_response_md({
                 "status": "bad_statute_id",
                 "input": {"statute_id": statute_id},
                 "message": (
@@ -2248,7 +2321,7 @@ def statute_lookup(
                     "글자 그대로 넘기거나, query 로 다시 검색하세요."
                 ),
             })
-        return _format_response_md({
+        return _bounded_response_md({
             "status": "missing_input",
             "message": (
                 "query(법령명·키워드) 또는 statute_id(검색이 준 식별자) 중 하나는 필요합니다. "
@@ -2291,7 +2364,7 @@ def statute_lookup(
             note = f"{', '.join(unsupported)} 는 제외했습니다. {_UNSUPPORTED_UNIT_HINT}"
             prev = resp.get("message")
             resp["message"] = note if not prev else f"{prev} · {note}"
-        return _format_response_md(resp)
+        return _bounded_response_md(resp)
     finally:
         conn.close()
 

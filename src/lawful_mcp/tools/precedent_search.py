@@ -159,6 +159,60 @@ def _extract_case_number(query: str) -> str | None:
     return q if _CASE_NO_RE.fullmatch(q) else None
 
 
+# Joined cases can abbreviate later numbers: '2009다84608, 84615' or
+# '85다카1181(본소),1182(반소)'. Some rows also prefix the court's name.
+# Parse the components instead of accepting a substring: '93다373' must
+# never stand in for the different case '93다37342'.
+_CASE_NO_PART_RE = re.compile(r"(?<!\d)(\d{2,4})([가-힣]{1,5})(\d+)(?!\d)")
+_CASE_NO_TAIL_RE = re.compile(r"(\d+)(?:\(.*)?")
+# Select the normalised expression, not the original column, so SQLite
+# scans the case-number index rather than the table containing full bodies.
+# Measured cold reads were 8.9s vs 0.11s; warm reads were 0.22s vs 0.016s.
+# The expression must match idx_prec_cases_casenum_norm.
+_CASE_NO_CANDIDATES_SQL = (
+    "SELECT id, REPLACE(case_number,' ','') FROM prec_cases "
+    "WHERE REPLACE(case_number,' ','') LIKE ? AND REPLACE(case_number,' ','') LIKE ?"
+)
+
+
+def _case_number_parts(stored: str) -> set[str]:
+    """Expand joined case numbers, inheriting the year and type when omitted."""
+    parts: set[str] = set()
+    head = ""
+    for tok in re.split(r"[,·]", re.sub(r"\s+", "", stored or "")):
+        found = list(_CASE_NO_PART_RE.finditer(tok))
+        if found:
+            parts.update(m.group(0) for m in found)
+            head = found[-1].group(1) + found[-1].group(2)
+        elif head and (tail := _CASE_NO_TAIL_RE.fullmatch(tok)):
+            parts.add(head + tail.group(1))
+    return parts
+
+
+def _case_number_ids(conn: sqlite3.Connection, cno: str, limit: int) -> list[int]:
+    """Return exact matches, or joined-case members if no exact row exists.
+
+    Exact lookups use the expression index directly. Component matching
+    scans that index only when the direct lookup misses.
+    """
+    rows = conn.execute(
+        "SELECT id FROM prec_cases WHERE REPLACE(case_number,' ','')=? ORDER BY id LIMIT ?",
+        (cno, limit),
+    ).fetchall()
+    if rows:
+        return [r[0] for r in rows]
+    m = _CASE_NO_PART_RE.fullmatch(cno)
+    if not m:
+        return []
+    # Narrow candidates by both the year/type and serial, then parse them.
+    cands = conn.execute(
+        _CASE_NO_CANDIDATES_SQL, (f"%{m.group(1)}{m.group(2)}%", f"%{m.group(3)}%"),
+    ).fetchall()
+    hits = sorted((r for r in cands if cno in _case_number_parts(r[1])),
+                  key=lambda r: (len(r[1]), r[0]))
+    return [r[0] for r in hits[:limit]]
+
+
 # ---------- court level: normalise, and say so when it cannot ----------
 # The column holds four values. A caller naturally passes a court's name
 # instead ("High Court", "District Court"), which matches nothing and makes
@@ -1108,22 +1162,14 @@ def precedent_search(
         # two arguments' jobs distinct is what makes each of them
         # predictable. A citation passed in that argument is normalised to
         # the number it contains.
+        cno_miss = None
         if cno:
-            id_rows = conn.execute(
-                "SELECT id FROM prec_cases WHERE REPLACE(case_number,' ','')=? ORDER BY id LIMIT ?",
-                (cno, LIMIT),
-            ).fetchall()
-            if not id_rows:  # 병합사건('2015두38917·38924') 등은 부분일치로
-                id_rows = conn.execute(
-                    "SELECT id FROM prec_cases WHERE REPLACE(case_number,' ','') LIKE ? "
-                    "ORDER BY length(case_number), id LIMIT ?",
-                    (f"%{cno}%", LIMIT),
-                ).fetchall()
-            if id_rows:
-                matches = _hydrate(
-                    conn, [r["id"] for r in id_rows], court_level, year_from, year_to,
-                    cap=LIMIT, court_name=court_name,
-                )
+            ids = _case_number_ids(conn, cno, LIMIT)
+            matches = _hydrate(
+                conn, ids, court_level, year_from, year_to,
+                cap=LIMIT, court_name=court_name,
+            )
+            if matches:
                 # A case-number lookup has no query terms to choose by, so
                 # the first item stands as the representative issue.
                 cno_terms = _preview_terms(query) if query else []
@@ -1135,21 +1181,26 @@ def precedent_search(
                     )
                     _set_holding(m, cno_terms)
                     _drop_preview_internals(m)
-                if matches:
-                    return _format_response_md({"status": "ok", "matches": matches})
-            if case_number and not query:
-                # Case number given, nothing found, and no query to fall
-                # back on: say so instead of returning empty.
+                return _format_response_md({"status": "ok", "matches": matches})
+            # A number excluded by filters is different from an absent one.
+            # Neither means the judgment itself does not exist.
+            cno_miss = (
+                f"사건번호 '{case_number}' 판례는 있으나 지정한 심급·법원·연도 조건에 맞지 않습니다"
+                if ids else
+                f"사건번호 '{case_number}' 에 해당하는 판례를 찾지 못했습니다"
+                "(번호가 틀렸거나 코퍼스에 수록되지 않은 판결)"
+            )
+            if not query:
                 return _format_response_md({
                     "status": "ok",
-                    "message": (
-                        f"사건번호 '{case_number}' 에 해당하는 판례를 찾지 못했습니다. "
-                        "사건번호를 확인하거나 사실관계 키워드(query)로 재검색하세요."
+                    "message": cno_miss + (
+                        ". 조건을 빼고 다시 조회하세요." if ids else
+                        ". 사건번호를 확인하거나 사실관계 키워드(query)로 재검색하세요."
                     ),
                     "matches": [],
                 })
-            # Otherwise fall through to keyword search — the number may be
-            # mistyped or formatted differently.
+            # Keyword fallback is labelled below so its first result is not
+            # mistaken for the requested case.
 
         # ----- keyword search -----
 
@@ -1208,11 +1259,12 @@ def precedent_search(
                 "matches": matches,
                 "_debug": {"n_tri": len(tri_ids), "n_morph": len(morph_ids), "mode": "tri+morph_rrf"},
             }
-            # Say what was ignored and why, rather than returning a bare
-            # empty result the caller cannot diagnose.
+            # Warn even when a case number in the query returns results:
+            # those judgments may merely cite the requested case.
             notes = [court_level_note]
-            if not matches:
-                notes.append(_case_no_in_query_hint(query))
+            if cno_miss:
+                notes.append(f"{cno_miss} — 아래는 query 키워드로 찾은 판례입니다")
+            notes.append(_case_no_in_query_hint(query))
             notes = [n for n in notes if n]
             if notes:
                 resp["note"] = " / ".join(notes)
