@@ -43,6 +43,24 @@ def test_repeal_does_not_depend_on_the_backfill_register(corpus):
     assert statutes._repeal_label(corpus, "repealed") == "폐지"
 
 
+def test_reenactment_ends_repeal_without_rewriting_the_repealed_interval(corpus):
+    corpus.execute("INSERT INTO st_statutes VALUES (8,'repealed','20260915','현행','제정')")
+    assert statutes._is_repealed_at(corpus, "repealed", "20260929") is None
+    assert not statutes._is_repealed_as_of(corpus, "repealed", "20260929")
+    assert statutes._repealed_sids(corpus, [1, 2, 8]) == set()
+    assert statutes._is_repealed_at(corpus, "repealed", "20260910") == {
+        "effective_date": "20260901", "change_kind": "폐지"}
+    assert statutes._is_repealed_as_of(corpus, "repealed", "20260910")
+
+
+def test_combined_repeal_and_enactment_is_a_living_law(corpus):
+    corpus.execute("INSERT INTO st_statutes VALUES (8,'new','20200101','연혁','폐지제정')")
+    assert statutes._is_repealed_at(corpus, "new", "20200101") is None
+    assert not statutes._is_repealed_as_of(corpus, "new", "20200101")
+    assert statutes._repealed_sids(corpus, [8]) == set()
+    assert statutes._is_repealed_at(corpus, None, "20260929") is None
+
+
 @pytest.mark.parametrize("reason, label", [
     ("sunset", "유효기간 만료"),
     ("amending_act", "일괄개정 반영 완료"),

@@ -491,12 +491,57 @@ def _get_historic_article(
     return None
 
 
+def _pending_article(
+    conn: sqlite3.Connection, law_id: str, as_of_iso: str, art_no: int, art_br: int | None,
+) -> dict[str, Any] | None:
+    """Find the earliest pending edition containing this article number.
+
+    Return its effective date, title and branch. With no branch requested,
+    consider every branch, preferring the main article on the same date.
+    """
+    q = ("SELECT s.effective_date, a.title, a.article_branch, a.article_text FROM st_articles a "
+         "JOIN st_statutes s ON s.id=a.statute_id "
+         "WHERE s.law_id=? AND s.history_status='시행예정' AND s.effective_date>? "
+         "AND a.article_no_num=?")
+    params: list[Any] = [law_id, as_of_iso, art_no]
+    if art_br is not None:
+        q += " AND COALESCE(a.article_branch,0)=?"
+        params.append(art_br)
+    for r in conn.execute(q + " ORDER BY s.effective_date, COALESCE(a.article_branch,0)", params):
+        if not _is_structural_heading(r['article_text']):
+            return {"effective_date": r['effective_date'], "title": r['title'],
+                    "branch": r['article_branch'] or 0}
+    return None
+
+
+def _same_title(a: Any, b: Any) -> bool:
+    """Compare article titles ignoring whitespace and middle-dot variants."""
+    return bool(a) and _norm_law_name(a) == _norm_law_name(b)
+
+
+def _is_repeal_kind(change_kind: Any) -> bool:
+    """True for repeal editions, excluding combined repeal and enactment.
+
+    '폐지제정' enacts this law while repealing its predecessor. Treating it
+    as a repeal misclassified 19 current laws. Status checks and the charge
+    index share this rule; snapshot selection has a separate constraint
+    documented in `_pick_current_version`.
+    """
+    ck = str(change_kind or "")
+    return "폐지" in ck and "제정" not in ck
+
+
 def _pick_current_version(conn: sqlite3.Connection, group: list, as_of_iso: str) -> dict | None:
     """Pick the one version of a law that was current on a given date.
 
     In order: keep versions in force by that date (or all of them, for a
     law whose only rows are future amendments); prefer one that has not been
     repealed; then prefer the consolidated snapshot.
+
+    Unlike `_is_repeal_kind`, snapshot selection also excludes '폐지제정'
+    when another candidate exists. Including those rows changes the chosen
+    baseline for eight laws, both adding and dropping historical articles.
+    Revisit this only after comparing the official full texts.
 
     That last step is the one that matters. An amendment row holds only the
     articles it changed — sometimes a single article — and the status label
@@ -537,6 +582,51 @@ def _resolve_current_statute_id(
     ).fetchall()
     chosen = _pick_current_version(conn, group, as_of_iso)
     return chosen['id'] if chosen else None
+
+
+def _articles_in_force(
+    conn: sqlite3.Connection, law_id: str, as_of_iso: str,
+) -> set[tuple[int, int]] | None:
+    """Article keys in force on a date: a full baseline plus later amendments.
+
+    An article-by-article history walk finds the last edition containing a
+    number even if a full revision removed it without a deletion marker.
+    This affected 7,730 numbers across 2,655 laws. Restrict membership to the
+    baseline plus later deltas, while still resolving each article's newest
+    wording through `_get_historic_article`.
+
+    Historical partial amendments are never baselines: a large delta can
+    outnumber the original full text while omitting unchanged articles.
+    Historical enactments and full revisions remain eligible.
+
+    Return None if the baseline lacks article 1 or has less than 70% number
+    density. The caller then keeps the history walk: mistaking sparse deltas
+    for full texts previously caused missing articles in 86 of 89 laws.
+    """
+    group = conn.execute(
+        "SELECT id, effective_date, history_status, change_kind, mst "
+        "FROM st_statutes WHERE law_id=? AND effective_date <= ?",
+        (law_id, as_of_iso),
+    ).fetchall()
+    candidates = [r for r in group
+                  if r['history_status'] != '연혁'
+                  or any(k in str(r['change_kind'] or '') for k in ('제정', '전부개정'))]
+    base = _pick_current_version(conn, candidates, as_of_iso) if candidates else None
+    if base is None:
+        return None
+    keys = {(r[0], r[1] or 0) for r in conn.execute(
+        "SELECT article_no_num, article_branch FROM st_articles "
+        "WHERE statute_id=? AND article_no_num IS NOT NULL", (base['id'],))}
+    nums = {n for n, _ in keys if n > 0}
+    if 1 not in nums or len(nums) < 0.7 * max(nums):
+        return None
+    keys.update((r[0], r[1] or 0) for r in conn.execute(
+        """SELECT a.article_no_num, a.article_branch
+           FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id
+           WHERE s.law_id=? AND s.effective_date > ? AND s.effective_date <= ?
+             AND a.article_no_num IS NOT NULL""",
+        (law_id, base['effective_date'] or "", as_of_iso)))
+    return keys
 
 
 def _fmt_eff_iso(eff: Any) -> str:
@@ -700,23 +790,12 @@ def resolve_web_law_id(
 def _is_repealed_as_of(
     conn: sqlite3.Connection, law_id: str | None, as_of_iso: str,
 ) -> bool:
-    """Was the law repealed as of that date?
-    Decided from the latest version in force by then. A law repealed and
-    later re-enacted under the same id reads as not repealed, which is
-    correct. The whole history is consulted, so a partial result set cannot
-    hide the repeal.
+    """Use the same repeal or lapse verdict for search and article lookup.
+
+    The full history is consulted, so a partial result set cannot hide a
+    repeal or a later re-enactment under the same law id.
     """
-    if not law_id:
-        return False
-    r = conn.execute(
-        """SELECT change_kind FROM st_statutes
-           WHERE law_id=? AND effective_date<=?
-           ORDER BY effective_date DESC LIMIT 1""",
-        (law_id, as_of_iso),
-    ).fetchone()
-    if r and r['change_kind'] and '폐지' in str(r['change_kind']):
-        return True
-    return _lapse(conn, law_id, as_of_iso) is not None
+    return bool(law_id) and _is_repealed_at(conn, law_id, as_of_iso) is not None
 
 
 # Reasons a law can lose effect without a repeal edition.
@@ -747,13 +826,9 @@ def _lapse(conn: sqlite3.Connection, law_id: str | None, as_of_iso: str) -> dict
 
 def _repeal_label(conn: sqlite3.Connection, law_id: str | None) -> str:
     """Label an inactive law after `_repealed_sids` has made the verdict."""
-    today = _today_iso()
-    r = conn.execute("SELECT change_kind FROM st_statutes WHERE law_id=? AND effective_date<=? "
-                     "ORDER BY effective_date DESC LIMIT 1", (law_id, today)).fetchone() if law_id else None
-    if r and r[0] and '폐지' in str(r[0]):
-        return "폐지"
-    lapse = _lapse(conn, law_id, today)
-    return lapse["change_kind"] if lapse else "폐지"
+    rep = _is_repealed_at(conn, law_id, _today_iso()) if law_id else None
+    # Preserve a lapse's reason; repeals and backfilled inactive laws use the short label.
+    return rep["change_kind"] if rep and not _is_repeal_kind(rep["change_kind"]) else "폐지"
 
 
 def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None) -> list:
@@ -803,19 +878,24 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
     return ordered
 
 
-def _is_repealed_at(conn: sqlite3.Connection, law_id: str, offense_iso: str | None) -> dict | None:
-    """Was the law repealed or expired as of that date, or today?
+def _is_repealed_at(conn: sqlite3.Connection, law_id: str | None, offense_iso: str | None) -> dict | None:
+    """Return a repeal or lapse's date and kind, or None for a living law.
 
-    Returns the repeal's date and kind, or None.
+    Only the latest edition by the cutoff can establish repeal. Searching
+    for any historical repeal would mislabel a subsequently re-enacted law.
     """
+    if not law_id:
+        return None
     target_date = offense_iso or '99999999'
     r = conn.execute(
         """SELECT effective_date, change_kind FROM st_statutes
-           WHERE law_id=? AND effective_date<=? AND change_kind LIKE '%폐지%'
+           WHERE law_id=? AND effective_date<=?
            ORDER BY effective_date DESC LIMIT 1""",
         (law_id, target_date),
     ).fetchone()
-    return dict(r) if r else _lapse(conn, law_id, target_date)
+    if r and _is_repeal_kind(r['change_kind']):
+        return dict(r)
+    return _lapse(conn, law_id, target_date)
 
 
 # ---------- article previews for the list mode ----------
@@ -1381,7 +1461,8 @@ def _outline_statute(
                ORDER BY a.article_no_num, a.article_branch, s.effective_date DESC""",
             (law_id, offense_iso),
         ).fetchall()
-        # Keep the newest row per article; already ordered by date.
+        # Keep the newest row per article, excluding numbers removed by then.
+        in_force = _articles_in_force(conn, law_id, offense_iso)
         seen: set[tuple] = set()
         articles: list[dict] = []
         for r in rows:
@@ -1389,6 +1470,8 @@ def _outline_statute(
             if key in seen:
                 continue
             seen.add(key)
+            if in_force is not None and key not in in_force:
+                continue
             articles.append({
                 'no': r['article_no'], 'no_num': r['article_no_num'],
                 'branch': r['article_branch'], 'title': r['title'],
@@ -1734,10 +1817,14 @@ def _detail_statute_at_date(
     law_id = meta['law_id']
     # Check whether the law was repealed by then.
     repealed = _is_repealed_at(conn, law_id, offense_iso)
+    # None leaves the history walk unrestricted when no reliable baseline exists.
+    in_force = _articles_in_force(conn, law_id, offense_iso)
 
     articles: list[dict] = []
     missing: list[str] = []
     missing_specs: list[tuple[int, int | None]] = []   # for the `missing_neighbors` hint
+    # A vanished number needs its last edition's date, not a claim it never existed.
+    vanished: dict[str, str] = {}
     for num, branch in specs:
         # No branch requested: resolve the article and every branch under
         # it, each at its own last change.
@@ -1751,21 +1838,46 @@ def _detail_statute_at_date(
                 (law_id, num, offense_iso),
             ).fetchall()
             branches = sorted({r['article_branch'] or 0 for r in branches_rows})
-            if not branches:
+            alive = (branches if in_force is None
+                     else [br for br in branches if (num, br) in in_force])
+            if not alive:
                 missing.append(f"{num}")
                 missing_specs.append((num, None))
+                old_effs = [r['effective_date'] for r in (
+                    _get_historic_article(conn, law_id, num, br, offense_iso)
+                    for br in branches) if r]
+                if old_effs:
+                    vanished[f"{num}"] = max(old_effs)
                 continue
-            for br in branches:
+            for br in alive:
                 r = _get_historic_article(conn, law_id, num, br, offense_iso)
                 if r:
                     articles.append(_format_historic_article_row(r))
         else:
             r = _get_historic_article(conn, law_id, num, branch, offense_iso)
+            if r and in_force is not None and (num, branch) not in in_force:
+                vanished[f"{num}-{branch}"] = r['effective_date']
+                r = None
             if r:
                 articles.append(_format_historic_article_row(r))
             else:
                 missing.append(f"{num}-{branch}")
                 missing_specs.append((num, branch))
+
+    # Distinguish articles awaiting commencement from old, removed numbers.
+    pending: dict[str, str] = {}
+    for num, branch in missing_specs:
+        key = f"{num}" if branch is None else f"{num}-{branch}"
+        hit = _pending_article(conn, law_id, offense_iso, num, branch)
+        if hit is None:
+            continue
+        pending[key] = hit["effective_date"]
+        # A delayed article can already appear in a promulgated amendment.
+        # Matching titles identify that case; a different title means a new
+        # article reusing an old number, so both notices remain relevant.
+        last = _get_historic_article(conn, law_id, num, hit["branch"], offense_iso)
+        if key in vanished and last and _same_title(last["title"], hit["title"]):
+            del vanished[key]
 
     out = {
         "mode": "detail",
@@ -1780,8 +1892,13 @@ def _detail_statute_at_date(
     }
     if asked_iso:
         out["offense_date"] = asked_iso
+    if vanished:
+        out["vanished"] = vanished
+    if pending:
+        out["pending"] = pending
     if missing:
-        nbrs = _neighbor_articles(conn, law_id, offense_iso, missing_specs)
+        nbrs = _neighbor_articles(conn, law_id, offense_iso, missing_specs,
+                                  in_force=in_force)
         if nbrs:
             out["missing_neighbors"] = nbrs
     if repealed:
@@ -1980,9 +2097,14 @@ _NEIGHBOR_LIMIT = 3
 def _neighbor_articles(
     conn: sqlite3.Connection, law_id: str | None, as_of_iso: str | None,
     specs: list[tuple[int, int | None]], limit: int = _NEIGHBOR_LIMIT,
+    *, in_force: set[tuple[int, int]] | None = None,
 ) -> list[str]:
     """Missing article specs -> the article labels that **do** exist around
-    them (nearest first, at most `limit`)."""
+    them (nearest first, at most `limit`).
+
+    When membership is known, omit vanished numbers so the hint does not
+    send the caller back to another article that no longer exists.
+    """
     if not law_id or not specs:
         return []
     rows = conn.execute(
@@ -1992,7 +2114,9 @@ def _neighbor_articles(
         (law_id, as_of_iso or "99999999"),
     ).fetchall()
     have = sorted({(r["article_no_num"], r["article_branch"] or 0, r["article_no"])
-                   for r in rows})
+                   for r in rows
+                   if in_force is None
+                   or (r["article_no_num"], r["article_branch"] or 0) in in_force})
     keys = [(n, b) for n, b, _ in have]
     picked: dict[tuple[int, int], str] = {}
     for num, branch in specs:
@@ -2163,7 +2287,7 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append(f"- 문언 기준: {eff} 시행본{extra}")
         rep = resp.get("repealed")
         if rep and rep.get("note"):
-            label = "폐지" if "폐지" in str(rep.get("change_kind") or "") else "효력 상실"
+            label = "폐지" if _is_repeal_kind(rep.get("change_kind")) else "효력 상실"
             lines.append(f"- {label}: {rep['note']}")
 
     if resp.get("content_format"):
@@ -2212,7 +2336,33 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             # Give the fact and the numbers that *are* there, and the round
             # trip ends here.
             lines.append(f"## 없는 조문: {', '.join(str(x) for x in missing)}")
-            lines.append("- 현행·연혁본 어디에도 이 번호의 조문이 없습니다.")
+            vanished = resp.get("vanished") or {}
+            pending = resp.get("pending") or {}
+            od = resp.get("offense_date")
+            never = [str(x) for x in missing if str(x) not in vanished and str(x) not in pending]
+            if never:
+                lines.append("- 현행·연혁본 어디에도 이 번호의 조문이 없습니다." if len(never) == len(missing)
+                             else f"- {', '.join(never)}: 현행·연혁본 어디에도 없는 번호입니다.")
+            if vanished:
+                old = ", ".join(f"{k}({_fmt_eff_iso(v)}판까지)" for k, v in vanished.items())
+                if od:
+                    # Preserve the requested date for the outline; use the
+                    # old edition's date only to retrieve the vanished text.
+                    lines.append(
+                        f"- {old}: {_fmt_eff_iso(od)} 시점에는 없는 옛 번호입니다 — 개정으로 조문이 옮겨졌거나 "
+                        "사라졌습니다. 그 시점의 번호는 같은 offense_date 로 조문 개요(번호·제목)를 받아 확인하고, "
+                        "그 번호가 있던 때의 문언이 필요하면 괄호 속 날짜를 offense_date 로 주세요.")
+                else:
+                    lines.append(
+                        f"- {old}: 현행에는 없는 옛 번호입니다 — 개정으로 조문이 옮겨졌거나 사라졌습니다. "
+                        "찾는 내용의 지금 번호는 statute_id 만으로 조문 개요(번호·제목)를 받아 확인하고, "
+                        "옛 판례가 인용한 그때 문언이 필요하면 offense_date 를 주세요.")
+            if pending:
+                soon = ", ".join(f"{k}({_fmt_eff_iso(v)} 시행 예정)" for k, v in pending.items())
+                when = f"{_fmt_eff_iso(od)} 시점에는" if od else "아직"
+                lines.append(
+                    f"- {soon}: {when} 시행 전인 조문입니다 — 시행될 문언은 괄호 속 시행일을 "
+                    "offense_date 로 주면 볼 수 있습니다.")
             nbrs = resp.get("missing_neighbors")
             if nbrs:
                 lines.append(f"- 근처 조문: {' · '.join(nbrs)}")

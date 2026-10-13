@@ -79,6 +79,16 @@ def coerce_int(v: Any) -> int | None:
         if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
             _warn(v, "int")
             return int(s)
+        # Treat a JSON-encoded array like an actual array. Dropping '[2]'
+        # from act_count would silently omit the concurrence adjustment.
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except (ValueError, RecursionError):
+                parsed = None
+            if isinstance(parsed, list):
+                _warn(v, "int")
+                return coerce_int(parsed[0]) if parsed else None
         _warn(v, "int")
         return None
     if isinstance(v, (list, tuple)) and v:

@@ -4,6 +4,7 @@ No network and no API keys: every test here runs on data/fixture.db alone.
 """
 from __future__ import annotations
 
+import json
 import re
 from types import SimpleNamespace
 
@@ -735,6 +736,33 @@ def test_sentencing_analysis_calculates_without_reprinting_the_guideline(ctx):
     assert "- 선고 가능 범위(6~18월) 안: True" in out
     for repeated in ("## 양형 판단 흐름", "## 특별양형인자", "## 실선고 통계"):
         assert repeated not in out, repeated
+
+
+def test_numeric_args_encoded_as_json_strings_preserve_their_values():
+    """The direct tool schema accepts strings; coercion must retain the number.
+
+    The MCP wrapper keeps its narrower integer contract. Direct pydantic-ai
+    callers can send encoded arrays through the shared tool schema.
+    """
+    from pydantic_ai.tools import Tool
+    from lawful_mcp.tools._coerce import coerce_int
+
+    validate = Tool(tools.sentencing_analysis).function_schema.validator.validate_json
+    for name in ("sg_category_id", "act_count", "reference_year", "sentence_months", "fine_amount"):
+        wire = validate(json.dumps({"charge": "사기", name: "[2]"}))[name]
+        assert wire == "[2]", name
+        assert coerce_int(wire) == coerce_int([2]) == 2, name
+    assert coerce_int(' [ "24", "36" ] ') == coerce_int(["24", "36"]) == 24
+    for text in ("[]", "[별표 1]", "[1] 사기", "[2"):
+        assert coerce_int(text) is None, text
+
+
+def test_json_string_numbers_keep_concurrence_and_sentence_verification(ctx):
+    base = dict(charge="사기", guideline_type="일반사기 2유형")
+    plain = tools.sentencing_analysis(ctx, **base, act_count=2, sentence_months=40)
+    encoded = tools.sentencing_analysis(ctx, **base, act_count="[2]", sentence_months="[40]")
+    assert encoded == plain
+    assert "경합" in plain and "## 선고형 검증" in plain
 
 
 def test_sentencing_analysis_hands_back_unknown_factor_keys(ctx):

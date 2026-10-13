@@ -37,7 +37,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, TypeVar
 
 from .._charge import norm_charge
-from .statutes import _STATUTE_ALIASES, _strip_dots
+from .statutes import _STATUTE_ALIASES, _is_repeal_kind, _strip_dots
 
 # Special-act charge pattern: <statute>위반(<substantive>). Bare codes (Criminal Code) are handled separately.
 _SPLIT_RE = re.compile(r"^(.+?)위반(?:\((.+)\))?$")
@@ -140,7 +140,7 @@ class LawNames:
             self.display.setdefault(n, name)
             names_by_id.setdefault(law_id, set()).add(n)
             e = str(eff or "")
-            rec = (e, n, norm_cmp(short), bool(kind and "폐지" in str(kind) and "제정" not in str(kind)))
+            rec = (e, n, norm_cmp(short), _is_repeal_kind(kind))
             if earliest.get(law_id) is None or e < earliest[law_id][0]:
                 earliest[law_id] = rec
             if status == "시행예정" or e > today:
