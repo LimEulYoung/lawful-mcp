@@ -24,13 +24,14 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-ai>=0.0.20",
     "kiwipiepy>=0.17",   # morphological index; two-syllable terms need it
+    "httpx>=0.27",       # issue reordering in precedent_search
     "uvicorn>=0.30",
     "starlette>=0.37",
 ]
 
 [project.optional-dependencies]
 # Embedding + rerank retrieval path (USE_DENSE=1). Off by default.
-dense = ["openai>=1.0", "httpx>=0.27", "sqlite-vec>=0.1"]
+dense = ["openai>=1.0", "sqlite-vec>=0.1"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

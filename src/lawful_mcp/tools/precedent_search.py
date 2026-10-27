@@ -4,7 +4,9 @@ Two retrieval paths, selected by USE_DENSE:
 
 - Lexical (the default). Two full-text indexes over the same judgments —
   character trigrams and Kiwi morphemes — each queried in OR mode and fused
-  with reciprocal rank fusion. No external service is involved.
+  with reciprocal rank fusion. No external service is involved, unless an
+  ``issue`` arrives with a key configured: then the candidate pool is
+  reordered by Jev (see "issue reordering" below).
 - Dense (opt-in). Adds an embedding KNN and a reranker, which need an
   embedding service configured.
 
@@ -23,14 +25,19 @@ term, and Korean charge names are frequently two characters (사기, 절도,
 """
 from __future__ import annotations
 
+import functools
+import logging
 import os
 import re
 import sqlite3
+import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from typing import Any, Sequence
 
+import httpx
 from pydantic_ai import RunContext
 
-from ..config import case_url_base
+from ..config import case_url_base, jev_api_key
 from ..deps import HarnessDeps, open_db
 from ._coerce import coerce_int, coerce_str
 from ._morph import kiwi as _kiwi
@@ -1084,11 +1091,150 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ---------- issue reordering (Jev) ----------
+# The candidate pool that `query` found (LIMIT * OVERSAMPLE) is reordered
+# against `issue` — the legal question the search is meant to answer. Jev
+# (TypeSafe, via OpenRouter) is asked of each case whether it decided that
+# question directly, and LIMIT cases come back in order of that probability.
+# Without an issue this stage does not run.
+#
+# Measured offline on 855 Korean bar-exam statements over the same 35
+# candidates: a correct case in the top 7 went from 75.0% (BM25) to 82.5%,
+# and at rank 1 from 44.4% to 52.9%. Given the query keywords instead, the
+# same Jev scored 77.2%, indistinguishable from chance — the gain comes from
+# the question sentence, not the reranker (bge and Qwen3 rerankers given the
+# issue land at the same level). 12% of the correct cases sit outside the
+# pool and this stage cannot reach them: finding cases is still the query's job.
+#
+# Never cut by a threshold — always LIMIT cases. A cut saves characters (-32%
+#   at 0.5), but it raises the cost of a misjudged issue, and nothing here
+#   measures that cost.
+# Never fuse with the BM25 rank (RRF). Overall hits are similar (81.9%), but
+#   on fact-pattern items the gain drops from 74.3% to 68.6% — and a user's
+#   own situation is exactly that shape.
+# Fail-open: a missing key, an error or a timeout on any request leaves that
+#   search in BM25 order.
+# What leaves the process is the public case cards and the legal question,
+#   nothing else. Putting conversation context into `issue` changes that.
+USE_JEV = os.environ.get("USE_JEV", "1") == "1"   # off: BM25 order even with an issue (restart needed)
+JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+# Pinned to a dated release: this is an alpha endpoint, so a new release
+# changes the scores. This is the release that was measured.
+JEV_MODEL = "typesafe/jev-1.14-20261014"
+# A search takes as long as its slowest parallel request. Over 2,988
+# searches: median 0.47s, p99 1.22s, max 1.91s, and 0.3% went past 1.5s. The
+# budget is never hit in normal running; it only sends a search back to BM25
+# when the upstream slows down.
+JEV_BUDGET_S = 1.5
+# Cap on Jev requests in flight. One search sends one request per candidate,
+# so this is three to four searches' worth. Beyond it requests queue, hit the
+# budget and fall back to BM25 — the cap keeps threads from piling up under load.
+JEV_MAX_INFLIGHT = 128
+# Code checks only the length (what to write is the docstring's business).
+# Measured issues: median 61 characters, max 121.
+ISSUE_MAX_CHARS = 300
+# Both questions are sent exactly as measured (whether one alone gives the
+# same probabilities was not tested). Order comes from the three-way
+# question's 관련_판단 probability. At a fixed 7 the yes/no question hits the
+# same (82.5 vs 82.6%); should a threshold ever be revisited, the three-way
+# one cuts more evenly between 0.3 and 0.5.
+_JEV_QUESTIONS = {
+    "기본": {
+        "type": "noul",
+        "instructions": "`판례`는 `찾는_내용`과 관련 있는 판례인가?",
+        "criteria": {"true": "찾는 내용과 관련 있는 판례", "false": "찾는 내용과 관련 없는 판례"},
+    },
+    "세갈래": {
+        "type": "choice",
+        "instructions": "`판례`는 `찾는_내용`과 어떤 관계인가?",
+        "criteria": {
+            "관련_판단": "`찾는_내용`의 법적 쟁점을 직접 판단한 판례",
+            "다른_쟁점": "같은 법 분야이지만 다른 쟁점을 판단한 판례",
+            "무관": "`찾는_내용`과 관련 없는 판례",
+        },
+    },
+}
+
+_log = logging.getLogger(__name__)
+
+
+@functools.cache
+def _jev_pool() -> tuple[httpx.Client, ThreadPoolExecutor]:
+    """One per process; this is where concurrent Jev requests are bounded.
+
+    Connections are reused only by searches that follow within 5 seconds
+    (httpx's default keepalive). One search's requests open their
+    connections side by side, adding tens of milliseconds, so the keepalive
+    is not raised — multiplexing them over one HTTP/2 connection made no
+    difference.
+    """
+    limits = httpx.Limits(max_connections=JEV_MAX_INFLIGHT, max_keepalive_connections=JEV_MAX_INFLIGHT)
+    return (
+        httpx.Client(timeout=JEV_BUDGET_S, limits=limits),
+        ThreadPoolExecutor(max_workers=JEV_MAX_INFLIGHT, thread_name_prefix="jev"),
+    )
+
+
+def _jev_card(match: dict[str, Any]) -> str:
+    """The case text sent to Jev: the result block exactly as the model gets
+    it (the measured condition). Sending only the holding would leave lower-
+    court judgments, which have none, scored on their case name alone."""
+    return "\n".join(_format_response_md({"status": "ok", "matches": [match]}).splitlines()[2:])
+
+
+def _jev_relevance(client: httpx.Client, key: str, issue: str, card: str) -> float:
+    resp = client.post(
+        JEV_URL,
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": JEV_MODEL, "state": {"찾는_내용": issue, "판례": card},
+              "questions": _JEV_QUESTIONS},
+    )
+    resp.raise_for_status()
+    return float(resp.json()["answers"]["세갈래"]["probabilities"]["관련_판단"])
+
+
+def _jev_scores(issue: str, cards: Sequence[str]) -> tuple[list[float] | None, str]:
+    """p(관련_판단) per card, plus a one-word outcome. If any card is missing a
+    score, no scores are returned (fail-open)."""
+    key = jev_api_key()
+    if not key:
+        return None, "no-key"
+    client, pool = _jev_pool()
+    futures = [pool.submit(_jev_relevance, client, key, issue, card) for card in cards]
+    # One failure already settles the search on BM25 order, so the rest are
+    # not waited for.
+    done, pending = wait(futures, timeout=JEV_BUDGET_S, return_when=FIRST_EXCEPTION)
+    for f in pending:
+        f.cancel()  # cancels only queued requests; ones already sent run to completion
+    # Whether a status code or a malformed body, only this search falls back.
+    e = next((f.exception() for f in done if f.exception()), None)
+    if e is not None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        return None, f"error:{type(e).__name__}" + (f":{status}" if status else "")
+    if pending:
+        return None, "timeout"
+    return [f.result() for f in futures], "ok"
+
+
+def _order_by_issue(issue: str, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """matches (in BM25 order) by relevance to issue; ties keep BM25 order.
+
+    The log records outcome, count and time only — never the issue text."""
+    t0 = time.monotonic()
+    scores, outcome = _jev_scores(issue, [_jev_card(m) for m in matches])
+    _log.info("[issue-rerank] %s n=%d %.0fms", outcome, len(matches), (time.monotonic() - t0) * 1000)
+    if scores is None:
+        return matches
+    order = sorted(range(len(matches)), key=lambda i: (-scores[i], i))
+    return [matches[i] for i in order]
+
+
 # ---------- public tool ----------
 
 def precedent_search(
     ctx: RunContext[HarnessDeps],
     query: str | None = None,
+    issue: str | None = None,
     case_number: str | None = None,
     court_level: str | None = None,
     court_name: str | None = None,
@@ -1101,7 +1247,8 @@ def precedent_search(
     필요하면 가장 관련된 결과의 id로 precedent_dive를 이어 호출해 확인합니다.
 
     언제:
-    - 유사 사실관계 판례(민사·형사·행정·가사)를 찾거나 주장·전망의 근거가 필요할 때 → query.
+    - 유사 사실관계 판례(민사·형사·행정·가사)를 찾거나 주장·전망의 근거가 필요할 때
+      → query 와 issue.
       "보통 이렇게 됩니다" 류의 전망을 기억으로 말하기 전에 먼저 부르세요.
     - 특정 사건번호가 주어졌을 때 → case_number.
     - 판례가 적용한 조문의 본문·현행 여부는 statute_lookup 으로 이어 확인하세요 — 판례는
@@ -1109,7 +1256,7 @@ def precedent_search(
 
     응답: markdown-KV.
     - `holding`은 법원이 쓴 판시사항(그 사건이 무엇을 정했는지)이라 직접인용할 수 있습니다.
-      쟁점이 여럿인 판례는 질의에 가장 가까운 항 하나만 나가며, 꼬리 `…`는 그 항이 길어
+      쟁점이 여럿인 판례는 query 에 가장 가까운 항 하나만 나가며, 꼬리 `…`는 그 항이 길어
       잘렸다는 뜻입니다(잘린 문장은 인용하지 말고 필요하면 precedent_dive로 확인하세요).
       하급심 등 판시사항이 없는 판례는 이 칸이 아예 나오지 않습니다.
     - `preview_kind` 이름에 **원문**이 있는 것만 따옴표로 직접인용할 수 있고
@@ -1117,7 +1264,10 @@ def precedent_search(
     답에 쓴 판례는 직접 인용이든 요약이든 반환 url을 링크로 함께 제시하세요.
 
     Args:
-      query: 사건번호를 뺀 사실관계·죄명·법조의 변별력 있는 명사 어간 여러 개. 2자 죄명도 지원.
+      query: 판례를 찾는 검색어. 사건번호를 뺀 사실관계·죄명·법조의 변별력 있는 명사 어간 여러 개.
+        2자 죄명도 지원.
+      issue: 찾은 판례의 순서를 정하는 질문. 이 검색으로 답을 찾으려는 법적 질문을 한 문장으로
+        주면(이 사건의 당사자·날짜·금액은 빼고) 그 질문을 직접 판단한 판례가 앞에 옵니다.
       case_number: 특정 사건번호(예 "2010다89012"). 긴 인용문이면 사건번호 부분만.
       court_level: 심급 '1심'|'2심'|'대법원'|'헌재'.
       court_name: 법원 이름·지역 부분매칭(예 "부산", "특허법원").
@@ -1125,6 +1275,7 @@ def precedent_search(
       year_to: 사건년도 범위 끝. year_from 과 함께 또는 단독 사용.
     """
     query = coerce_str(query)
+    issue = (coerce_str(issue) or "")[:ISSUE_MAX_CHARS].strip()
     case_number = coerce_str(case_number)
     court_level = coerce_str(court_level)
     court_level, court_level_note = _normalize_court_level(court_level)
@@ -1229,9 +1380,12 @@ def precedent_search(
             # Fuse the two rankings.
             rankings = [r for r in (tri_ids, morph_ids) if r]
             ids = _rrf_fuse(rankings, k=RRF_K, limit=pool_size) if rankings else []
+            # With an issue, cards are built for the whole pool, reordered,
+            # and only then cut to LIMIT (see "issue reordering").
+            reorder = bool(issue) and USE_JEV
             matches = _hydrate(
                 conn, ids, court_level, year_from, year_to,
-                cap=LIMIT, court_name=court_name,
+                cap=None if reorder else LIMIT, court_name=court_name,
             ) if ids else []
             # Prefer the FTS snippet, which sits on the matched phrase.
             snips = _fts_snippets(conn, [m["id"] for m in matches], tri_match) if (matches and tri_match) else {}
@@ -1254,6 +1408,9 @@ def precedent_search(
                 _set_preview(m, text, source)
                 _set_holding(m, terms)
                 _drop_preview_internals(m)
+            if reorder and len(matches) > 1:
+                matches = _order_by_issue(issue, matches)
+            matches = matches[:LIMIT]
             resp = {
                 "status": "ok",
                 "matches": matches,

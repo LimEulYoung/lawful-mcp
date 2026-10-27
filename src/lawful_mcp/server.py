@@ -125,7 +125,9 @@ _DESC_PRECEDENT_SEARCH = (
     "매치는 짧은 preview와 그 출처를 알리는 preview_kind를 반환합니다. "
     "본문 확인이 필요하면 가장 관련된 id로 precedent_dive를 이어 호출하세요. "
     "민·형사·행정·가사 분쟁 질의의 기본 도구이며, 주장·전망의 근거를 유사 판례의 실제 결과로 뒷받침할 때 씁니다.\n"
-    "Args: query=사실관계·죄명·법조 키워드(명사 어간 여러 개; 2자 죄명도 지원; 사건번호 제외). "
+    "Args: query=판례를 찾는 검색어 — 사실관계·죄명·법조 키워드(명사 어간 여러 개; 2자 죄명도 지원; 사건번호 제외). "
+    "issue=찾은 판례의 순서를 정하는 질문 — 이 검색으로 답을 찾으려는 법적 질문 한 문장"
+    "(이 사건의 당사자·날짜·금액은 빼고)을 주면 그 질문을 직접 판단한 판례가 앞에 옵니다. "
     "case_number=특정 사건번호로 바로 찾을 때(예 '2010다89012'; '대법원 … 선고 2010다89012 판결'이면 사건번호 부분만). "
     "court_level='1심'|'2심'|'대법원'|'헌재'. court_name=법원명·지역 부분매칭(예 '부산','특허법원'). year_from/year_to=사건년도 범위.\n"
     "url만 인용 링크로 씁니다. preview_kind 이름에 '원문'이 있는 것만 직접인용하고 요약 계열은 바꿔 쓰세요."
@@ -195,6 +197,7 @@ _DESC_PRECEDENT_DIVE = (
 )
 def precedent_search(
     query: str | None = None,
+    issue: str | None = None,
     case_number: str | None = None,
     court_level: str | None = None,
     court_name: str | None = None,
@@ -204,6 +207,7 @@ def precedent_search(
     return _t.precedent_search(
         _ctx(),
         query=query,
+        issue=issue,
         case_number=case_number,
         court_level=court_level,
         court_name=court_name,

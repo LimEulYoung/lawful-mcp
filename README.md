@@ -112,6 +112,13 @@ export DIVE_MODEL=...
 All three values are required to register `precedent_dive`. Without them,
 the other three tools still work. Restart the server after changing settings.
 
+`precedent_search` also takes an optional `issue`: the legal question the
+search is meant to answer. With `JEV_API_KEY` (an OpenRouter key) set, it sends
+each candidate's result block — public case metadata, holding and preview —
+and that question to OpenRouter's Jev endpoint, and returns the cases that
+decided the question first. Without the key, or when a request fails or takes
+longer than 1.5 seconds, results keep their keyword order.
+
 Optional dense search (`USE_DENSE=1`) sends search queries to an embedding
 endpoint and, when reranking is enabled, queries and candidate excerpts to a
 reranking endpoint. It requires the `dense` extra and corpus vectors, which

@@ -74,6 +74,136 @@ def test_precedent_search_requires_an_argument(ctx):
     assert "status" in out
 
 
+# Jev is never called here: `_jev_scores` is swapped out, so only the order
+# rule and the fail-open are measured.
+_ISSUE_QUERY = "명의신탁 매도인 악의 소유권이전등기 무효 매매 계약명의신탁"
+_ISSUE = "계약명의신탁에서 매도인이 계약 당시 선의였다가 등기 때 악의가 되면 매매계약이 무효가 되는가"
+
+
+def _case_ids(out: str) -> list[str]:
+    return re.findall(r"^- id: (\d+)$", out, re.M)
+
+
+def test_precedent_issue_reorders_the_pool_and_falls_back_to_bm25(ctx, monkeypatch):
+    """An issue reorders the whole candidate pool by Jev score and returns
+    LIMIT cases. Without scores (failure, timeout, switched off) the response
+    is character-for-character the search without an issue — that is what
+    fail-open means here."""
+    import importlib
+    ps = importlib.import_module("lawful_mcp.tools.precedent_search")
+    seen: list[list[str]] = []
+
+    def scores(fn):
+        def _fake(issue, cards):
+            assert issue == _ISSUE
+            seen.append(cards)
+            return fn(len(cards)), "ok"
+        return _fake
+
+    def _no_call(issue, cards):
+        raise AssertionError("Jev must not be called without an issue or when switched off")
+
+    monkeypatch.setattr(ps, "_jev_scores", _no_call)
+    baseline = ps.precedent_search(ctx, query=_ISSUE_QUERY)
+    assert len(_case_ids(baseline)) == ps.LIMIT
+    monkeypatch.setattr(ps, "USE_JEV", False)
+    assert ps.precedent_search(ctx, query=_ISSUE_QUERY, issue=_ISSUE) == baseline
+    monkeypatch.setattr(ps, "USE_JEV", True)
+
+    # No scores: BM25 order unchanged.
+    monkeypatch.setattr(ps, "_jev_scores", lambda issue, cards: (None, "timeout"))
+    assert ps.precedent_search(ctx, query=_ISSUE_QUERY, issue=_ISSUE) == baseline
+    # Equal scores keep BM25 order.
+    monkeypatch.setattr(ps, "_jev_scores", scores(lambda n: [0.5] * n))
+    assert ps.precedent_search(ctx, query=_ISSUE_QUERY, issue=_ISSUE) == baseline
+
+    # The whole pool is scored, and each card is the result block the model
+    # gets (the measured condition).
+    pool = seen[-1]
+    assert len(pool) > ps.LIMIT
+    assert pool[0] in baseline
+    pool_ids = [re.match(r"- id: (\d+)", c).group(1) for c in pool]
+    assert pool_ids[: ps.LIMIT] == _case_ids(baseline)
+
+    # Later cards score higher, so the pool's tail comes first, still LIMIT long.
+    monkeypatch.setattr(ps, "_jev_scores", scores(lambda n: list(range(n))))
+    reordered = ps.precedent_search(ctx, query=_ISSUE_QUERY, issue=_ISSUE)
+    assert _case_ids(reordered) == pool_ids[::-1][: ps.LIMIT]
+
+
+def test_jev_scores_fail_open(monkeypatch):
+    """A missing key, an upstream error or a blown budget returns no scores,
+    so only that search falls back to BM25 order."""
+    import importlib
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import httpx
+
+    ps = importlib.import_module("lawful_mcp.tools.precedent_search")
+
+    class _Client:
+        def __init__(self, behave):
+            self.behave = behave
+
+        def post(self, url, **kw):
+            return self.behave(kw["json"])
+
+    def _ok(body):
+        p = 0.9 if "가" in body["state"]["판례"] else 0.1
+        return httpx.Response(200, request=httpx.Request("POST", "x"),
+                              json={"answers": {"세갈래": {"probabilities": {"관련_판단": p}}}})
+
+    def _rate_limited(body):
+        return httpx.Response(429, request=httpx.Request("POST", "x"), json={})
+
+    def _slow(body):
+        _time.sleep(0.5)
+        return _ok(body)
+
+    pool = ThreadPoolExecutor(4)
+    use = lambda behave: monkeypatch.setattr(ps, "_jev_pool", lambda: (_Client(behave), pool))
+
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    assert ps._jev_scores("q", ["가", "나"]) == (None, "no-key")
+
+    monkeypatch.setenv("JEV_API_KEY", "test")
+    use(_ok)
+    assert ps._jev_scores("q", ["가", "나"]) == ([0.9, 0.1], "ok")
+    use(_rate_limited)
+    assert ps._jev_scores("q", ["가", "나"]) == (None, "error:HTTPStatusError:429")
+    # Once one request fails the search is settled on BM25 order; the slow
+    # rest is not waited for.
+    use(lambda body: _rate_limited(body) if "가" in body["state"]["판례"] else _slow(body))
+    t0 = _time.monotonic()
+    assert ps._jev_scores("q", ["가", "나"]) == (None, "error:HTTPStatusError:429")
+    assert _time.monotonic() - t0 < 0.4, "waited on the rest after a failure settled it"
+    use(_slow)
+    monkeypatch.setattr(ps, "JEV_BUDGET_S", 0.1)
+    t0 = _time.monotonic()
+    assert ps._jev_scores("q", ["가", "나"]) == (None, "timeout")
+    assert _time.monotonic() - t0 < 0.4, "waited past the budget"
+
+
+def test_precedent_issue_reaches_the_tool(monkeypatch):
+    """The MCP wrapper lists its arguments by hand. An argument present in
+    the signature but not passed on would drop a client's issue silently:
+    the search would still run, in BM25 order, and nothing would fail."""
+    import anyio
+
+    from lawful_mcp import server
+
+    seen = {}
+
+    def _stub(ctx, **kw):
+        seen.update(kw)
+        return ""
+
+    monkeypatch.setattr(tools, "precedent_search", _stub)
+    anyio.run(server.mcp.call_tool, "precedent_search", {"query": "명의신탁 매도인", "issue": "무효가 되는가"})
+    assert seen["issue"] == "무효가 되는가"
+
+
 def test_statute_lookup_by_name(ctx):
     out = tools.statute_lookup(ctx, query="형법")
     assert "형법" in out
@@ -468,6 +598,7 @@ def test_charge_is_string_and_required():
 
     for tool, field in (
         ("precedent_search", "query"),
+        ("precedent_search", "issue"),
         ("precedent_search", "case_number"),
         ("precedent_search", "court_name"),
         ("sentencing_analysis", "statute_choice"),

@@ -18,7 +18,11 @@ Environment variables:
   DIVE_MODEL         Model name to request.
   DIVE_TIMEOUT       Seconds to wait before returning a timeout status with
                      case metadata and retry guidance. Defaults to 15.
-  USE_DENSE          Set to 1 to enable the embedding + rerank retrieval
+  JEV_API_KEY        OpenRouter API key for reordering ``precedent_search``
+                     results by its ``issue`` argument. When unset, ``issue``
+                     is accepted and results keep their BM25 order.
+  USE_JEV            Set to 0 to keep BM25 order even with a key set.
+  USE_DENSE         Set to 1 to enable the embedding + rerank retrieval
                      path in ``precedent_search``. Off by default: the
                      lexical path (trigram + morpheme RRF) scored on par in
                      a known-item A/B and needs no external service.
@@ -73,6 +77,15 @@ def dive_config() -> tuple[str, str, str] | None:
     if not base_url or not model:
         return None
     return (base_url, api_key, model)
+
+
+def jev_api_key() -> str | None:
+    """Key for the ``issue`` reordering in ``precedent_search``, or None.
+
+    Read on each search that carries an ``issue``. None is a supported state:
+    the search runs and keeps its BM25 order.
+    """
+    return os.environ.get("JEV_API_KEY", "").strip() or None
 
 
 def dive_timeout_s() -> float:
