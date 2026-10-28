@@ -26,7 +26,7 @@ class DiveResult(BaseModel):
 
     summary: str = Field(
         max_length=DIVE_SUMMARY_MAX_CHARS,
-        description="질문에 대한 생성 추출 요약, 500자 이내(직접인용 아님)",
+        description="질문에 대한 추출 결과, 1,000자 이내. `>` 줄은 판결문 원문 그대로",
     )
     not_in_text: bool = Field(description="원문에 답이 명시되어 있지 않으면 True")
 

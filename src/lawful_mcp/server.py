@@ -39,7 +39,7 @@ _EXTRA_HOSTS = [
 
 _INSTRUCTIONS = (
     "한국 법률 검색 도구 모음 — 판례·법령·행정규칙(고시·훈령·예규)·양형기준 corpus 기반. "
-    "판례 검색(precedent_search) 후 필요할 때 본문 생성요약(precedent_dive), "
+    "판례 검색(precedent_search) 후 필요할 때 본문 확인(precedent_dive — 법리는 판결문 원문 그대로), "
     "법령·행정규칙 조문(statute_lookup), 양형(sentencing_analysis — 기준·인자·실선고 분포를 "
     "한 응답에, 인자를 더하면 처단형·권고형·선고형 계산). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
@@ -180,10 +180,11 @@ _DESC_SENTENCING_ANALYSIS = (
     "판례·조문 url만 인용 링크로 쓰세요."
 )
 _DESC_PRECEDENT_DIVE = (
-    "단건 판결·결정 본문 추출(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 500자 내외 생성 요약을 반환. "
-    "summary는 직접인용이 아니며 text_truncated=true이면 not_in_text도 전체 원문 부재를 확정하지 못합니다.\n"
+    "단건 판결·결정 본문 확인(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 내용을 판결문에서 찾아 1,000자 이내로 반환. "
+    "법리·판단은 `>` 로 시작하는 줄에 판결문 원문 그대로 옮기고 판결이 단 참조 판례 표기('(대법원 … 판결 참조)')를 함께 남기며, 사실관계·결론·형량은 요약합니다. "
+    "text_truncated=true이면 not_in_text도 전체 원문 부재를 확정하지 못합니다.\n"
     "Args: case_id=precedent_search 결과 id. question=공개 판례에서 추출할 쟁점·항목만(사용자 이름·주소·연락처·계정·사적 첨부사실 등 개인정보 금지).\n"
-    "url만 인용 링크로 쓰고 생성 요약인 summary 는 원문 직접인용으로 쓰지 마세요."
+    "직접인용은 `>` 줄에만 하고 나머지는 바꿔 쓰세요. 인용 링크는 반환 url만 씁니다 — 참조 판례를 링크로 달려면 그 사건번호로 precedent_search(case_number)를 불러 url을 받으세요."
 )
 
 

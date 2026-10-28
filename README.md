@@ -4,7 +4,8 @@ English | [한국어](README.ko.md)
 
 Korean case law, statutes and sentencing data as [MCP](https://modelcontextprotocol.io)
 tools. Connect an AI client to find judgments, look up statutes as of a date,
-summarise a judgment and calculate statutory and guideline sentencing ranges.
+check what a judgment held in its own words and calculate statutory and guideline
+sentencing ranges.
 
 Four read-only tools:
 

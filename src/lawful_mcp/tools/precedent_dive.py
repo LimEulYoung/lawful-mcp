@@ -114,10 +114,22 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             lines.append("- not_in_text_conclusive: false")
             lines.append("- note: 중간 원문이 생략되어 보존 구간에 없다는 뜻일 뿐, 전체 원문 부재를 확정하지 못함")
     if resp.get("summary"):
-        # One name, not four. The name carries no 원문, so the positive rule
-        # documented above `precedent_search._PREVIEW_KINDS` already makes it
-        # unquotable — no prohibition tag is added on top of that.
-        lines.append("## summary — AI 생성 요약")
+        # The result has two strands: judgment sentences the sub-agent copied
+        # onto `> ` lines (holdings, reasoning, reference citations) and a
+        # summary of the rest. Only `> ` lines may be quoted, and the tool
+        # description says so. Code does not check `> ` lines against the
+        # judgment; the sub-agent's instructions carry that, decided knowing a
+        # real-path run produced a line with one word dropped.
+        # Keep 원문 out of this header: under the positive rule documented
+        # above `precedent_search._PREVIEW_KINDS` it would make the summary
+        # lines read as quotable too. Do not go back to 'AI 생성 요약' either —
+        # under that header there was no way to quote a holding verbatim, and
+        # the Supreme Court citations lower courts attach fell out of the
+        # summary, so answers cited the lower-court number as the source of
+        # the rule. Measured: Supreme Court numbers in dives on lower-court
+        # cases 0/24 -> 15/26; 229 of 236 `> ` lines verbatim, the rest
+        # differing only in punctuation around a citation bracket.
+        lines.append("## 판결문 확인 결과")
         lines.append(resp["summary"])
 
     return "\n".join(lines)
@@ -129,7 +141,7 @@ async def precedent_dive(
     question: str,
 ) -> str:
     """단건 판결·결정 본문 추출(sub-agent 위임) — search preview가 부족할 때 case id로
-    호출하면 question에 답하는 500자 내외 생성 요약을 반환합니다(직접인용 아님).
+    호출하면 question에 답하는 내용을 판결문에서 찾아 1,000자 이내로 반환합니다.
 
     언제:
     - 한 case의 구체 판단 이유·결론·역할·피해규모 등이 preview에 없을 때.
@@ -139,8 +151,8 @@ async def precedent_dive(
       세션 정보나 사적 사실을 넣지 마세요.
     - text_truncated=true일 때 not_in_text는 보존된 앞·뒤 구간에 없다는 뜻일 뿐입니다.
 
-    응답: markdown-KV. summary는 생성 요약이므로 직접인용하지 말고, 답에 쓴 판례는 반환
-    url을 함께 제시하세요.
+    응답: markdown-KV. `>` 로 시작하는 줄은 판결문 원문 그대로이고, 판결이 단 참조 판례 표기를
+    담습니다. 답에 쓴 판례는 반환 url을 링크로 함께 제시하세요.
 
     Args:
       case_id: precedent_search 결과의 id 필드.

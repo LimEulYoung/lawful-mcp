@@ -1080,3 +1080,59 @@ def test_precedent_dive_times_out_instead_of_hanging(ctx, monkeypatch):
     started = asyncio.run(dive.precedent_dive(slow_ctx, case_id=case_id, question="쟁점"))
     assert "## status: timeout" in started, started
     assert "본문은 읽지 못한 것으로 취급" in started, started
+
+
+def test_dive_summary_is_hard_capped_and_truncation_absence_is_nonconclusive():
+    import importlib
+
+    from lawful_mcp.schemas import DIVE_SUMMARY_MAX_CHARS, DiveResult
+
+    dive = importlib.import_module("lawful_mcp.tools.precedent_dive")
+    result = DiveResult(summary="가" * (DIVE_SUMMARY_MAX_CHARS + 200), not_in_text=False)
+    assert len(result.summary) == DIVE_SUMMARY_MAX_CHARS
+    assert result.summary.endswith("…")
+
+    rendered = dive._format_response_md({
+        "status": "ok",
+        "summary": "관련 정보 없음",
+        "not_in_text": True,
+        "text_truncated": True,
+    })
+    # No 원문 in the header: only `> ` lines are quotable, and a header
+    # saying 원문 would make the summary lines read as quotable too (the
+    # positive rule). No prohibition tag or quotability field comes back either.
+    head = next(line for line in rendered.splitlines() if line.startswith("## 판결문 확인 결과"))
+    assert "원문" not in head and "AI 생성 요약" not in rendered
+    assert "quote_eligible" not in rendered and "quotation_status" not in rendered
+    assert "not_in_text_conclusive: false" in rendered
+
+
+def test_dive_quotes_holdings_verbatim_and_keeps_citations_on_every_surface():
+    """A dive returns holdings and reasoning on verbatim `> ` lines, with the
+    reference citations the judgment attached.
+
+    When it returned a summary only, the '(대법원 … 판결 참조)' a lower court
+    attaches fell out, and answers cited the lower-court number as the source
+    of the rule (Supreme Court numbers in dives on lower-court cases: 0/24 ->
+    15/26). The sub-agent instructions, the output schema, the tool docstring
+    and the MCP description must make the same promise — a surface left saying
+    '생성 요약, 직접인용 아님' leaves its model unable to quote the `> ` lines.
+    """
+    from lawful_mcp import server
+    from lawful_mcp.prompts import DIVE_PROMPT
+    from lawful_mcp.schemas import DiveResult
+    from lawful_mcp.tools.precedent_dive import precedent_dive
+
+    assert "`> `" in DIVE_PROMPT and "원문 그대로" in DIVE_PROMPT
+    assert "참조 표기" in DIVE_PROMPT and "1,000자" in DIVE_PROMPT
+    surfaces = {
+        "schema": DiveResult.model_fields["summary"].description or "",
+        "docstring": precedent_dive.__doc__ or "",
+        "mcp": server._DESC_PRECEDENT_DIVE,
+    }
+    for name, text in surfaces.items():
+        assert "1,000자" in text, name
+        assert "`>`" in text and "원문 그대로" in text, name
+        assert "생성 요약" not in text and "직접인용 아님" not in text, name
+    assert "참조 판례" in surfaces["docstring"] and "참조 판례" in surfaces["mcp"]
+    assert "생성요약" not in server._INSTRUCTIONS
