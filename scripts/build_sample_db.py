@@ -17,6 +17,8 @@ Three tiers:
      snapshot (picked the same way the lookup tool does) and drops later
      full-text versions whose articles it does not ship, ``core`` ships every
      version's articles, ``all`` ships the lot.
+     Tax treaties: a few partners' documents plus the multilateral ones
+     (``--treaty-countries``).
   3. Precedents: a bounded selection (``--cases N``). Cases that carry the
      sentencing sample (``prec_defendants``) are preferred so
      ``sentence_statistics`` stays meaningful, then cases carrying the
@@ -92,6 +94,15 @@ CORE_STATUTES = [
     "개인정보 보호법",
     "부정수표 단속법",
 ]
+
+# Tax treaties for --treaty-countries. The full set (147 documents, 5.3 MiB of
+# text before its trigram index) does not fit under the size limit, so the
+# sample takes the partners whose documents cover every lookup path: 베트남 (a
+# convention and the protocol amending it — the example in the tool
+# description), 미국 (a convention carrying an attachment) and 나이지리아 (a
+# document not split into articles). The multilateral conventions come along
+# too: every treaty lookup lists them beside the partner's documents.
+SAMPLE_TREATY_COUNTRIES = ("베트남", "미국", "나이지리아")
 
 # Tokenizer recipe for the contentless morpheme index. Mirrors the production
 # indexer: content morphemes only, verbs/adjectives as lemma form.
@@ -267,6 +278,46 @@ def drop_unshipped_full_texts(dest: sqlite3.Connection, snap_ids: list[int]) -> 
     return dropped
 
 
+def copy_treaty_tables(dest: sqlite3.Connection, countries: tuple[str, ...] | None) -> int | None:
+    """Copy the tax treaties of ``countries`` (None = all) and the multilateral ones, with their index.
+
+    Only published facts: the loader's run stamp (``listed_at``) stays out.
+    The country-name table comes along whole (a few hundred short rows), so a
+    query naming any partner is read as that partner rather than searched
+    as text. Older sources without the tables remain supported (None).
+    """
+    if not dest.execute(
+        "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='st_treaties'"
+    ).fetchone():
+        return None
+    columns = "id, treaty_no, name, name_en, country, role, signed_date, effective_date, attachment_url"
+    dest.execute(
+        "CREATE TABLE main.st_treaties (id INTEGER PRIMARY KEY, treaty_no TEXT, name TEXT NOT NULL, "
+        "name_en TEXT, country TEXT, role TEXT NOT NULL, signed_date TEXT, effective_date TEXT, "
+        "attachment_url TEXT)"
+    )
+    if countries is None:
+        dest.execute(f"INSERT INTO main.st_treaties ({columns}) SELECT {columns} FROM src.st_treaties")
+    else:
+        marks = ",".join("?" * len(countries))
+        dest.execute(
+            f"INSERT INTO main.st_treaties ({columns}) SELECT {columns} FROM src.st_treaties "
+            f"WHERE country IS NULL OR country IN ({marks})",
+            countries,
+        )
+    for table, scope in (
+        ("st_treaty_articles", "treaty_id IN (SELECT id FROM main.st_treaties)"),
+        ("st_treaty_country_names", "1"),
+    ):
+        copy_ddl(dest, table)
+        dest.execute(f"INSERT INTO main.{table} SELECT * FROM src.{table} WHERE {scope}")
+    for table in ("st_treaties", "st_treaty_articles", "st_treaty_country_names"):
+        copy_indexes(dest, table)
+    copy_ddl(dest, "st_treaty_articles_fts")
+    dest.execute("INSERT INTO main.st_treaty_articles_fts(st_treaty_articles_fts) VALUES('rebuild')")
+    return count(dest, "st_treaties")
+
+
 # --- build --------------------------------------------------------------------
 
 
@@ -298,6 +349,11 @@ def main() -> None:
     ap.add_argument(
         "--notices", type=int, default=20,
         help="recent current-edition notices to keep",
+    )
+    ap.add_argument(
+        "--treaty-countries",
+        default=",".join(SAMPLE_TREATY_COUNTRIES),
+        help="comma-separated treaty partners to keep (multilateral treaties always), or 'all'",
     )
     ap.add_argument("--force", action="store_true", help="overwrite dest")
     args = ap.parse_args()
@@ -406,6 +462,10 @@ def main() -> None:
         f"statutes: {count(dest, 'st_statutes')} laws, {count(dest, 'st_articles')} articles, "
         f"{count(dest, 'st_notices')} notices"
     )
+    partners = None if args.treaty_countries == "all" else tuple(
+        c.strip() for c in args.treaty_countries.split(",") if c.strip())
+    n_treaties = copy_treaty_tables(dest, partners)
+    log("treaties: source has none" if n_treaties is None else f"treaties: {n_treaties} documents")
 
     # 3. precedent selection: sentencing-sample cases first, then recent.
     linked_cap = int(args.cases * args.linked_share)

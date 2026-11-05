@@ -13,7 +13,7 @@ Four read-only tools:
 |---|---|
 | `precedent_search` | Find judgments by facts, charge, court, year or case number |
 | `precedent_dive` | Read one judgment body and answer a question about it |
-| `statute_lookup` | Statute and administrative-rule articles, current or as of a date |
+| `statute_lookup` | Statute and administrative-rule articles, current or as of a date, and tax treaties |
 | `sentencing_analysis` | Statutory ranges, guidelines, factors and observed sentences for one charge; calculate ranges from supplied findings |
 
 This repository publishes the MCP tools used by
@@ -137,13 +137,14 @@ model keys are needed:
 
 ## The corpus
 
-The tools read one SQLite file. The bundled sample is about 48 MiB:
+The tools read one SQLite file. The bundled sample is about 49 MiB:
 
 | | Sample (`data/fixture.db`) | Hosted |
 |---|---|---|
 | Judgments | 700 | 220,000+ |
 | Statutes | 27 core laws, current text | All, with amendment history |
 | Administrative rules | 20 | All |
+| Tax treaties | 3 partners and the multilateral conventions, 7 documents | All |
 | Sentencing guidelines | Complete | Complete |
 | Charge taxonomy | Complete | Complete |
 
@@ -153,6 +154,11 @@ full corpus, or set `CORPUS_DB` to a compatible database you maintain.
 Statute lookups distinguish repeal from loss of effect, such as expiry, when
 the corpus supplies that information. The sample's lapse register is currently
 empty; expiry and reinstatement are covered by separate test data.
+
+A tax treaty comes with every document of the same partner and the
+multilateral conventions, in order of entry into force. The official source
+has no consolidated text and records no termination, so the lookup does not
+say which wording is current.
 
 Default search combines trigram and [Kiwi](https://github.com/bab2min/kiwipiepy)
 morpheme indexes using reciprocal rank fusion. The morpheme index makes

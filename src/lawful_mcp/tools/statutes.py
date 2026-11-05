@@ -40,6 +40,7 @@ from ..deps import HarnessDeps, open_db
 from ._coerce import BAD_DATE_MESSAGE, coerce_int, coerce_list, coerce_str, to_iso_date, unreadable_date
 from ._fts import query_tokens as _query_tokens, quoted_and as _quoted_and
 from ._morph import kiwi as _kiwi
+from . import treaties
 from .precedent_search import bm25_expr  # one owner for BM25 weights, shared with case search
 
 # BM25 column weights for the article index, in `st_articles_fts` column order
@@ -80,11 +81,12 @@ LIMIT_MAX = 50
 NOTICE_URL_PREFIX = "admrul-"   # law_id namespace for administrative rules
 
 
-def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | None:
+def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | tuple[str, int] | None:
     """Read a caller's ``statute_id`` into ``(is_rule, id)``, or None if unreadable.
 
     A bare integer means a statute (``st_statutes``); ``'admrul-18060'`` means an
-    administrative rule (``st_notices``). One shape is neither: a web path
+    administrative rule (``st_notices``); ``'trty-1307'`` means a tax treaty
+    (``st_treaties``) and comes back as ``("trty", 1307)``. One shape is neither: a web path
     ``/statutes/{law_id}`` — or a zero-padded digit string — carries a *law_id*
     ('004704') rather than a primary key, and comes back as ``("law", law_id)``
     for `_statute_lookup_impl` to resolve against the database.
@@ -116,6 +118,9 @@ def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | None:
         if low.startswith(NOTICE_URL_PREFIX):
             rest = low[len(NOTICE_URL_PREFIX):]
             return (True, int(rest)) if rest.isdigit() else None
+        if low.startswith(treaties.TREATY_URL_PREFIX):
+            tid = treaties.parse_ref(low)
+            return ("trty", tid) if tid is not None else None
         # A whole page url, pasted through from a previous answer.
         if "/statutes/" in low:
             tail = (low.rsplit("/statutes/", 1)[1]
@@ -123,6 +128,9 @@ def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | None:
             if tail.startswith(NOTICE_URL_PREFIX):
                 rest = tail[len(NOTICE_URL_PREFIX):]
                 return (True, int(rest)) if rest.isdigit() else None
+            if tail.startswith(treaties.TREATY_URL_PREFIX):
+                tid = treaties.parse_ref(tail)
+                return ("trty", tid) if tid is not None else None
             # The statute slot of a web path is a law_id by definition. No
             # zero-padding is applied: a made-up /statutes/584 silently landing
             # on law_id 000584 is worse than failing loudly into a search.
@@ -135,13 +143,15 @@ def _parse_statute_ref(raw: Any) -> tuple[bool, int] | tuple[str, str] | None:
 
 def _statute_ref(d: dict[str, Any] | None) -> str:
     """A result row -> the identifier the caller sees: a bare integer for a
-    statute, ``'admrul-{id}'`` for an administrative rule. The corpus test is
-    the same one `_statute_web_url` uses (does the row carry a law_id) — were
-    the two to disagree, the id and the url in one response would point at
-    different documents.
+    statute, ``'admrul-{id}'`` for an administrative rule, ``'trty-{id}'`` for
+    a tax treaty. The corpus test is the same one `_statute_web_url` uses
+    (does the row carry a treaty_id or a law_id) — were the two to disagree,
+    the id and the url in one response would point at different documents.
     """
     if not d:
         return ""
+    if d.get("treaty_id"):
+        return f"{treaties.TREATY_URL_PREFIX}{d['treaty_id']}"
     nid = d.get("id")
     if not isinstance(nid, int):
         nid = d.get("statute_id")
@@ -2369,9 +2379,11 @@ def _neighbor_articles(
 
 
 def _statute_web_url(d: dict[str, Any]) -> str | None:
-    """Page url for a law or an administrative rule, or None if undetermined."""
+    """Page url for a law, an administrative rule or a tax treaty, or None if undetermined."""
     if not d:
         return None
+    if d.get("treaty_id"):
+        return f"{case_url_base()}/statutes/{treaties.TREATY_URL_PREFIX}{d['treaty_id']}"
     law_id = d.get("law_id")
     if law_id:
         return f"{case_url_base()}/statutes/{law_id}"
@@ -2562,11 +2574,11 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                     # One marker rather than two lines per article: a single
                     # lookup can carry dozens of articles, so per-line cost
                     # multiplies.
-                    lines.append("- text_kind: 공식 조문 원문")
+                    lines.append(f"- text_kind: {resp.get('text_kind') or '공식 조문 원문'}")
                     lines.append(a["text"])
-        if resp.get("body"):  # 고시 other category
+        if resp.get("body"):  # a rule's other category, or a treaty document not split into articles
             lines.append("## body")
-            lines.append("- text_kind: 공식 고시 원문")
+            lines.append(f"- text_kind: {resp.get('body_kind') or '공식 고시 원문'}")
             lines.append(resp["body"])
         missing = resp.get("missing")
         if missing:
@@ -2624,6 +2636,19 @@ def _format_response_md(resp: dict[str, Any]) -> str:
         if resp.get("hint"):
             lines.append(f"## hint: {resp['hint']}")
 
+    if resp.get("attachment"):
+        # The hosted service tells the model to read the attachment with its
+        # web tool; this server registers none, so it points at the file.
+        lines.append(f"## 첨부 원문: {resp['attachment']} — 본문이 첨부파일에만 있을 수 있습니다. "
+                     "이 주소의 파일을 직접 확인하세요.")
+    # Tax treaties: every document of the same partner, in order of entry into
+    # force — the source has no consolidated text (`treaties.lookup`).
+    if resp.get("related"):
+        lines.append(f"## {resp['related_title']}")
+        for d in resp["related"]:
+            lines.append(f"- {d['ref']} · {d['date']} 발효 · {d['role']} · {d['name']}"
+                         + (" ← 이 문서" if d.get("self") else ""))
+
     return "\n".join(lines)
 
 
@@ -2657,6 +2682,8 @@ def statute_lookup(
 
     법률·대통령령·부령·규칙과 **행정규칙(고시·훈령·예규)**을 한 번에 검색합니다. 종류를
     가리는 인자는 없습니다 — 관련도 순으로 함께 나오고 각 결과에 종류가 붙습니다.
+    **조세조약**(이중과세방지협약·조세정보교환협정과 그 개정 의정서)도 상대국과 함께 찾으면
+    나옵니다(예: query='베트남 조세조약').
 
     언제:
     - 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 모든 국면 — 조문을 인용할 때만이 아니라
@@ -2676,8 +2703,8 @@ def statute_lookup(
       ② 맞는 법령을 골라 그 statute_id + articles 로 본문 호출.
       조문 번호는 법령-종속이라(같은 '제3조'도 법마다 다름) 법령을 먼저 확정한 뒤
       본문을 받는 게 안전합니다.
-    - **검색이 준 id 를 글자 그대로 되넘기세요.** 행정규칙 id 는 `admrul-18060` 처럼
-      접두사가 붙어 나옵니다 — 접두사를 떼면 **같은 번호의 다른 법령**이 조회됩니다.
+    - **검색이 준 id 를 글자 그대로 되넘기세요.** 행정규칙 id 는 `admrul-18060`, 조세조약 id 는
+      `trty-1307` 처럼 접두사가 붙어 나옵니다 — 접두사를 떼면 **같은 번호의 다른 법령**이 조회됩니다.
     - **위 quick-access 목록 밖의 statute_id 는 추측 금지** (DB primary key — 예: 574 는
       근로기준법이 아니라 형사소송법). 모르면 query 로 검색해 받은 id 를 쓰세요.
     - articles 미지정 시 outline (모든 조문 title) — 형법처럼 큰 법령은 응답이 거대해지니
@@ -2692,7 +2719,7 @@ def statute_lookup(
     Args:
       query: 법령명·행정규칙명 또는 본문 키워드. id 모를 때 검색용. 받은 목록에서 id 를 골라 재호출.
       statute_id: 검색 결과가 준 식별자를 그대로. 법령은 정수(예: 584), 행정규칙은
-        `'admrul-18060'`. 한글 이름 받지 않음. 모르면 query 로 검색(추측 금지).
+        `'admrul-18060'`, 조세조약은 `'trty-1307'`. 한글 이름 받지 않음. 모르면 query 로 검색(추측 금지).
       articles: 조문 번호 리스트(문자열/정수 모두 허용) **최대 8개** — 넘치면 앞 8개만
         조회하고 나머지는 응답 message 로 알린다(나눠 재호출). 아래 표기 모두 허용(자동 정규화):
         - "347" / "제347조": 347조 + 가지(의2, 의3 ...) 함께
@@ -2836,7 +2863,9 @@ def _statute_lookup_impl(
             conn, query, limit, offense_date=offense_date,
         )
         notice_matches = _search_notices(conn, query, limit) if query else []
-        matches = _merge_law_notice_matches(stat_matches + notice_matches, query, limit)
+        # Tax treaties join only queries about a tax treaty (`treaties.about_tax_treaty`).
+        treaty_matches = treaties.search(conn, query, limit)
+        matches = _merge_law_notice_matches(stat_matches + notice_matches + treaty_matches, query, limit)
         out = {
             "status": "ok", "mode": "list",
             "matches": matches,
@@ -2870,6 +2899,15 @@ def _statute_lookup_impl(
                 ),
             }
         ref = (False, resolved[0])
+
+    if ref[0] == "trty":
+        # A treaty also takes '전문', '말미' and '의정서' by name, so this runs
+        # before the "article numbers unreadable" note below.
+        tid = ref[1]
+        res = treaties.lookup(conn, tid, _parse_articles(articles), articles)
+        if res is None:
+            return {"status": "missing", "input": {"statute_id": f"{treaties.TREATY_URL_PREFIX}{tid}"}}
+        return {"status": "ok", **res}
 
     is_notice, sid = ref
     shown_id = f"{NOTICE_URL_PREFIX}{sid}" if is_notice else sid

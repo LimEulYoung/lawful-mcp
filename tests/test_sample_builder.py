@@ -91,3 +91,47 @@ def test_later_full_text_versions_without_articles_are_dropped():
         assert [r[0] for r in conn.execute("SELECT id FROM st_statutes ORDER BY id")] == [1, 3, 4, 6, 7]
     finally:
         conn.close()
+
+
+def test_treaties_keep_the_chosen_partners_and_the_multilateral_ones_without_run_stamps():
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("ATTACH DATABASE ':memory:' AS src")
+        conn.executescript("""
+            CREATE TABLE src.st_treaties (id INTEGER PRIMARY KEY, treaty_no TEXT, name TEXT NOT NULL,
+                name_en TEXT, country TEXT, role TEXT NOT NULL, signed_date TEXT, effective_date TEXT,
+                attachment_url TEXT, listed_at TEXT NOT NULL);
+            CREATE TABLE src.st_treaty_articles (id INTEGER PRIMARY KEY, treaty_id INTEGER NOT NULL,
+                article_seq INTEGER NOT NULL, article_no INTEGER, article_branch INTEGER NOT NULL DEFAULT 0,
+                title TEXT, article_text TEXT NOT NULL);
+            CREATE VIRTUAL TABLE src.st_treaty_articles_fts USING fts5(
+                article_text, content='st_treaty_articles', content_rowid='id', tokenize='trigram');
+            CREATE TABLE src.st_treaty_country_names (name TEXT PRIMARY KEY, country TEXT NOT NULL);
+            INSERT INTO src.st_treaties VALUES
+                (1, NULL, '베트남 협정', NULL, '베트남', '협약', NULL, '19940909', NULL, 'run stamp'),
+                (2, NULL, '일본 협약', NULL, '일본', '협약', NULL, '19700101', NULL, 'run stamp'),
+                (3, NULL, '다자협약', NULL, NULL, '개정', NULL, '20200901', NULL, 'run stamp');
+            INSERT INTO src.st_treaty_articles (treaty_id, article_seq, article_no, article_text) VALUES
+                (1, 0, 4, '제4조 거주자'), (2, 0, 4, '제4조 거주자'), (3, 0, 1, '제1조 적용 대상 조세협정');
+            INSERT INTO src.st_treaty_country_names VALUES ('베트남', '베트남'), ('일본', '일본');
+        """)
+        assert builder.copy_treaty_tables(conn, ("베트남",)) == 2
+        assert [r[0] for r in conn.execute("SELECT id FROM main.st_treaties ORDER BY id")] == [1, 3]
+        assert "listed_at" not in [r[1] for r in conn.execute("PRAGMA main.table_info(st_treaties)")]
+        assert conn.execute("SELECT COUNT(*) FROM main.st_treaty_articles").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM main.st_treaty_country_names").fetchone()[0] == 2
+        hits = conn.execute("SELECT rowid FROM main.st_treaty_articles_fts WHERE st_treaty_articles_fts "
+                            "MATCH '\"거주자\"'").fetchall()
+        assert len(hits) == 1
+    finally:
+        conn.close()
+
+
+def test_older_sources_without_treaties_are_supported():
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("ATTACH DATABASE ':memory:' AS src")
+        assert builder.copy_treaty_tables(conn, None) is None
+        assert conn.execute("SELECT name FROM main.sqlite_master").fetchall() == []
+    finally:
+        conn.close()
