@@ -16,15 +16,18 @@ import os
 import sys
 import threading
 from types import SimpleNamespace
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic.json_schema import SkipJsonSchema
 
 from . import tools as _t
 from .config import corpus_db_path, dive_config
 from .deps import build_deps, build_dive_subagent
 from .tools.compute_sentencing_range import ChargeArg
+from .tools.sentencing_factors import FactorIds, retired_factor_args
 
 logger = logging.getLogger("lawful-mcp")
 
@@ -103,8 +106,8 @@ _dive_subagent = build_dive_subagent()
 def _ctx() -> SimpleNamespace:
     """Shuttle context for a tool call.
 
-    The tools take a pydantic-ai ``RunContext`` but only ever read ``.deps``
-    and ``.usage``, so a namespace with those two fields is enough. Fresh per
+    The tools take a pydantic-ai ``RunContext`` but only read ``.deps`` (the
+    dive sub-agent keeps its own usage), so a namespace is enough. Fresh per
     call.
     """
     return SimpleNamespace(deps=build_deps(_dive_subagent), usage=None)
@@ -164,17 +167,11 @@ _DESC_SENTENCING_ANALYSIS = (
     "is_attempted·is_accessory·is_solicitor=미수·방조·교사. "
     "statutory_modifications=형법 §56 가중·감경 list(예 [{\"kind\": \"누범_가중\"}]). "
     "guideline_type=응답 목록의 따옴표 안 유형 명칭 그대로. "
-    # The eight key names are spelled out **here**. A pydantic-ai agent reads them
-    # from the tool docstring, but for an MCP client this description is all there
-    # is, and a briefing response is `protocol=False` so it carries no schema line
-    # either. Leave them out and a client invents names, paying one more
-    # `bad_factor_key` round trip — breaking this tool's promise not to ask back,
-    # on the MCP surface alone.
-    "guideline_factors=특별양형인자 dict — key 는 special_act_aggravators·"
-    "special_act_mitigators·special_actor_aggravators·special_actor_mitigators 넷뿐. "
-    "probation_factors=집행유예 참작사유 dict — key 는 major_positive·major_negative·"
-    "general_positive·general_negative 넷뿐. 값은 응답의 해당 그룹 아래 문장 그대로 넣고, "
-    "이 여덟 밖의 key 는 계산 없이 되돌아옵니다. "
+    # The argument names and how to pick ids also head the lists in a briefing
+    # response (`sentencing_factors.format_catalog`); one line here suffices. An
+    # MCP client never sees the tool docstring — this description is all it has.
+    "guideline_factor_ids·probation_factor_ids=응답의 특별양형인자·집행유예 참작사유 목록에서 사건에 해당하는 "
+    "id의 정수 배열(guideline_type과 함께) — 가중·감경·주요·일반 분류는 도구가 기준표에서 읽습니다. "
     "sentence_months·fine_amount=검증할 선고형. act_count=같은 죄명의 별개 행위 수"
     "(2 이상이면 경합범 가중). reference_year=비교 판례 기준 연도.\n"
     "판례·조문 url만 인용 링크로 쓰세요."
@@ -265,13 +262,22 @@ def sentencing_analysis(
     is_solicitor: bool = False,
     statutory_modifications: list[dict] | None = None,
     guideline_type: str | None = None,
-    guideline_factors: dict | None = None,
-    probation_factors: dict | None = None,
+    guideline_factor_ids: FactorIds = None,
+    probation_factor_ids: FactorIds = None,
     sentence_months: int | None = None,
     fine_amount: int | None = None,
     act_count: int = 1,
     reference_year: int | None = None,
+    # The retired dict arguments: accepted but kept out of the schema
+    # (`SkipJsonSchema`). Not accepting them lets the SDK drop an unknown
+    # argument silently (the argument model ignores extras) and compute with
+    # no factors at all. When they arrive, the reply explains the id form.
+    guideline_factors: SkipJsonSchema[Any] = None,
+    probation_factors: SkipJsonSchema[Any] = None,
 ) -> str:
+    retired = retired_factor_args(guideline_factors=guideline_factors, probation_factors=probation_factors)
+    if retired:
+        return retired
     return _t.sentencing_analysis(
         _ctx(),
         charge=charge,
@@ -285,8 +291,8 @@ def sentencing_analysis(
         is_solicitor=is_solicitor,
         statutory_modifications=statutory_modifications,
         guideline_type=guideline_type,
-        guideline_factors=guideline_factors,
-        probation_factors=probation_factors,
+        guideline_factor_ids=guideline_factor_ids,
+        probation_factor_ids=probation_factor_ids,
         sentence_months=sentence_months,
         fine_amount=fine_amount,
         act_count=act_count,

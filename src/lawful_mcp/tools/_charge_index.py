@@ -133,7 +133,7 @@ class LawNames:
         latest: dict[str, tuple[str, str, str, bool]] = {}
         earliest: dict[str, tuple[str, str, str, bool]] = {}
         names_by_id: dict[str, set[str]] = {}
-        for law_id, name, short, status, eff, kind in rows:
+        for law_id, name, short, _status, eff, kind in rows:
             n = norm_cmp(name)
             if not n:
                 continue
@@ -143,7 +143,7 @@ class LawNames:
             rec = (e, n, norm_cmp(short), _is_repeal_kind(kind))
             if earliest.get(law_id) is None or e < earliest[law_id][0]:
                 earliest[law_id] = rec
-            if status == "시행예정" or e > today:
+            if e > today:   # by date: the '시행예정' label flips later than the effective date
                 continue
             if latest.get(law_id) is None or e >= latest[law_id][0]:
                 latest[law_id] = rec

@@ -12,10 +12,11 @@ Three tiers:
      (``sg_*``), charge taxonomy (``charge_*``), statutory-penalty history
      (``clm_versions``).
   2. Statutes: a core-law whitelist or everything (``--statutes``). Version
-     rows are cheap metadata and always come along for whitelisted laws;
-     article bodies are the weight. ``core-current`` ships only each law's
-     consolidated current snapshot (picked the same way the lookup tool
-     does), ``core`` ships every version's articles, ``all`` ships the lot.
+     rows are cheap metadata and come along for whitelisted laws; article
+     bodies are the weight. ``core-current`` ships only each law's current
+     snapshot (picked the same way the lookup tool does) and drops later
+     full-text versions whose articles it does not ship, ``core`` ships every
+     version's articles, ``all`` ships the lot.
   3. Precedents: a bounded selection (``--cases N``). Cases that carry the
      sentencing sample (``prec_defendants``) are preferred so
      ``sentence_statistics`` stays meaningful, then cases carrying the
@@ -173,25 +174,51 @@ def copy_statute_status_tables(dest: sqlite3.Connection) -> None:
         )
 
 
-def pick_current_snapshot(dest: sqlite3.Connection, law_id: str, as_of_iso: str) -> int | None:
-    """Pick the consolidated current version of a law — mirror of the tool.
+def _is_repeal_kind(change_kind) -> bool:
+    ck = str(change_kind or "")
+    return "폐지" in ck and "제정" not in ck
 
-    Version rows carry delta article sets, so status labels alone cannot
-    tell a consolidated snapshot from the latest amendment. The tool picks,
-    among in-force, non-repealed, current/NULL-status rows, the one with the
-    most articles (then full-snapshot origin, then latest effective date);
-    this must select the same row.
+
+def _is_full_text_kind(change_kind) -> bool:
+    ck = str(change_kind or "")
+    return "제정" in ck or "전부개정" in ck
+
+
+def _carries_full_text(row) -> bool:
+    """Would the tool treat this version row as a full text on its own?
+
+    An enactment or full revision, a consolidated snapshot (mst NULL), or a
+    row loaded whole (a serial number). Rows are (id, effective_date,
+    history_status, change_kind, mst, serial_id).
+    """
+    return _is_full_text_kind(row[3]) or row[4] is None or bool(row[5])
+
+
+def pick_current_snapshot(dest: sqlite3.Connection, law_id: str, as_of_iso: str) -> int | None:
+    """Pick the version of a law current on ``as_of_iso`` — mirror of the tool.
+
+    Same rule as ``statutes._pick_current_version``: versions in force by
+    date (not by label), repeals passed over, then the most recent full text —
+    an enactment or full revision, or a snapshot (mst NULL, loaded whole, or a
+    label other than '연혁'). A labelled row not loaded whole with under 90% of
+    the largest snapshot's article count holds only its amendment's articles
+    and is skipped. ``tests/test_sample_builder.py`` checks the two agree.
     """
     group = dest.execute(
-        "SELECT id, effective_date, history_status, change_kind, mst "
+        "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
         "FROM src.st_statutes WHERE law_id=?",
         (law_id,),
     ).fetchall()
     if not group:
         return None
+
+    def snapshot(r) -> bool:
+        return r[4] is None or bool(r[5]) or r[2] != "연혁"
+
     in_force = [r for r in group if (r[1] or "") <= as_of_iso] or list(group)
-    non_repealed = [r for r in in_force if not (r[3] and "폐지" in str(r[3]))] or in_force
-    pool = [r for r in non_repealed if r[2] in (None, "현행")] or non_repealed
+    non_repealed = [r for r in in_force if not _is_repeal_kind(r[3])] or in_force
+    full = [r for r in non_repealed if _is_full_text_kind(r[3]) or snapshot(r)]
+    pool = full or non_repealed
     if len(pool) == 1:
         return pool[0][0]
     ids = [r[0] for r in pool]
@@ -202,8 +229,42 @@ def pick_current_snapshot(dest: sqlite3.Connection, law_id: str, as_of_iso: str)
     )
     for sid, c in dest.execute(q, ids):
         counts[sid] = c
-    best = max(pool, key=lambda r: (counts[r[0]], r[4] is None, r[1] or ""))
-    return best[0]
+    if not full:
+        return max(pool, key=lambda r: (counts[r[0]], r[4] is None, r[1] or ""))[0]
+    most = max((counts[r[0]] for r in pool if snapshot(r)), default=0)
+    texts = [r for r in pool if _carries_full_text(r) or counts[r[0]] >= 0.9 * most]
+    return max(texts, key=lambda r: (r[1] or "", counts[r[0]], r[4] is None))[0]
+
+
+def drop_unshipped_full_texts(dest: sqlite3.Connection, snap_ids: list[int]) -> int:
+    """Drop version rows dated after a shipped snapshot that carry a full text of their own.
+
+    ``core-current`` ships one snapshot's articles per law, but every version
+    row comes along. The tool decides the current version by date, so a
+    later version that counts as a full text (in practice a future amendment
+    loaded whole) takes over once its date passes — and in the sample it has
+    no articles, so the law turns up empty. Measured on the committed sample:
+    16 such rows across 8 laws, taking over one by one from the build date
+    on. Repeal rows stay (they carry no text, and they are how a repealed
+    law is known), so do delta rows (never chosen without their articles)
+    and rows the charge map points at (foreign keys). Returns the count.
+    """
+    dropped = 0
+    for sid in snap_ids:
+        law_id, eff = dest.execute(
+            "SELECT law_id, effective_date FROM main.st_statutes WHERE id=?", (sid,)).fetchone()
+        rows = dest.execute(
+            "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
+            "FROM main.st_statutes WHERE law_id=? AND effective_date>? "
+            "AND id NOT IN (SELECT statute_id FROM main.charge_legal_map WHERE statute_id IS NOT NULL)",
+            (law_id, eff),
+        ).fetchall()
+        doomed = [r[0] for r in rows if not _is_repeal_kind(r[3]) and _carries_full_text(r)]
+        if doomed:
+            dest.execute(
+                "DELETE FROM main.st_statutes WHERE id IN (%s)" % ",".join("?" * len(doomed)), doomed)
+            dropped += len(doomed)
+    return dropped
 
 
 # --- build --------------------------------------------------------------------
@@ -308,13 +369,16 @@ def main() -> None:
     if args.statutes == "core-current":
         # Version rows carry delta article sets (changed articles only); the
         # full text of a law as it stands lives in its consolidated snapshot.
-        # Ship only that snapshot per law — the pick mirrors the tool.
+        # Ship only that snapshot per law — the pick mirrors the tool — and
+        # drop the later full-text rows whose articles are not shipped.
         smarks = ",".join("?" for _ in snap_ids)
         dest.execute(
             f"INSERT INTO main.st_articles SELECT * FROM src.st_articles "
             f"WHERE statute_id IN ({smarks})",
             snap_ids,
         )
+        log(f"statutes: dropped {drop_unshipped_full_texts(dest, snap_ids)} later full-text "
+            "versions whose articles are not shipped")
     else:
         dest.execute(
             "INSERT INTO main.st_articles SELECT * FROM src.st_articles "

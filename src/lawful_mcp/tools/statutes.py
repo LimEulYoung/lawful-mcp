@@ -37,7 +37,7 @@ from pydantic_ai import RunContext
 
 from ..config import case_url_base
 from ..deps import HarnessDeps, open_db
-from ._coerce import coerce_int, coerce_list, coerce_str, to_iso_date
+from ._coerce import BAD_DATE_MESSAGE, coerce_int, coerce_list, coerce_str, to_iso_date, unreadable_date
 from ._fts import query_tokens as _query_tokens, quoted_and as _quoted_and
 from ._morph import kiwi as _kiwi
 from .precedent_search import bm25_expr  # one owner for BM25 weights, shared with case search
@@ -347,6 +347,32 @@ def _fts_query_ok(q: str) -> bool:
     return any(len(w) >= 3 for w in q.split())
 
 
+def _short_words_message(query: str, matches: list[dict[str, Any]]) -> str | None:
+    """Say so when every query word is too short for the article index.
+
+    `st_articles_fts` is a trigram index, so a word under three characters
+    never matches article text and SQLite drops it from the expression. If
+    every word is that short, the list comes from statute names alone — and
+    without a note an empty or name-only list reads as "no such article"
+    ('절도', '누범' and '형의 병과' returned nothing in a research pilot;
+    '형법 간통' returned 형법 with no hint of where). A statute named outright
+    ('민법') is found by its name, so nothing is said then.
+    """
+    words = _query_tokens(query)
+    if not words or any(len(w) >= 3 for w in words):
+        return None
+    names = "".join(re.sub(r"\s+", "", m.get("name", "")) for m in matches)
+    unmatched = [w for w in words if w not in names]
+    if not unmatched:
+        return None
+    found = "아래는 법령 이름에 낱말이 든 것뿐입니다" if matches else "이름에 이 낱말이 든 법령도 없습니다"
+    return (
+        f"{'·'.join(repr(w) for w in unmatched)}: 두 글자 이하 낱말은 조문 본문에서 찾지 못합니다"
+        f"(본문 검색은 세 글자부터) — {found}. 본문은 조문에 나올 세 글자 이상 문구로 찾고, "
+        "법령을 알면 statute_id 로 조문 개요(번호·제목)를 받으세요."
+    )
+
+
 # Structural units that are not articles, filtered out before any number is
 # read off the token.
 #
@@ -446,12 +472,14 @@ def _today_iso() -> str:
 # Against Public Morals" — are stored as rows too, and they carry the
 # article number of whatever follows them. Asking for that article can
 # therefore return the heading instead. Article text always begins with
-# 제<number>조; a heading names a part, chapter, section or subsection.
-_HEADING_RE = re.compile(r'^\s*제\s*\d+\s*[편장절관]')
+# 제<number>조; a heading names a part, chapter, section or subsection. 민법
+# also has paragraph headings ('제2항 재판상 파양'), and bracketed change
+# notes ('[제1절에서 제2절로 변경 …]') in historical editions are headings too.
+_HEADING_RE = re.compile(r'^\s*\[?\s*제\s*\d+\s*([편장절관항])')   # group = the unit
 
 
 def _is_structural_heading(text: str | None) -> bool:
-    """True for a structural heading rather than an article."""
+    """True for a structural heading (or a change note) rather than an article."""
     return bool(text and _HEADING_RE.match(text))
 
 
@@ -494,16 +522,19 @@ def _get_historic_article(
 def _pending_article(
     conn: sqlite3.Connection, law_id: str, as_of_iso: str, art_no: int, art_br: int | None,
 ) -> dict[str, Any] | None:
-    """Find the earliest pending edition containing this article number.
+    """Find the earliest edition not yet in force that contains this article number.
 
+    "Not yet in force" means effective after both ``as_of_iso`` and today.
     Return its effective date, title and branch. With no branch requested,
     consider every branch, preferring the main article on the same date.
+    Decided by date, not by the '시행예정' label: the label flips only when
+    the collector next runs, after the effective date.
     """
     q = ("SELECT s.effective_date, a.title, a.article_branch, a.article_text FROM st_articles a "
          "JOIN st_statutes s ON s.id=a.statute_id "
-         "WHERE s.law_id=? AND s.history_status='시행예정' AND s.effective_date>? "
+         "WHERE s.law_id=? AND s.effective_date>? "
          "AND a.article_no_num=?")
-    params: list[Any] = [law_id, as_of_iso, art_no]
+    params: list[Any] = [law_id, max(as_of_iso, _today_iso()), art_no]
     if art_br is not None:
         q += " AND COALESCE(a.article_branch,0)=?"
         params.append(art_br)
@@ -511,6 +542,33 @@ def _pending_article(
         if not _is_structural_heading(r['article_text']):
             return {"effective_date": r['effective_date'], "title": r['title'],
                     "branch": r['article_branch'] or 0}
+    return None
+
+
+def _added_article(
+    conn: sqlite3.Connection, law_id: str, as_of_iso: str, art_no: int, art_br: int | None,
+) -> str | None:
+    """Effective date of the earliest version with this number that took effect after as_of and is in force today.
+
+    That date marks a number added after the asked date (a new article, or a
+    renumbering by full revision); None otherwise. With ``art_br`` None any
+    branch counts. A version in force does not make an article in force when
+    the article's own date is still ahead (an article deferred within the
+    version). Old history delta rows carry such an article under the
+    version's date — the caller filters once more by numbers alive today.
+    """
+    today = _today_iso()
+    q = ("SELECT s.effective_date, a.article_text FROM st_articles a "
+         "JOIN st_statutes s ON s.id=a.statute_id "
+         "WHERE s.law_id=? AND s.effective_date>? AND s.effective_date<=? "
+         "AND COALESCE(a.article_eff_date, s.effective_date)<=? AND a.article_no_num=?")
+    params: list[Any] = [law_id, as_of_iso, today, today, art_no]
+    if art_br is not None:
+        q += " AND COALESCE(a.article_branch,0)=?"
+        params.append(art_br)
+    for r in conn.execute(q + " ORDER BY s.effective_date", params):
+        if not _is_structural_heading(r['article_text']):
+            return r['effective_date']
     return None
 
 
@@ -531,35 +589,59 @@ def _is_repeal_kind(change_kind: Any) -> bool:
     return "폐지" in ck and "제정" not in ck
 
 
+def _is_full_text_kind(change_kind: Any) -> bool:
+    """Does a version of this amendment kind carry the full text — enactment or full revision (폐지제정 included)."""
+    ck = str(change_kind or "")
+    return "제정" in ck or "전부개정" in ck
+
+
+def _is_loaded_whole(r: Any) -> bool:
+    """Was this row loaded as that version's full text? Such rows carry a serial
+    number (`serial_id`); old history delta rows, holding only the articles
+    their amendment changed, leave it empty."""
+    return bool('serial_id' in r.keys() and r['serial_id'])
+
+
+def _is_snapshot(r: Any) -> bool:
+    """A consolidated snapshot (mst NULL), a row loaded whole, or a row labelled
+    other than '연혁' (현행, 시행예정). The last may still hold only the
+    articles its amendment changed — `_pick_current_version` filters again by
+    article count."""
+    return r['mst'] is None or _is_loaded_whole(r) or r['history_status'] != '연혁'
+
+
 def _pick_current_version(conn: sqlite3.Connection, group: list, as_of_iso: str) -> dict | None:
     """Pick the one version of a law that was current on a given date.
 
-    In order: keep versions in force by that date (or all of them, for a
-    law whose only rows are future amendments); prefer one that has not been
-    repealed; then prefer the consolidated snapshot.
+    In order:
 
-    Unlike `_is_repeal_kind`, snapshot selection also excludes '폐지제정'
-    when another candidate exists. Including those rows changes the chosen
-    baseline for eight laws, both adding and dropping historical articles.
-    Revisit this only after comparing the official full texts.
+    1. Keep versions in force by that date (or all of them, for a law whose
+       only rows are future amendments). This is by date, not label, so a
+       version past its effective date that still says '시행예정' counts.
+    2. Prefer one that has not been repealed (`_is_repeal_kind`). A
+       '폐지제정' row — the old law repealed and this one enacted under the
+       same id (외국환거래법, 1999) — is a new full text and stays. Compared
+       with the official text of that date, keeping it is what drops the old
+       law's articles (416 laws, 1,557 dates checked).
+    3. **The most recent full text**: an enactment or full revision
+       (`_is_full_text_kind`) or a snapshot (`_is_snapshot`: mst NULL, loaded
+       whole, or a label other than '연혁'). A labelled row that has an mst, was
+       not loaded whole and holds under 90% of the largest snapshot's article
+       count carries only the articles its amendment changed, and is skipped
+       — the latest amendment taking the '현행' label used to turn a law into
+       a one-article law (101 laws, 행정소송법 among them). Among full texts:
+       latest effective date, then article count, then mst NULL. With no full
+       text at all, the row with the most articles.
 
-    That last step is the one that matters. An amendment row holds only the
-    articles it changed — sometimes a single article — and the status label
-    does not distinguish it from a consolidated text. Choosing by label
-    alone therefore yields a "law" with one article in it, which was
-    measured on 101 laws. Choosing the row with the most articles finds the
-    consolidated text instead; full-snapshot origin and then recency break
-    the remaining ties.
+    Choosing by article count first returned the 1960 wording of
+    민사소송법 제600조 when asked as of 2020.
     """
     if not group:
         return None
     in_force = [r for r in group if (r['effective_date'] or '') <= as_of_iso] or list(group)
-    non_repealed = [
-        r for r in in_force
-        if not (r['change_kind'] and '폐지' in str(r['change_kind']))
-    ] or in_force
-    snapshots = [r for r in non_repealed if r['history_status'] in (None, '현행')]
-    pool = snapshots or non_repealed
+    non_repealed = [r for r in in_force if not _is_repeal_kind(r['change_kind'])] or in_force
+    full = [r for r in non_repealed if _is_full_text_kind(r['change_kind']) or _is_snapshot(r)]
+    pool = full or non_repealed
     if len(pool) == 1:
         return pool[0]
     ids = [r['id'] for r in pool]
@@ -568,7 +650,13 @@ def _pick_current_version(conn: sqlite3.Connection, group: list, as_of_iso: str)
          "GROUP BY statute_id" % ",".join("?" * len(ids)))
     for sid, c in conn.execute(q, ids):
         counts[sid] = c
-    return max(pool, key=lambda r: (counts[r['id']], r['mst'] is None, r['effective_date'] or ''))
+    if not full:
+        return max(pool, key=lambda r: (counts[r['id']], r['mst'] is None, r['effective_date'] or ''))
+    most = max((counts[r['id']] for r in pool if _is_snapshot(r)), default=0)
+    texts = [r for r in pool
+             if _is_full_text_kind(r['change_kind']) or r['mst'] is None or _is_loaded_whole(r)
+             or counts[r['id']] >= 0.9 * most]
+    return max(texts, key=lambda r: (r['effective_date'] or '', counts[r['id']], r['mst'] is None))
 
 
 def _resolve_current_statute_id(
@@ -576,7 +664,7 @@ def _resolve_current_statute_id(
 ) -> int | None:
     """Law -> the id of the version current on that date."""
     group = conn.execute(
-        "SELECT id, effective_date, history_status, change_kind, mst "
+        "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
         "FROM st_statutes WHERE law_id=?",
         (law_id,),
     ).fetchall()
@@ -595,22 +683,22 @@ def _articles_in_force(
     baseline plus later deltas, while still resolving each article's newest
     wording through `_get_historic_article`.
 
-    Historical partial amendments are never baselines: a large delta can
-    outnumber the original full text while omitting unchanged articles.
-    Historical enactments and full revisions remain eligible.
+    Historical delta rows (partial amendments not loaded whole) are never
+    baselines: a large delta can outnumber the original full text while
+    omitting unchanged articles. Candidates are enactments and full revisions
+    (including 폐지제정) and snapshots (`_is_snapshot`, rows loaded whole
+    included).
 
     Return None if the baseline lacks article 1 or has less than 70% number
     density. The caller then keeps the history walk: mistaking sparse deltas
     for full texts previously caused missing articles in 86 of 89 laws.
     """
     group = conn.execute(
-        "SELECT id, effective_date, history_status, change_kind, mst "
+        "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
         "FROM st_statutes WHERE law_id=? AND effective_date <= ?",
         (law_id, as_of_iso),
     ).fetchall()
-    candidates = [r for r in group
-                  if r['history_status'] != '연혁'
-                  or any(k in str(r['change_kind'] or '') for k in ('제정', '전부개정'))]
+    candidates = [r for r in group if _is_full_text_kind(r['change_kind']) or _is_snapshot(r)]
     base = _pick_current_version(conn, candidates, as_of_iso) if candidates else None
     if base is None:
         return None
@@ -704,8 +792,9 @@ def _repealed_sids(conn: sqlite3.Connection, sids) -> set[int]:
 
     The backfill record also identifies repealed laws with no later edition
     in force. A live successor can mean a rename, but a repeal edition is
-    not a live successor and must not hide the repeal. Future amendments
-    cannot undo a repeal that has already taken effect.
+    not a live successor and must not hide the repeal. Editions not yet in
+    force (effective after today) cannot undo a repeal that has already taken
+    effect; that is decided by date, since the '시행예정' label flips late.
     """
     sids = [s for s in sids if s is not None]
     if not sids:
@@ -720,8 +809,8 @@ def _repealed_sids(conn: sqlite3.Connection, sids) -> set[int]:
         q = ("SELECT s.id FROM st_statutes s WHERE s.id IN (%s) AND NOT EXISTS("
              "SELECT 1 FROM st_statutes s2 WHERE s2.law_id = s.law_id "
              "AND s2.effective_date > s.effective_date "
-             "AND COALESCE(s2.history_status,'') != '시행예정')" % ",".join("?" * len(back)))
-        out |= {r[0] for r in conn.execute(q, back)}
+             "AND s2.effective_date <= ?)" % ",".join("?" * len(back)))
+        out |= {r[0] for r in conn.execute(q, [*back, today])}
     return out
 
 
@@ -743,7 +832,7 @@ def _current_refs(conn: sqlite3.Connection, rows) -> dict[int, dict[str, Any]]:
     lids = sorted({r["law_id"] for r in rows if r["law_id"]})
     if not lids:
         return {}
-    q = ("SELECT id, law_id, name, effective_date, history_status, change_kind, mst "
+    q = ("SELECT id, law_id, name, effective_date, history_status, change_kind, mst, serial_id "
          "FROM st_statutes WHERE law_id IN (%s)" % ",".join("?" * len(lids)))
     by_law: dict[str, list] = {}
     for r in conn.execute(q, lids):
@@ -835,8 +924,11 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
     """Fold search hits so each law appears once.
 
     With a date, the latest version in force by then. Without one, the
-    version current today. Excluding laws that are themselves repealed is
-    the search path's job, not this one's.
+    version current today (`_pick_current_version`). Dropping laws already
+    repealed on the search date is `_drop_repealed`'s job, afterwards.
+
+    The chosen version inherits the strongest search evidence among the
+    law's matched versions (`_with_law_evidence`).
     """
     by_law: dict[str, list] = {}
     for r in rows:
@@ -847,10 +939,10 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
         else:
             by_law.setdefault(lid, []).append(r)
 
-    out = []
+    out = {}
     for lid, group in by_law.items():
         if len(group) == 1 and lid.startswith('_solo_'):
-            out.append(group[0])
+            out[group[0]['id']] = group[0]
             continue
         # Filter by date.
         if offense_iso:
@@ -865,17 +957,76 @@ def _fold_versions(conn: sqlite3.Connection, rows: list, offense_iso: str | None
             # No date given means current: the consolidated snapshot in
             # force today, with future amendments excluded.
             chosen = _pick_current_version(conn, group, _today_iso())
-        out.append(chosen)
-    # Keep the original ranking order.
-    seen = set()
-    ordered = []
-    for r in rows:
-        if r['id'] in seen:
-            continue
-        if any(c['id'] == r['id'] for c in out):
-            ordered.append(r)
-            seen.add(r['id'])
-    return ordered
+        out[chosen['id']] = _with_law_evidence(chosen, group, dated=bool(offense_iso))
+    # Keep the original ranking order — each chosen row at its first appearance.
+    return [out[r['id']] for r in rows if r['id'] in out]
+
+
+def _named_length(r: Any) -> int:
+    """Length of the row's name or abbreviation the query contains whole (0 without score columns)."""
+    return (r['name_in_query'] or 0) if 'name_in_query' in r.keys() else 0
+
+
+def _with_law_evidence(chosen: Any, group: list, *, dated: bool) -> Any:
+    """Give the chosen version the strongest evidence among the law's matched versions.
+
+    That is the name the query called (`name_in_query`, plus that row's name
+    as `matched_name`/`matched_short_name` for `_rank_name_rows`), the name
+    coverage, and for a dated search the text hits. The search window ranks a
+    law by its best version and brings all matched versions along; re-ranking
+    by the chosen version's own score loses the evidence that the query named
+    the law by an older name ('주택건설촉진법' fell out of the top 10 behind
+    주택법's current score — 115 of 162 old names were found before this,
+    157 after). Past versions may be missing from the text index, so a dated
+    search uses the law-level text hits and a current search the current
+    version's own.
+    """
+    if 'name_in_query' not in chosen.keys():
+        return chosen
+    named = max(group, key=_named_length)
+    best = {"name_in_query": _named_length(named),
+            "fts_hits": max(r['fts_hits'] or 0 for r in group) if dated else chosen['fts_hits'] or 0,
+            "name_cover": max(r['name_cover'] or 0 for r in group)}
+    if all((chosen[k] or 0) >= v for k, v in best.items()):
+        return chosen
+    out = dict(chosen) | best
+    if best["name_in_query"] > _named_length(chosen):
+        out |= {"matched_name": named['name'], "matched_short_name": named['short_name']}
+    return out
+
+
+def _drop_repealed(conn: sqlite3.Connection, rows: list, offense_iso: str | None, named: int = 0) -> list:
+    """Drop laws already repealed on the search date.
+
+    A current search uses today: otherwise the last version before repeal
+    surfaces as though it were live, while the replacement usually exists
+    under a different id. A dated search uses that date: a law repealed
+    before it had no force then, one repealed after it did.
+
+    A dated search keeps a repealed law carrying the longest name the query
+    called (`named`, the window's largest `name_in_query`) — only when no law
+    in force has that name ('증권거래법' as of 2015-03-01 used to return
+    nothing). The model asked for that law, and the row goes out saying it was
+    repealed and what is current. Laws the query merely grazed ('교육법시행령'
+    for '소득세법 시행령', '시장법' for '자본시장법') and repealed laws sharing a
+    name with a law in force (the 1953 근로기준법) are still dropped.
+    """
+    when = offense_iso or _today_iso()
+    dead = {r['id'] for r in rows if _is_repealed_as_of(conn, r['law_id'], when)}
+    keep = named if offense_iso else 0
+    if keep and any(_named_length(r) == keep for r in rows if r['id'] not in dead):
+        keep = 0
+    rows = [r for r in rows if r['id'] not in dead or (keep and _named_length(r) == keep)]
+    if offense_iso is None:
+        # Old laws with no repeal edition, which the check above misses (in
+        # the backfill register with no successor — their result line says
+        # '폐지된 법령', `_repealed_sids`), also stay in a current search only
+        # when the query names them. Once the candidate window counted laws,
+        # colonial-era ordinances filled the free slots (replaying 653
+        # recorded calls: lines marked repealed went 261 -> 371).
+        gone = _repealed_sids(conn, [r['id'] for r in rows])
+        rows = [r for r in rows if r['id'] not in gone or (named and _named_length(r) == named)]
+    return rows
 
 
 def _is_repealed_at(conn: sqlite3.Connection, law_id: str | None, offense_iso: str | None) -> dict | None:
@@ -988,10 +1139,11 @@ def _search_statutes(
 ) -> list[dict[str, Any]]:
     """Search by law name.
 
-    Several versions of one law can match,
-    so results are folded to one per law: the current version by default,
-    or the one in force on a given date, including repealed and superseded
-    versions when the date calls for them.
+    Several versions of one law can match, so results are folded to one per
+    law: the current version by default (`_pick_current_version`), or the
+    last one in force on a given date, history included. A law already
+    repealed on that date stays only when the query names it
+    (`_drop_repealed`).
     """
     offense_iso = to_iso_date(offense_date)
     # No kind filter — a `kind` argument used to add a clause here.
@@ -999,7 +1151,8 @@ def _search_statutes(
     params: list[Any] = []
     fts_query_str: str | None = None   # the preview below reads it again
 
-    # Oversample so folding versions still leaves enough distinct laws.
+    # Candidate window size: laws for a query search (each brings all its
+    # matched versions along), rows for the query-less list.
     sql_limit = max(limit * 8, 80)
 
     if query:
@@ -1009,37 +1162,24 @@ def _search_statutes(
         # With no analyser available, the whole normalised query is used.
         normalized, tokens = _statute_name_tokens(query)
         like_terms = tokens or [normalized]
-        name_norm = _name_norm_sql("s.name")
+        # Name scores are computed once per distinct (name, abbreviation) and
+        # joined onto the version rows — one law keeps the same name across
+        # many versions, and the normalisation below is the costly part.
+        name_norm = _name_norm_sql("n.name")
         cover_sql = " + ".join(f"({name_norm} LIKE ?)" for _ in like_terms)
         name_or = " OR ".join(f"{name_norm} LIKE ?" for _ in like_terms)
         like_params = [f"%{t}%" for t in like_terms]
         # Length of whichever of the name or the official abbreviation the
         # query contains whole (`_name_in_query_sql`).
         spans = _query_name_spans(query)
-        name_in_q = _name_in_query_sql("s.name", len(spans))
-        short_in_q = _name_in_query_sql("COALESCE(s.short_name,'')", len(spans))
-        sql = f"""
-        WITH fts_hits AS (
-          SELECT a.statute_id, COUNT(*) AS hits
-          FROM st_articles_fts f
-          JOIN st_articles a ON a.id = f.rowid
-          WHERE st_articles_fts MATCH ?
-          GROUP BY a.statute_id
-        )
-        SELECT s.id, s.law_id, s.name, s.short_name, s.kind, s.issuing_agency,
-               s.effective_date, s.history_status, s.change_kind, s.mst,
-               COALESCE(h.hits, 0) AS fts_hits,
-               ({cover_sql}) AS name_cover,
-               MAX({name_in_q}, {short_in_q}) AS name_in_query
-        FROM st_statutes s
-        LEFT JOIN fts_hits h ON h.statute_id = s.id
-        """
+        name_in_q = _name_in_query_sql("n.name", len(spans))
+        short_in_q = _name_in_query_sql("COALESCE(n.short_name,'')", len(spans))
         # The article FTS expression is a quoted AND over operator-free
         # tokens. `safe_fts_query` alone leaves 'AND'/'NOT' in place and the
-        # MATCH dies with a syntax error (measured 2026-09-12: an unhandled
-        # exception out of statute_lookup). When every token is below the
-        # trigram floor no article can match, and the CTE is skipped with an
-        # unreachable token — an empty string is itself an FTS5 error.
+        # MATCH dies with a syntax error (measured: an unhandled exception out
+        # of statute_lookup). When every token is below the trigram floor no
+        # article can match, and the CTE is skipped with an unreachable token
+        # — an empty string is itself an FTS5 error.
         art_match = _quoted_and(_query_tokens(query))
         fts_query_str = art_match if (art_match and _fts_query_ok(art_match)) else "x" * 1000
         # A candidate matches on the name, on an abbreviation the query
@@ -1047,45 +1187,68 @@ def _search_statutes(
         # abbreviation needs its own clause because its characters need not
         # appear in the full name at all ('상증세법' against 「상속세 및
         # 증여세법」), so a token LIKE never reaches it.
-        where_parts.append(f"(({name_or}) OR {short_in_q} > 0 OR h.hits > 0)")
-        sql += "WHERE " + " AND ".join(where_parts) + "\n"
+        #
         # Candidate window only — the final order is `_rank_name_rows`, which
         # knows about morpheme boundaries. Keys: the query contains the name
         # whole, then text hits, then token coverage, then name length.
         # ⚠ `fts_hits` sits **above** `length(name)`: the old order raised a
         # law whose name was merely grazed over the law whose text actually
-        # matched (measured 2026-09-12: `음주운전` put 도시철도운전규칙 first
-        # with 도로교통법 sixth, and `부당해고` put 부당이득세법 first). An
-        # exact match is the first key's maximum, so it has no column of its
-        # own (`_name_in_query_sql`).
-        sql += """
-        ORDER BY name_in_query DESC, fts_hits DESC, name_cover DESC, length(s.name) ASC
-        LIMIT ?
+        # matched (measured: `음주운전` put 도시철도운전규칙 first with
+        # 도로교통법 sixth, and `부당해고` put 부당이득세법 first). An exact
+        # match is the first key's maximum, so it has no column of its own
+        # (`_name_in_query_sql`).
+        #
+        # The window counts **laws**: each law is ranked by its best version
+        # row, and all its matched versions come along for `_fold_versions`.
+        # Cutting by version rows let a law with many versions fill the window
+        # and push other laws out (238 of 583 recorded searches changed). Ties
+        # break on row id so the result does not depend on the query plan.
+        sql = f"""
+        WITH fts_hits AS (
+          SELECT a.statute_id, COUNT(*) AS hits
+          FROM st_articles_fts f
+          JOIN st_articles a ON a.id = f.rowid
+          WHERE st_articles_fts MATCH ?
+          GROUP BY a.statute_id
+        ), names AS MATERIALIZED (
+          SELECT n.name, n.short_name, ({cover_sql}) AS name_cover,
+                 MAX({name_in_q}, {short_in_q}) AS name_in_query,
+                 (({name_or}) OR {short_in_q} > 0) AS name_hit
+          FROM (SELECT DISTINCT name, short_name FROM st_statutes) n
+        ), scored AS (
+          SELECT s.id, s.law_id, s.name, s.short_name, s.kind, s.issuing_agency,
+                 s.effective_date, s.history_status, s.change_kind, s.mst, s.serial_id,
+                 COALESCE(h.hits, 0) AS fts_hits, m.name_cover, m.name_in_query
+          FROM st_statutes s
+          JOIN names m ON m.name = s.name AND m.short_name IS s.short_name
+          LEFT JOIN fts_hits h ON h.statute_id = s.id
+          WHERE m.name_hit OR h.hits > 0
+        ), top AS (
+          SELECT COALESCE(law_id, 'row:' || id) AS law, MAX(name_in_query) AS q, MAX(fts_hits) AS f,
+                 MAX(name_cover) AS c, MIN(length(name)) AS n, MIN(id) AS first
+          FROM scored GROUP BY law ORDER BY q DESC, f DESC, c DESC, n ASC, first ASC LIMIT ?
+        )
+        SELECT scored.* FROM scored JOIN top ON top.law = COALESCE(scored.law_id, 'row:' || scored.id)
+        ORDER BY name_in_query DESC, fts_hits DESC, name_cover DESC, length(name) ASC, scored.id ASC
         """
-        # Parameter order follows the order they appear in the SQL:
-        #   fts MATCH, cover (SELECT), name_in_q (spans), short_in_q (spans),
-        #   name_or (WHERE), short_in_q (WHERE, spans), LIMIT
-        params_q = [fts_query_str, *like_params, *spans, *spans]
+        # Parameter order follows the SQL: MATCH, cover, name_in_q,
+        # short_in_q, name_or, short_in_q, LIMIT.
         rows = conn.execute(
-            sql, [*params_q, *params, *like_params, *spans, sql_limit]).fetchall()
+            sql, [fts_query_str, *like_params, *spans, *spans, *like_params, *spans, sql_limit]).fetchall()
     else:
         sql = ("SELECT s.id, s.law_id, s.name, s.kind, s.issuing_agency, "
-               "s.effective_date, s.history_status, s.change_kind, s.mst, "
+               "s.effective_date, s.history_status, s.change_kind, s.mst, s.serial_id, "
                "0 AS fts_hits, 0 AS name_hit FROM st_statutes s")
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         sql += " ORDER BY s.name LIMIT ?"
         rows = conn.execute(sql, [*params, sql_limit]).fetchall()
 
-    # Fold to one row per law.
+    # Fold to one row per law, then drop laws already repealed on the search
+    # date (`_drop_repealed`).
+    named = max((_named_length(r) for r in rows), default=0)
     rows = _fold_versions(conn, rows, offense_iso)
-    if offense_iso is None:
-        # Current search drops laws that are repealed today, otherwise the
-        # last version before repeal surfaces as though it were live — the
-        # replacement usually exists under a different id. A dated search
-        # keeps them, because on that date they were the law.
-        today = _today_iso()
-        rows = [r for r in rows if not _is_repealed_as_of(conn, r['law_id'], today)]
+    rows = _drop_repealed(conn, rows, offense_iso, named)
     # Final order and drop-outs belong to the Python side, which can see
     # morpheme boundaries; SQL only builds the candidate window.
     rows = _rank_name_rows(rows, query, limit) if query else rows[:limit]
@@ -1378,9 +1541,10 @@ def _rank_name_rows(rows, query: str, limit: int, *, alt_key: str = "short_name"
     q_norm = _strip_dots((query or "").replace(" ", ""))
 
     def name_key(r):
-        best = _name_cover_key(r["name"], q_norm, tokens, spans)
-        alt = r[alt_key] if (alt_key in r.keys() and r[alt_key]) else ""
-        return min(best, _name_cover_key(alt, q_norm, tokens, spans)) if alt else best
+        # When the chosen version inherited a matched version's name
+        # (`_with_law_evidence`), read that name too — a law called by an old name.
+        names = [r[k] for k in (alt_key, "matched_name", "matched_short_name") if k in r.keys() and r[k]]
+        return min(_name_cover_key(n, q_norm, tokens, spans) for n in [r["name"], *names])
 
     def rank_key(r):
         return _name_rank_key(name_key(r), r["name_in_query"] or 0, r["fts_hits"] or 0,
@@ -1449,16 +1613,29 @@ def _outline_statute(
         return None
 
     offense_iso = to_iso_date(offense_date)
+    earliest = None
     if offense_iso and meta.get('law_id'):
-        # Assemble from the last version of each article by that date.
+        first = conn.execute("SELECT MIN(effective_date) FROM st_statutes WHERE law_id=?",
+                             (meta['law_id'],)).fetchone()[0]
+        if first and first > offense_iso:
+            # The corpus has no version in force on that date: give the
+            # current outline and say so (as `_detail_statute` does).
+            earliest, offense_iso = first, None
+    if offense_iso and meta.get('law_id'):
+        # Assemble from the row each article lookup (`_get_historic_article`)
+        # would use: the last version's row by that date, delta or baseline,
+        # heading rows excluded. Reading amended articles only dropped every
+        # article never amended (a dated 헌법 outline had none). Headings are
+        # judged on the text with leading whitespace stripped — a deeply
+        # indented heading row used to take an article's place.
         law_id = meta['law_id']
         rows = conn.execute(
             """SELECT a.article_no, a.article_no_num, a.article_branch, a.title,
-                      a.article_eff_date
+                      a.article_eff_date, substr(ltrim(a.article_text, ' ' || char(9, 10, 13, 12288)), 1, 20) AS head
                FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id
-               WHERE s.law_id=? AND a.article_changed='Y' AND a.title IS NOT NULL
-                 AND s.effective_date <= ?
-               ORDER BY a.article_no_num, a.article_branch, s.effective_date DESC""",
+               WHERE s.law_id=? AND a.article_no_num IS NOT NULL AND s.effective_date <= ?
+               ORDER BY a.article_no_num, COALESCE(a.article_branch, 0),
+                        s.effective_date DESC, (a.article_changed='Y') DESC""",
             (law_id, offense_iso),
         ).fetchall()
         # Keep the newest row per article, excluding numbers removed by then.
@@ -1466,6 +1643,8 @@ def _outline_statute(
         seen: set[tuple] = set()
         articles: list[dict] = []
         for r in rows:
+            if _is_structural_heading(r['head']):
+                continue
             key = (r['article_no_num'], r['article_branch'] or 0)
             if key in seen:
                 continue
@@ -1474,7 +1653,7 @@ def _outline_statute(
                 continue
             articles.append({
                 'no': r['article_no'], 'no_num': r['article_no_num'],
-                'branch': r['article_branch'], 'title': r['title'],
+                'branch': r['article_branch'], 'title': r['title'] or '',
                 'eff_date': r['article_eff_date'],
             })
         articles.sort(key=lambda a: (a['no_num'], a['branch'] or 0))
@@ -1584,6 +1763,15 @@ def _outline_statute(
     }
     if asked:
         out["asked_name"] = asked
+    if earliest:
+        out["no_version_at"] = {"date": to_iso_date(offense_date), "earliest": earliest}
+    # A law repealed or lapsed by as_of: the list is its last wording, and the
+    # header says it no longer has force.
+    rep = _is_repealed_at(conn, meta.get("law_id"), as_of)
+    if rep:
+        del out["as_of"]
+        out["repealed"] = {**rep, "note": f"이 법령은 {rep['effective_date']} {rep['change_kind']} — "
+                                          "지금은 효력이 없는 법령입니다."}
     return out
 
 
@@ -1695,6 +1883,15 @@ def _detail_statute(
     if law_id:
         as_of = offense_iso
         asked = None
+        earliest = None
+        if as_of is not None:
+            first = conn.execute("SELECT MIN(effective_date) FROM st_statutes WHERE law_id=?",
+                                 (law_id,)).fetchone()[0]
+            if first and first > as_of:
+                # The corpus has no version in force on that date: give the
+                # current wording and say so in the header. Walking that date
+                # would report every article as "not yet in force then".
+                earliest, as_of = first, None
         if as_of is None:
             # Serving the current body means serving the current name. This
             # used to keep the requested row's metadata, so current text went
@@ -1715,17 +1912,20 @@ def _detail_statute(
                         asked = {"name": meta["name"],
                                  "effective_date": meta["effective_date"]}
                     meta = cur_meta
+            # By date, not label — a version past its effective date that
+            # still says '시행예정' is current.
             cur = conn.execute(
-                "SELECT MAX(effective_date) AS d FROM st_statutes "
-                "WHERE law_id=? AND COALESCE(history_status,'') != '시행예정'",
-                (law_id,),
+                "SELECT MAX(effective_date) AS d FROM st_statutes WHERE law_id=? AND effective_date <= ?",
+                (law_id, _today_iso()),
             ).fetchone()
             as_of = cur["d"] if cur and cur["d"] else None
         if as_of:
             res = _detail_statute_at_date(conn, meta, specs, as_of,
-                                          asked_iso=offense_iso)
+                                          asked_iso=None if earliest else offense_iso)
             if asked:
                 res["asked_name"] = asked
+            if earliest:
+                res["no_version_at"] = {"date": offense_iso, "earliest": earliest}
             return res
 
     # Fallback for a row with no law id, or when no date can be resolved.
@@ -1864,10 +2064,41 @@ def _detail_statute_at_date(
                 missing.append(f"{num}-{branch}")
                 missing_specs.append((num, branch))
 
-    # Distinguish articles awaiting commencement from old, removed numbers.
+    # Missing numbers that exist in a version in force today but effective
+    # after the asked date were added later -> that version's date. Saying
+    # "nowhere" sends the model away from today's article (부가가치세법
+    # 제39조 as of 2012 — it arrived with the 2013 full revision). Only
+    # numbers alive today (`_articles_in_force`) count: old history delta rows
+    # carry a deferred article under the promulgating version's date
+    # (소득세법 제164조의4: a 2025-01-01 row, in force 2027-01-01), so by
+    # version date alone a pending article would read "added in that
+    # version". With no trustworthy baseline (None), dates alone decide.
+    added: dict[str, str] = {}
+    if asked_iso:
+        alive_today = _articles_in_force(conn, law_id, _today_iso())
+        for num, branch in missing_specs:
+            key = f"{num}" if branch is None else f"{num}-{branch}"
+            if key in vanished:
+                continue
+            if alive_today is not None and not (
+                    (num, branch) in alive_today if branch is not None
+                    else any(n == num for n, _ in alive_today)):
+                continue
+            eff = _added_article(conn, law_id, offense_iso, num, branch)
+            if eff:
+                added[key] = eff
+
+    # Missing numbers found in a version not yet in force are articles
+    # awaiting commencement -> their date. Calling them old numbers makes the
+    # model answer "deleted" (소득세법 제164조의4, in force 2027-01-01). A
+    # number that already exists today is not pending even if a future
+    # version amends it (행정규제기본법 제8조의2, in force since 2018-10-18,
+    # was reported "in force 2026-11-13" in a research pilot).
     pending: dict[str, str] = {}
     for num, branch in missing_specs:
         key = f"{num}" if branch is None else f"{num}-{branch}"
+        if key in added:
+            continue
         hit = _pending_article(conn, law_id, offense_iso, num, branch)
         if hit is None:
             continue
@@ -1896,6 +2127,8 @@ def _detail_statute_at_date(
         out["vanished"] = vanished
     if pending:
         out["pending"] = pending
+    if added:
+        out["added"] = added
     if missing:
         nbrs = _neighbor_articles(conn, law_id, offense_iso, missing_specs,
                                   in_force=in_force)
@@ -2268,6 +2501,11 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             # branch here to print it.
             lines.append(f"- 시점 조회: {_fmt_eff_iso(od)} 기준 문언입니다"
                          + (f" — 현행은 {tail}." if tail else "."))
+        elif resp.get("no_version_at"):
+            nv = resp["no_version_at"]
+            lines.append(f"- 시점 조회 불가: 이 코퍼스에는 {_fmt_eff_iso(nv['date'])} 시점에 시행된 판본이 없습니다"
+                         f"(가장 이른 판본 {_fmt_eff_iso(nv['earliest'])} 시행). 아래는 현행 문언이며 "
+                         "그 시점의 문언과 다를 수 있습니다.")
         elif cv and not cv.get("is_served_row"):
             # `is_served_row` means this ref *is* the row that was looked up.
             # Printing the line then says "not current" and names that row's
@@ -2339,7 +2577,9 @@ def _format_response_md(resp: dict[str, Any]) -> str:
             vanished = resp.get("vanished") or {}
             pending = resp.get("pending") or {}
             od = resp.get("offense_date")
-            never = [str(x) for x in missing if str(x) not in vanished and str(x) not in pending]
+            added = resp.get("added") or {}
+            never = [str(x) for x in missing if str(x) not in vanished and str(x) not in pending
+                     and str(x) not in added]
             if never:
                 lines.append("- 현행·연혁본 어디에도 이 번호의 조문이 없습니다." if len(never) == len(missing)
                              else f"- {', '.join(never)}: 현행·연혁본 어디에도 없는 번호입니다.")
@@ -2357,12 +2597,27 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                         f"- {old}: 현행에는 없는 옛 번호입니다 — 개정으로 조문이 옮겨졌거나 사라졌습니다. "
                         "찾는 내용의 지금 번호는 statute_id 만으로 조문 개요(번호·제목)를 받아 확인하고, "
                         "옛 판례가 인용한 그때 문언이 필요하면 offense_date 를 주세요.")
-            if pending:
-                soon = ", ".join(f"{k}({_fmt_eff_iso(v)} 시행 예정)" for k, v in pending.items())
-                when = f"{_fmt_eff_iso(od)} 시점에는" if od else "아직"
+            if added:
+                new = ", ".join(f"{k}({_fmt_eff_iso(v)}판부터)" for k, v in added.items())
                 lines.append(
-                    f"- {soon}: {when} 시행 전인 조문입니다 — 시행될 문언은 괄호 속 시행일을 "
-                    "offense_date 로 주면 볼 수 있습니다.")
+                    f"- {new}: {_fmt_eff_iso(od)} 시점에는 아직 없던 번호입니다 — 그 뒤 개정으로 생겼거나 번호가 "
+                    "바뀌었습니다. 그 시점의 번호는 같은 offense_date 로 조문 개요(번호·제목)를 받아 확인하고, "
+                    "지금 문언이 필요하면 offense_date 없이 조회하세요.")
+            if pending:
+                when = f"{_fmt_eff_iso(od)} 시점에는" if od else "아직"
+                # An effective date of 9999… is the source's "undecided"
+                # placeholder, not a date to look up.
+                dated = {k: v for k, v in pending.items() if not str(v).startswith("9999")}
+                if dated:
+                    soon = ", ".join(f"{k}({_fmt_eff_iso(v)} 시행 예정)" for k, v in dated.items())
+                    lines.append(
+                        f"- {soon}: {when} 시행 전인 조문입니다 — 시행될 문언은 괄호 속 시행일을 "
+                        "offense_date 로 주면 볼 수 있습니다.")
+                undated = [k for k in pending if k not in dated]
+                if undated:
+                    lines.append(
+                        f"- {', '.join(undated)}: 시행일이 정해지지 않은 개정본에만 있는 번호입니다 — "
+                        f"{when} 시행 중인 조문이 아닙니다.")
             nbrs = resp.get("missing_neighbors")
             if nbrs:
                 lines.append(f"- 근처 조문: {' · '.join(nbrs)}")
@@ -2456,6 +2711,15 @@ def statute_lookup(
     limit = min(max(coerce_int(limit) or 10, 1), LIMIT_MAX)
     articles = coerce_list(articles)
     ref = _parse_statute_ref(statute_id)
+
+    if unreadable_date(offense_date):
+        # Dropping an unreadable date and answering with current text would
+        # be read as the wording on that date.
+        return _bounded_response_md({
+            "status": "bad_offense_date",
+            "message": BAD_DATE_MESSAGE,
+            "input": {"offense_date": offense_date},
+        })
 
     if ref is None and not query:
         # An unreadable statute_id and no statute_id at all are different
@@ -2578,6 +2842,9 @@ def _statute_lookup_impl(
             "matches": matches,
             "offense_date": to_iso_date(offense_date),
         }
+        short = _short_words_message(query, matches) if query else None
+        if short:
+            out["message"] = short
         # Article numbers mean nothing without a law — the same number is a
         # different provision in every act. Rather than ignore them, say so
         # and describe the two-step call.

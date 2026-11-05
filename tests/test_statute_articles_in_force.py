@@ -26,7 +26,7 @@ def corpus(monkeypatch):
         CREATE TABLE st_statutes (
             id INTEGER PRIMARY KEY, law_id TEXT, name TEXT, short_name TEXT,
             kind TEXT, issuing_agency TEXT, promulgation_date TEXT,
-            effective_date TEXT, history_status TEXT, change_kind TEXT, mst TEXT
+            effective_date TEXT, history_status TEXT, change_kind TEXT, mst TEXT, serial_id TEXT
         );
         CREATE TABLE st_articles (
             id INTEGER PRIMARY KEY, statute_id INTEGER, article_no TEXT,

@@ -5,12 +5,14 @@
 
   * a response never names a sibling tool. There is one name to call,
     ``TOOL_NAME``.
-  * called with ``protocol=False`` a response carries nothing addressed to a
-    *next* call — argument schemas, the key beside each group heading, "call
-    again with…", ``sg_category_id``. Left where they cannot be acted on, a
-    model prepares a call that does not exist. They are dropped inside the
-    formatters rather than stripped from the finished string by regex: a regex
-    goes quietly blind the day the wording changes.
+  * called with ``protocol=False`` a response carries none of the
+    engine-only argument schemas, "call again with…" or ``sg_category_id``.
+    Left where they cannot be acted on, a model prepares a call that does not
+    exist. They are dropped inside the formatters rather than stripped from
+    the finished string by regex: a regex goes quietly blind the day the
+    wording changes. Factor ids and their public argument names
+    (``guideline_factor_ids``, ``probation_factor_ids``) belong to the shared
+    catalog (``sentencing_factors``) and stay.
 
 Korean sentencing runs through four stages, and this tool advances through
 them as the caller supplies more: give it a charge and it returns the
@@ -55,6 +57,8 @@ from ._charge_index import (
     strip_charge_decorations)
 from ._coerce import (
     coerce_dict, coerce_dict_list, coerce_int, coerce_list, coerce_str, to_iso_date)
+from .sentencing_factors import format_catalog, read_catalog, resolve_ids, section_tags
+from . import statutes as _statutes
 
 _log = logging.getLogger(__name__)
 
@@ -1597,31 +1601,10 @@ def _format_processed_penalty_lines(p: ProcessedPenalty) -> list[str]:
 
 # ---------- the recommended range: guideline leaf and factors ----------
 
-# The dict keys `guideline_factors` and `probation_factors` accept. **These two
-# tuples are the source**: the schema line in the response, the conversion
-# functions below, and the argument check in `sentencing_analysis` all read them.
-#
-# There are responses that do not carry these names (`protocol=False`). Handed an
-# unknown key there, `.get()` returns an empty list and **the factors vanish
-# whole, leaving "기본영역"** — measured: `{"감경": [...]}` and `{"zzz": [...]}`
-# both came back `status: ok` in the default band. So the calling surface checks
-# the keys and hands them back (`sentencing_analysis._bad_factor_keys`).
-GUIDELINE_FACTOR_KEYS = ("special_act_aggravators", "special_act_mitigators",
-                         "special_actor_aggravators", "special_actor_mitigators")
-PROBATION_FACTOR_KEYS = ("major_positive", "major_negative",
-                         "general_positive", "general_negative")
-
-
-def _schema_line(keys: tuple[str, ...]) -> str:
-    """`- schema: {a: [text...], b: [...], ...}` — built from the tuples above."""
-    rest = ", ".join(f"{k}: [...]" for k in keys[1:])
-    return f"- schema: {{{keys[0]}: [text...], {rest}}}"
-
-
 def _convert_factors_to_applied(
     guideline_factors: dict | None,
 ) -> list[AppliedFactor]:
-    """Turn the caller's factor lists into applied-factor records.
+    """Turn classified special-factor lists into applied-factor records.
 
     Input shape::
 
@@ -1632,10 +1615,11 @@ def _convert_factors_to_applied(
         "special_actor_mitigators":  [...],
       }
 
-    The text passes through as the caller wrote it and is not verified: how
-    accurately a factor was classified is measured against gold labels in
-    evaluation, not here. This counts by the (kind, direction) the dict key
-    implies, and the text is for the trace.
+    The registered tool never has the model write this dict: it resolves the
+    ids the model picked against the guideline table into this shape
+    (`sentencing_factors.resolve_ids`). The arithmetic only counts by the
+    (kind, direction) the key implies, and the text is for the trace. Whether
+    a factor fits the case is the model's judgement.
     """
     if not guideline_factors:
         return []
@@ -1677,21 +1661,18 @@ def _extract_fine_paragraphs(
     """
     if statute_id is None:
         return []
-    if article_branch and article_branch != 0:
-        row = conn.execute(
-            "SELECT article_text FROM st_articles "
-            "WHERE statute_id=? AND article_no_num=? AND article_branch=?",
-            (statute_id, article_no_num, article_branch),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT article_text FROM st_articles "
-            "WHERE statute_id=? AND article_no_num=? AND article_branch IS NULL",
-            (statute_id, article_no_num),
-        ).fetchone()
-    if row is None or not row[0]:
+    # An article without a branch stores article_branch as NULL or 0 depending
+    # on the load path (measured: 180K NULL rows, 410K zero rows), so match
+    # both. Part and chapter heading rows carry the number of the article that
+    # follows them and are skipped (형법 제136조 <- '제7장 공무방해에 관한 죄';
+    # 17 articles lost their fine wording this way in a research audit).
+    text = next((t for (t,) in conn.execute(
+        "SELECT article_text FROM st_articles "
+        "WHERE statute_id=? AND article_no_num=? AND COALESCE(article_branch,0)=? ORDER BY id",
+        (statute_id, article_no_num, article_branch or 0),
+    ) if t and not _statutes._is_structural_heading(t)), None)
+    if not text:
         return []
-    text = row[0]
     paragraphs = re.split(r"(?=[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮])", text)
     return [p.strip() for p in paragraphs if p.strip() and "벌금" in p]
 
@@ -1875,7 +1856,7 @@ def _probation_recommendation(
         return lines
 
     if not probation_factors:
-        lines.append("- probation_factors 미지정 — 4분면 룰 적용 불가")
+        lines.append("- 집행유예 참작사유 미지정 — 4분면 룰 적용 불가")
         return lines
 
     mp = len(probation_factors.get("major_positive") or [])
@@ -2142,11 +2123,12 @@ def _range_text(r: sqlite3.Row) -> str:
 
 
 def _format_leaf_candidates(conn: sqlite3.Connection, leaves: list[sqlite3.Row],
-                            *, protocol: bool = True) -> list[str]:
+                            *, protocol: bool = True, category_id: int | None = None) -> list[str]:
     """Format leaf candidate enum in lookup stage."""
     if not leaves:
         return []
     keys = _leaf_keys(leaves)
+    tags = section_tags(conn, category_id)
     lines = ["## 대법원 양형기준 권고형 범위 (정밀 계산 시 `guideline_type` 에 따옴표 안 명칭 그대로)"
              if protocol else "## 권고 형량범위 — 범죄유형별"]
     for lf in leaves:
@@ -2162,7 +2144,10 @@ def _format_leaf_candidates(conn: sqlite3.Connection, leaves: list[sqlite3.Row],
         r_map = {r["level"]: r for r in rows}
         parts = [f"{lvl} {_range_text(r_map[lvl])}" for lvl in ("기본", "감경", "가중") if lvl in r_map]
         desc = " · ".join(parts) if parts else "권고형 없음"
-        lines.append(f'- "{key}"{crit_str}: {desc}')
+        # The section letter goes **before** the quotes, so copying the quoted
+        # name alone does not drag the letter along.
+        tag = f"[{tags[lf['id']]}] " if lf["id"] in tags else ""
+        lines.append(f'- {tag}"{key}"{crit_str}: {desc}')
     return lines
 
 
@@ -2187,8 +2172,12 @@ def _get_leaf_label(conn: sqlite3.Connection, leaf_id: int) -> str | None:
     return _leaf_label(row) + (f" ({crit})" if crit else "")
 
 
+_SECTION_TAG_RE = re.compile(r"^\[[A-Z]\d*\]\s*")
+
+
 def _normalize_type_query(q: str) -> str:
     q = (q or "").translate(_QUOTE_TRANS).strip()
+    q = _SECTION_TAG_RE.sub("", q).strip()  # the section letter of a type line (「[A] "…"」) came along
     q = q.split(":", 1)[0].strip()
     return _ORDINAL_TYPE_RE.sub(lambda m: f"{m.group(1)}유형", q)
 
@@ -2300,178 +2289,6 @@ def _resolve_leaf(
     return None, notes
 
 
-def _list_factors_for_category(
-    conn: sqlite3.Connection, sg_category_id: int
-) -> list[sqlite3.Row]:
-    """Factors available under this category.
-
-    The union of the factors attached to each leaf. Within one category the
-    leaves carry nearly the same factors: the type criterion is what
-    distinguishes them, while the factors are shared.
-
-    The lookup stage returns these so the caller can fill `guideline_factors`
-    on its next call and cite the general factors in its reasoning.
-    """
-    return conn.execute(
-        "SELECT DISTINCT scope, kind, direction, text FROM sg_factors "
-        "WHERE category_id=? "
-        "ORDER BY scope DESC, kind, direction, text",
-        (sg_category_id,),
-    ).fetchall()
-
-
-# Factors are grouped by scope (special or ordinary), kind (conduct or
-# offender) and direction (aggravating or mitigating). The four lists the
-# caller supplies mirror these groups.
-def _format_factor_enum(factors: list[sqlite3.Row], *, protocol: bool = True) -> list[str]:
-    if not factors:
-        return []
-    # Group by scope, kind and direction.
-    from collections import defaultdict
-    groups: dict[tuple[str, str, str], list[str]] = defaultdict(list)
-    for r in factors:
-        groups[(r["scope"], r["kind"], r["direction"])].append(r["text"])
-
-    # Special factors first: they choose the band. Ordinary factors only
-    # move the sentence within it.
-    special = [k for k in groups if k[0] == "특별"]
-    general = [k for k in groups if k[0] == "일반"]
-    n_special = sum(len(groups[k]) for k in special)
-    n_general = sum(len(groups[k]) for k in general)
-
-    # Group heading -> the key the caller passes it back under.
-    _GF_KEY = {
-        ("특별", "행위", "가중"):       "special_act_aggravators",
-        ("특별", "행위", "감경"):       "special_act_mitigators",
-        ("특별", "행위_공통", "가중"):  "special_act_aggravators",
-        ("특별", "행위_공통", "감경"):  "special_act_mitigators",
-        ("특별", "행위_미수", "가중"):  "special_act_aggravators",
-        ("특별", "행위_미수", "감경"):  "special_act_mitigators",
-        ("특별", "행위자_기타", "가중"): "special_actor_aggravators",
-        ("특별", "행위자_기타", "감경"): "special_actor_mitigators",
-    }
-
-    lines: list[str] = []
-    if special:
-        lines.append(
-            f"## 양형기준 특별인자 enum ({n_special}개 — `guideline_factors` 선택용)"
-            if protocol else f"## 특별양형인자 ({n_special}개)"
-        )
-        if protocol:
-            lines.append(_schema_line(GUIDELINE_FACTOR_KEYS))
-            lines.append(
-                "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출."
-            )
-        for key in sorted(special):
-            scope, kind, direction = key
-            gf_key = _GF_KEY.get(key, "?")
-            lines.append(f"[{scope}/{kind}/{direction}] → {gf_key}" if protocol
-                         else f"[{scope}/{kind}/{direction}]")
-            for t in groups[key]:
-                lines.append(f"- {t}")
-    if general:
-        lines.append(
-            f"## 양형기준 일반인자 enum ({n_general}개 — 영역 결정 무영향, "
-            "선고형 위치 결정 시 reasoning 인용)"
-            if protocol else
-            f"## 일반양형인자 ({n_general}개 — 권고영역 결정에는 쓰지 않고 선고형 위치에 쓴다)"
-        )
-        for key in sorted(general):
-            scope, kind, direction = key
-            lines.append(f"[{scope}/{kind}/{direction}]")
-            for t in groups[key]:
-                lines.append(f"- {t}")
-    return lines
-
-
-def _list_probation_factors_for_category(
-    conn: sqlite3.Connection, sg_category_id: int
-) -> list[sqlite3.Row]:
-    """Suspension factors available under this category.
-
-    A union across the category, grouped by section number and source note.
-    That grouping keeps the separate four-quadrant tables some categories
-    publish per sub-section — 증권·금융 among them — from collapsing into one.
-
-    The lookup stage returns these so the caller can fill the four
-    `probation_factors` lists without inventing entries, and can tell which
-    sub-section a factor came from.
-    """
-    return conn.execute(
-        """
-        SELECT pole, direction, text, section_no, source_note
-        FROM sg_probation_factors
-        WHERE category_id=?
-        ORDER BY pole DESC, direction, section_no, source_note, text
-        """,
-        (sg_category_id,),
-    ).fetchall()
-
-
-# pole ∈ {major, general}, direction ∈ {positive, negative}.
-# Mirrors the four lists the caller passes back; the rule that consumes
-# them is in the recommendation function above.
-def _format_probation_factor_enum(rows: list[sqlite3.Row], *, protocol: bool = True) -> list[str]:
-    if not rows:
-        return []
-    from collections import defaultdict
-
-    groups: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
-    for r in rows:
-        key = (
-            r["pole"],
-            r["direction"],
-            r["section_no"] or "",
-            r["source_note"] or "",
-        )
-        groups[key].append(r["text"])
-
-    order_pole = {"major": 0, "general": 1}
-    order_dir = {"positive": 0, "negative": 1}
-
-    # Group heading -> the key the caller passes it back under.
-    _PF_KEY = {
-        ("major", "positive"):   "major_positive",
-        ("major", "negative"):   "major_negative",
-        ("general", "positive"): "general_positive",
-        ("general", "negative"): "general_negative",
-    }
-
-    lines: list[str] = ([
-        f"## 집행유예 4분면 enum ({len(rows)}개 — `probation_factors` 선택용)",
-        _schema_line(PROBATION_FACTOR_KEYS),
-        "- 각 그룹 헤더 옆 *key* 에 해당 list 에 text 그대로 넣어 호출.",
-    # `protocol=False` does **not** say how to call back with this list — saying
-    # so does not work. Measured: the four-quadrant rule ran 0 times across 42
-    # runs, so "give the sentence and the factors together and it computes" went
-    # in here and the 42 were run again. The rule still ran **0 times**, use of
-    # `probation_factors` on one model went 3 → 0, and suspension accuracy fell
-    # 45.5 → 36.4% (11 cases, so the drop is not conclusive, but there was no
-    # evidence of improvement at all). Reverted.
-    #   To whoever tries again: rewording is not the way. The rule needs
-    #   `sentence_months` and `probation_factors` **both**, and by the time a
-    #   model fixes a sentence it has already settled on its answer — reading the
-    #   invitation then does not buy another call. The order is structurally wrong.
-    ] if protocol else [f"## 집행유예 참작사유 ({len(rows)}개)"])
-    for key in sorted(
-        groups, key=lambda k: (order_pole[k[0]], order_dir[k[1]], k[2], k[3])
-    ):
-        pole, direction, sec, note = key
-        pf_key = _PF_KEY.get((pole, direction), "?")
-        head = f"[{pole}/{direction}] → {pf_key}" if protocol else f"[{pole}/{direction}]"
-        if sec:
-            head += f"  (section={sec}"
-            if note:
-                head += f", {note}"
-            head += ")"
-        elif note:
-            head += f"  ({note})"
-        lines.append(head)
-        for t in groups[key]:
-            lines.append(f"- {t}")
-    return lines
-
-
 # The statutory grounds for adjustment. Universal, so this is a constant
 # rather than a per-category lookup; the order and the multipliers live with
 # the adjustment logic. Attempt, aiding and solicitation are added
@@ -2529,21 +2346,26 @@ def _lookup_historic_article(
     if not s or not s['law_id']:
         return None
     law_id = s['law_id']
-    r = conn.execute(
+    # Heading rows carry the number of the article that follows them and are
+    # skipped ('제10장 벌칙' <- 제70조; 81 of 1,304 lookups in a research audit
+    # returned a heading row).
+    r = next((row for row in conn.execute(
         """SELECT s.effective_date, s.mst, a.article_text
            FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id
            WHERE s.law_id=? AND a.article_no_num=? AND COALESCE(a.article_branch,0)=?
              AND s.effective_date <= ?
-           ORDER BY s.effective_date DESC, (a.article_changed='Y') DESC LIMIT 1""",
+           ORDER BY s.effective_date DESC, (a.article_changed='Y') DESC""",
         (law_id, art_no, art_br, offense_iso),
-    ).fetchone()
+    ) if not _statutes._is_structural_heading(row['article_text'])), None)
     if not r:
         return None
-    # Also the current version's date, to show both ends of the timeline.
+    # Also the current version's date, to show both ends of the timeline: the
+    # latest version in force today. A version not yet in force would label an
+    # amendment that has not taken effect as current.
     current = conn.execute(
-        """SELECT effective_date FROM st_statutes WHERE law_id=?
+        """SELECT effective_date FROM st_statutes WHERE law_id=? AND effective_date <= ?
            ORDER BY effective_date DESC LIMIT 1""",
-        (law_id,),
+        (law_id, _statutes._today_iso()),
     ).fetchone()
     current_eff = current['effective_date'] if current else None
     return {
@@ -2785,19 +2607,14 @@ def _format_lookup_response(
 
     # Guideline leaves to choose from on the next call.
     leaves = _list_leaves_for_category(conn, payload_row["sg_category_id"])
-    lines.extend(_format_leaf_candidates(conn, leaves, protocol=protocol))
+    lines.extend(_format_leaf_candidates(conn, leaves, protocol=protocol,
+                                         category_id=payload_row["sg_category_id"]))
     lines.extend(_format_guide_notes(guide_notes))
 
-    # Factors to choose from. Offered as the union across the category,
-    # since they barely differ between leaves within one.
-    factors = _list_factors_for_category(conn, payload_row["sg_category_id"])
-    lines.extend(_format_factor_enum(factors, protocol=protocol))
-
-    # Suspension factors to choose from.
-    prob_factors = _list_probation_factors_for_category(
-        conn, payload_row["sg_category_id"]
-    )
-    lines.extend(_format_probation_factor_enum(prob_factors, protocol=protocol))
+    # Factors and suspension grounds to choose from, each with its id beside
+    # the source text; the model picks them as `guideline_factor_ids` and
+    # `probation_factor_ids`. `sentencing_factors` owns the list and the checks.
+    lines.extend(format_catalog(read_catalog(conn, payload_row["sg_category_id"])))
 
     # Statutory adjustments to choose from; the same for every offence.
     lines.extend(_format_modifier_enum(protocol=protocol))
@@ -3582,6 +3399,8 @@ def compute_sentencing_range(
     offense_date: OptStrArg = None,
     *,
     protocol: bool = True,
+    guideline_factor_ids: list[int] | None = None,
+    probation_factor_ids: list[int] | None = None,
 ) -> str:
     """통합 양형 도구 — 죄명에서 출발해 법정형 → 처단형 → 권고형(양형기준) → 선고 검증까지 단계별 계산.
 
@@ -3632,6 +3451,11 @@ def compute_sentencing_range(
         경합범 가중을 처단형에 자동 적용 (자유형 장기 1/2 가중, §42 ② 50년 cap).
         statutory_modifications 에 경합범_가중 항목을 명시하면 그 명시가 우선.
         포괄일죄·영업범처럼 판결문이 §37 을 명시하지 않는 유형은 1로 두세요.
+      guideline_factor_ids: 특별양형인자 목록에서 고른 id — guideline_type 이 필요하다.
+      probation_factor_ids: 집행유예 참작사유 목록에서 고른 id — guideline_type 이 필요하다.
+        특별양형인자는 고른 유형의 절로, 집행유예 사유는 카테고리로 확인한다. 양형기준 밖의 조항이나
+        유형이 정해지지 않은 조항은 id 를 건너뛰고 그렇다고 적는다. 등록 도구(`sentencing_analysis`)는
+        이 둘만 넘기고 dict 인자(guideline_factors·probation_factors)는 엔진 자체 점검용으로만 남는다.
     """
     # Normalise everything the wide signature let through.
     # A list of two or more charges is caught before `coerce_str` joins it:
@@ -3760,7 +3584,7 @@ def compute_sentencing_range(
                         f"## ⚠ branch_key={branch_key!r} 미적용 — 이 조문에는 분기가 없습니다"
                         f"{era}. 아래 정량은 조문 전체의 것입니다.")
                 if reference_choice and not (payload_row["reference_mode"]
-                                             in ("가중", "준용", "공동가중")):
+                                             in ("가중", "준용", "공동가중", "분기")):
                     penalty.trace.append(
                         f"## ⚠ reference_choice={reference_choice!r} 미적용 — 이 조문은 다른 죄의"
                         f" 형을 끌어쓰지 않습니다{era}.")
@@ -3788,6 +3612,35 @@ def compute_sentencing_range(
             scope_notes = [f"- ⚠ 양형기준 없음: {out_of_scope}"] if out_of_scope else []
             guide_notes = list_notes + leaf_notes + scope_notes
             leaf_label = _get_leaf_label(conn, resolved_leaf_id) if resolved_leaf_id else ""
+            # Factor ids count only when a guideline type governs this provision.
+            # One charge can have candidates inside and outside the guideline
+            # (drink-driving: §148의2 ① is outside, ③ inside), so a candidate
+            # that cannot use them says so and is still computed — refusing the
+            # call here would refuse every candidate (31 charges in a research
+            # audit). Only a missing type or an id outside this category stops
+            # the calculation.
+            if guideline_factor_ids is not None or probation_factor_ids is not None:
+                if out_of_scope or payload_row["sg_category_id"] is None:
+                    guideline_factors = probation_factors = None
+                    guide_notes.append("- 인자 id는 이 조항에 적용하지 않았다 — 양형기준 적용 대상이 아니다.")
+                elif resolved_leaf_id is None and not (guideline_type or guideline_leaf_id is not None):
+                    return ("## status: bad_factor_id\n- 인자 id는 guideline_type과 함께 보낸다"
+                            " — 아래 목록의 유형 명칭을 그대로 넣는다.\n"
+                            + "\n".join(leaf_notes + _format_leaf_candidates(
+                                conn, _list_leaves_for_category(conn, payload_row["sg_category_id"]),
+                                protocol=False, category_id=payload_row["sg_category_id"])) + "\n")
+                elif resolved_leaf_id is None:
+                    guideline_factors = probation_factors = None
+                    guide_notes.append("- 인자 id는 이 조항에 적용하지 않았다 — guideline_type이 이 조항의 유형으로"
+                                       " 정해지지 않았다.")
+                else:
+                    try:
+                        guideline_factors, probation_factors, factor_trace = resolve_ids(
+                            read_catalog(conn, payload_row["sg_category_id"]),
+                            guideline_factor_ids, probation_factor_ids, leaf_id=resolved_leaf_id)
+                    except ValueError as exc:
+                        return f"## status: bad_factor_id\n{exc}\n"
+                    appendix = factor_trace + appendix
             needs_processed = statutory_modifications is not None
             needs_recommended = resolved_leaf_id is not None
             needs_final = sentence_months is not None or fine_amount is not None

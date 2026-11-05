@@ -27,10 +27,11 @@ computes every candidate.
   and the verification come from ``compute_sentencing_range`` (the engine, not a
   registered tool), the distribution from ``sentence_statistics``, the article
   text from ``statute_lookup``.
-- Nothing that cannot be acted on. Argument schemas, the key beside a group
-  heading, "call again with…" — the engine's ``protocol=False`` drops those
-  **inside its formatters**, rather than this module scrubbing a finished
-  response with a regex.
+- Nothing that cannot be acted on. Engine-only argument schemas and "call
+  again with…" — the engine's ``protocol=False`` drops those **inside its
+  formatters**, rather than this module scrubbing a finished response with a
+  regex. Factor ids and their argument names belong to the shared catalog
+  (``sentencing_factors``) and stay.
 - Size is held by a budget. Truncation is a silent failure, so when the response
   runs over it folds itself and says what it folded (measured: article text is
   the largest cost by far — one financial-markets statute ran to 9,906
@@ -43,13 +44,11 @@ import re
 from pydantic_ai import RunContext
 
 from ..config import case_url_base
-from ..deps import HarnessDeps
-from ._coerce import coerce_dict, coerce_int, coerce_str
+from ..deps import HarnessDeps, open_db
+from ._coerce import BAD_DATE_MESSAGE, coerce_int, coerce_str, unreadable_date
 from .compute_sentencing_range import (
     _MOD_MULT,
     _MOD_ORDER,
-    GUIDELINE_FACTOR_KEYS,
-    PROBATION_FACTOR_KEYS,
     Candidate,
     ChargeArg,
     OptStrArg,
@@ -57,21 +56,24 @@ from .compute_sentencing_range import (
     sentencing_candidates,
 )
 from .sentence_statistics import sentence_statistics
+from .sentencing_factors import FactorIds, _decode_ids
 from .statutes import statute_lookup
 
-# Response budget, in characters. Over it, `_articles_section` and `_trim` fold.
+# Response budget, in characters. `_trim` and `_articles_section` fit the
+# response inside it. Statute candidates are never removed (the no-asking-back
+# promise of that section), and neither is the list of special-factor ids.
+# Whether it still fits is what `test_sentencing_analysis` checks.
 #
-# Measured over all 677 charges: longest 12,699 (아동학대처벌법), median 7,822,
-# 12 charges over 12,000, none over 13,000 — **2.3% of headroom (301 characters)**.
-# One more constant line in the response grows all 677 at once (two lines about
-# repeat offences cost exactly +97 characters across 673 of them). Anyone adding
-# a section should read that headroom first and re-measure after; whether it
-# still fits is what `test_sentencing_analysis` checks.
-# Staying under is `_trim`'s job, but trimming means **folding**. 19 of the 677
-# actually folded (2.8%: 13 general suspension factors, 6 ordinary factors, 0
-# conditions), so it is still the exception — if that share climbs noticeably,
-# it is time to raise the budget.
-BUDGET = 13_000
+# 13,000 -> 13,600 when each factor started carrying its id and the types and
+# special factors their section letter (at 13,000 the letters alone cost 6
+# charges their statute text and 2 the general suspension quadrants). Measured
+# over all 677 charges: longest 13,427, median 8,147, 9 over 13,000 — the
+# sentence-dict version before it was longest 12,699, median 7,822. Against
+# that version folding went from 19 charges (13 general suspension factors, 6
+# ordinary factors) to 15 (ordinary factors only); statute text turned into
+# links for 4 charges and newly fits for 3. One more line per factor grows
+# every charge — re-measure all 677 after adding one.
+BUDGET = 13_600
 
 # ---------------------------------------------------------------- the sequence
 # Source: Sentencing Commission, 「양형기준 해설」 — how the guidelines are applied,
@@ -316,8 +318,18 @@ def _articles_section(ctx, cands: list[Candidate], room: int) -> list[str]:
                 room -= len(md)
                 taken = subset
                 break
-        listed += [f"- §{a}: {case_url_base()}/statutes/{sid:06d}/{a}"
-                   for a in arts if a not in taken]
+        rest = [a for a in arts if a not in taken]
+        if rest:
+            # A statute page is addressed by law_id. Zero-padding the row id
+            # (statute_id) to six digits opens an unrelated statute or no page.
+            conn = open_db()
+            try:
+                row = conn.execute("SELECT law_id FROM st_statutes WHERE id=?", (sid,)).fetchone()
+            finally:
+                conn.close()
+            law_id = row["law_id"] if row else None
+            listed += [f"- §{a}: {case_url_base()}/statutes/{law_id}/{a}" if law_id else f"- §{a}"
+                       for a in rest]
     if listed:
         out.append("## 근거 조문 — 원문 생략\n"
                    "지면이 모자라 링크만 싣는다. 본문이 필요하면 `statute_lookup` 으로 조회한다.\n"
@@ -325,74 +337,41 @@ def _articles_section(ctx, cands: list[Candidate], room: int) -> list[str]:
     return out
 
 
-# One row of the statutory-range table: `- "조항" / "분기" — 조건 문구: 자유형 … · 벌금 …`
-_ROW_RE = re.compile(r"(?P<head>- .*?) — (?P<cond>.*?): (?P<tail>자유형 .*)$")
-_COND_MIN = 20          # below this a condition no longer distinguishes branches
-
-
-def _trim(sections: list[tuple[str, str]], room: int) -> list[str]:
+def _trim(sections: list[tuple[str, str]], room: int, limit: int) -> list[str]:
     """Fold, in this order, when over budget — and always say what was folded.
 
-    1) the general quadrants of the suspension factors (the major ones decide first)
-    2) the ordinary sentencing factors (no effect on the band — FLOW 4-2 says so)
-    3) the conditions in the statutory-range table (**rows are never removed**)
+    Rows of the statutory-range table (the statute candidates) are never
+    removed. 「여기 있는 것이 전부다」 is that section's promise, and deleting a
+    candidate tells a model that branch does not exist.
 
-    Without 3 nothing can be folded on a charge with many candidates: 아동학대처벌법
-    has 117 of them, and that one table runs to 7,906 characters — 62% of the
-    response. Folding 1 and 2 still left it over budget.
-    **A row (a candidate) is never deleted.** 「여기 있는 것이 전부다」 is this
-    section's promise, and deleting a candidate tells a model that branch does not
-    exist — which is the whole ground for not asking back. Cut the condition text
-    instead, and say it was cut.
+    1) the ordinary sentencing factors, when the sections exceed `room`. They
+       are not selectable and do not affect the band, so they give way to the
+       statute text.
+    2) the general quadrants of the suspension factors, only when the response
+       exceeds `limit` (the budget itself). They are selectable, so this is
+       the last resort; the major factors decide first. Measured over all 677
+       charges at the current budget, none reaches this step. The last one
+       that did was 아동학대처벌법위반 (117 statute candidates — the
+       statutory-range table alone ran to 7,519 characters).
     """
     folded: list[str] = []
-    for prefix, what in (("## 집행유예 참작사유", "집행유예 일반참작사유"),
-                         ("## 일반양형인자", "일반양형인자")):
-        if sum(len(h) + len(b) for h, b in sections) <= room:
-            break
-        i = _index_of(sections, prefix)
-        if i is None:
-            continue
-        header, body = sections[i]
-        if prefix == "## 집행유예 참작사유":
-            keep, dropped = [], 0
-            general = False
-            for line in body.splitlines():
-                if line.startswith("[general/"):
-                    general = True
-                elif line.startswith("["):
-                    general = False
-                if general and line.startswith("- "):
-                    dropped += 1
-                    continue
-                if general and line.startswith("["):
-                    continue
-                keep.append(line)
-            keep.append(f"- (일반참작사유 {dropped}개는 지면상 생략 — 주요참작사유가 먼저 가른다)")
-            sections[i] = (header, "\n".join(keep))
-        elif prefix == "## 법정형 — 조항·분기별":
-            over = sum(len(h) + len(b) for h, b in sections) - room
-            keep, cut = [], 0
-            for line in body.splitlines():
-                m = _ROW_RE.match(line)
-                # Cut only the overflow: divide it across the remaining rows and
-                # leave anything already shorter alone (cutting short conditions
-                # makes the table unreadable).
-                if m and over > 0:
-                    width = max(_COND_MIN, len(m["cond"]) - max(1, over // 20))
-                    if width < len(m["cond"]):
-                        over -= len(m["cond"]) - width
-                        cut += 1
-                        line = f'{m["head"]} — {m["cond"][:width]}…: {m["tail"]}'
-                keep.append(line)
-            if cut:
-                keep.append(f"- (조건 문구 {cut}개를 지면상 줄였다 — 후보는 하나도 안 지웠다."
-                            " 전문은 `statute_lookup` 으로 조문을 본다)")
-            sections[i] = (header, "\n".join(keep))
-        else:
-            n = len([l for l in body.splitlines() if l.startswith("- ")])
-            sections[i] = (header, f"- (인자 {n}개 생략 — 권고영역 결정에는 영향이 없다)")
-        folded.append(what)
+    i = _index_of(sections, "## 일반양형인자")
+    if len(_render(sections)) > room and i is not None:
+        sections[i] = (sections[i][0], "- (목록 생략 — 권고영역 결정에는 영향이 없다)")
+        folded.append("일반양형인자")
+    i = _index_of(sections, "## 집행유예 참작사유")
+    if len(_render(sections)) > limit and i is not None:
+        keep, dropped, general = [], 0, False
+        for line in sections[i][1].splitlines():
+            if line.startswith("["):
+                general = line.startswith("[general/")
+            if general:
+                dropped += line.startswith("- ")
+                continue
+            keep.append(line)
+        keep.append(f"- (일반참작사유 {dropped}개는 지면상 생략 — 주요참작사유가 먼저 가른다)")
+        sections[i] = (sections[i][0], "\n".join(keep))
+        folded.append("집행유예 일반참작사유")
     return folded
 
 
@@ -465,8 +444,11 @@ def _brief(ctx, charge: str, cands: list[Candidate], narrow: dict,
     # factor and suspension sections identical down to the md5, and **only the
     # statutory range differs** — so the rest is carried once.
     if len(got) > 1:
+        # The chosen base offence and its range belong to the first candidate
+        # only — the statutory-range table below carries one per candidate.
         sections = [(h, b) for h, b in sections
-                    if not h.startswith(("## branch_key 선택:", "## reference 선택:"))]
+                    if not h.startswith(("## branch_key 선택:", "## reference 선택:", "## 선택 원범죄:",
+                                         "## 원범죄 (", "## 원형:"))]
     li = _index_of(sections, "## 법정형")
     if len(got) > 1 and li is not None:
         by_statute: dict[str, list[str]] = {}
@@ -520,8 +502,9 @@ def _brief(ctx, charge: str, cands: list[Candidate], narrow: dict,
         sections.insert(li, ("", FLOW))
 
     stat_status, stat_md = _stat_section(ctx, charge, reference_year)
-    room = BUDGET - len(_render(sections)) - len(stat_md)
-    folded = _trim(sections, BUDGET - len(stat_md) - 1500)
+    # The statute section takes at least its link list, plus one line saying it folded.
+    links = sum(len(a) for a in _articles_section(ctx, [c for c, _r in got], 0)) + 100
+    folded = _trim(sections, BUDGET - len(stat_md) - 1500, BUDGET - len(stat_md) - links)
     room = BUDGET - len(_render(sections)) - len(stat_md)
     articles = _articles_section(ctx, [c for c, _r in got], room)
 
@@ -534,11 +517,22 @@ def _brief(ctx, charge: str, cands: list[Candidate], narrow: dict,
 
 def _calc(ctx, charge: str, cands: list[Candidate], narrow: dict, calc: dict) -> str:
     """The calculation. The guideline is not reprinted — the briefing already gave it."""
+    # Factor ids come from the briefing's category. A charge whose candidates
+    # span categories (문화재보호법위반: §94 arson and §92·93 damage, each with
+    # its own 「일반적 기준 1유형」) sends ids only some candidates know. The
+    # call is refused only when no candidate could count them; otherwise the
+    # calculation stands and the refusal is written in that candidate's place.
     blocks: list[str] = []
+    refused: list[tuple[Candidate, str]] = []
+    counted = False
     for c in cands:
         resp = compute_sentencing_range(
             ctx, charge=charge, statute_choice=c.statute_choice, branch_key=c.branch_key,
             reference_choice=c.reference_choice, protocol=False, **narrow, **calc)
+        if _status_of(resp) == "bad_factor_id":
+            refused.append((c, resp))
+            continue
+        counted = counted or "\n## 적용 인자\n" in resp
         sections = _split(resp)
         i = _index_of(sections, "## stage:")
         if i is not None:
@@ -546,6 +540,12 @@ def _calc(ctx, charge: str, cands: list[Candidate], narrow: dict, calc: dict) ->
         if len(cands) > 1:
             sections.insert(1, (f"## 조항·분기: {_where(c)}", c.label))
         blocks.append(_render(sections[1:] if blocks else sections))
+    if refused and not counted:
+        return refused[0][1]
+    for c, resp in refused:
+        reason = resp.split("\n", 1)[1].replace("\n- 입력을 수정해 다시 호출하세요. 계산하지 않았습니다.", "")
+        blocks.append(f"## 조항·분기: {_where(c)}\n{c.label}\n- 이 조항은 계산하지 않았다 — 보낸 인자 id가"
+                      f" 이 조항의 양형기준 목록에 없다.\n{reason.rstrip()}\n")
     tail = ("\n- 기준 전문(유형·양형인자·집행유예 참작사유)은 앞의 양형 분석 응답에 있다 —"
             " 같은 죄명으로 다시 부르지 않는다.\n")
     if len(cands) > 1:
@@ -553,9 +553,6 @@ def _calc(ctx, charge: str, cands: list[Candidate], narrow: dict, calc: dict) ->
                 " 하나로 좁히려면 `statute_choice`·`branch_key` 를 준다." + tail)
     return "\n".join(blocks).rstrip() + "\n" + tail
 
-
-_CALC_ARGS = ("statutory_modifications", "guideline_type", "guideline_factors",
-              "probation_factors", "sentence_months", "fine_amount")
 
 # The statuses meaning "the charge was not in the mapping table". **Only these**
 # turn into `no_guideline` when a distribution exists — a name absent from the
@@ -572,58 +569,6 @@ _CALC_ARGS = ("statutory_modifications", "guideline_type", "guideline_factors",
 # notation slip would have been tallied as a fact about corpus coverage.
 _NOT_IN_CORPUS = ("not_found", "not_found_with_candidates")
 
-# ---------------------------------------------------------------- factor keys
-# The factor lists in a response are grouped under **group headings** like
-# `[특별/행위/감경]`. Pass a heading as the dict key and the arithmetic still runs
-# `status: ok` while not one factor is counted, because the engine only `.get()`s
-# the keys it knows. Measured (사기, 일반사기 1유형, sentence fixed at 6 months):
-#   {"special_act_mitigators": […]} + {"major_positive": […×2]} → 영역 감경 · 집유 권고
-#   {"감경": […]}              + {"positive": […]}          → 영역 기본 · major 0/0
-#   {"zzz": […]}               + {"qqq": […]}               → 영역 기본 · major 0/0
-# The last two raised no warning and no change of status. So it hands them back
-# **without computing** — better than a wrong number. The heading-to-key mapping
-# is printed here and only here (a correct call's response is left alone).
-_HEADER_KEY = {
-    "guideline_factors": (("[특별/행위/가중]", "special_act_aggravators"),
-                          ("[특별/행위/감경]", "special_act_mitigators"),
-                          ("[특별/행위자_기타/가중]", "special_actor_aggravators"),
-                          ("[특별/행위자_기타/감경]", "special_actor_mitigators")),
-    "probation_factors": (("[major/positive]", "major_positive"),
-                          ("[major/negative]", "major_negative"),
-                          ("[general/positive]", "general_positive"),
-                          ("[general/negative]", "general_negative")),
-}
-_VALID_KEYS = {"guideline_factors": GUIDELINE_FACTOR_KEYS,
-               "probation_factors": PROBATION_FACTOR_KEYS}
-
-
-def _bad_factor_keys(calc: dict) -> str | None:
-    """The response to hand back if a key is unknown, else None. Normalizes in place."""
-    bad: list[tuple[str, list[str]]] = []
-    for arg in ("guideline_factors", "probation_factors"):
-        if arg not in calc:
-            continue
-        d = coerce_dict(calc[arg])
-        if d is None:                       # a list, a string — leave it to the engine
-            continue
-        calc[arg] = d
-        unknown = [str(k) for k in d if k not in _VALID_KEYS[arg]]
-        if unknown:
-            bad.append((arg, unknown))
-    if not bad:
-        return None
-    lines = ["## status: bad_factor_key"]
-    for arg, unknown in bad:
-        lines.append(f"- {arg} 에 모르는 key 가 있습니다: {', '.join(f'`{k}`' for k in unknown)}."
-                     " 그대로 두면 그 인자가 하나도 안 세어진 채 계산되므로 계산하지 않았습니다.")
-    lines.append("- 응답의 그룹 헤더에 대응하는 key 는 아래와 같습니다."
-                 " 헤더 아래 항목의 **문장을 그대로** 해당 list 에 넣어 다시 부르세요.")
-    for arg, _u in bad:
-        lines.append(f"### {arg}")
-        lines += [f"- {header} → {key}" for header, key in _HEADER_KEY[arg]]
-    return "\n".join(lines) + "\n"
-
-
 def sentencing_analysis(
     ctx: RunContext[HarnessDeps],
     charge: ChargeArg,
@@ -637,8 +582,8 @@ def sentencing_analysis(
     is_solicitor: bool = False,
     statutory_modifications: list | dict | str | None = None,
     guideline_type: OptStrArg = None,
-    guideline_factors: dict | str | list | None = None,
-    probation_factors: dict | str | list | None = None,
+    guideline_factor_ids: FactorIds = None,
+    probation_factor_ids: FactorIds = None,
     sentence_months: int | str | list | None = None,
     fine_amount: int | str | list | None = None,
     act_count: int | str | list = 1,
@@ -657,7 +602,8 @@ def sentencing_analysis(
     - 죄명은 판결문 표기로 하나만 (예: 사기, 도로교통법위반(음주운전)). 정규화는 도구가 한다.
     - 경합 사안은 죄명별로 각각 호출한다. 죄명별 분포를 합산·평균해 경합범 분포로 만들지 않는다.
     - 조항·분기가 여럿이면 후보의 정량이 응답에 전부 실린다 — 되묻지 않으니 사실관계로 골라 쓴다.
-    - 계산 인자의 값은 응답에 실린 목록의 표기를 그대로 쓰고 추측하지 않는다.
+    - 양형인자·집행유예 사유는 응답에 실린 해당 목록의 id만 골라 정수 배열로 보낸다.
+      사유의 사건 적용 여부는 판단하되, 가중·감경·주요·일반 분류는 도구가 기준표에서 읽는다.
     - 권고 형량범위는 공식 기준의 범위이지 선고 예측이 아니며, 실선고 분포는 관측일 뿐이다.
 
     응답: markdown. 판례·조문 url 이 있으면 출처로 그대로 인용한다.
@@ -677,11 +623,10 @@ def sentencing_analysis(
         [{"kind": "누범_가중"}]. 지정하면 처단형을 계산한다.
       guideline_type: 양형기준 범죄유형의 명칭 — 응답 목록의 따옴표 안 표기 그대로
         (예: "일반사기 2유형"). 지정하면 권고 형량범위를 계산한다.
-      guideline_factors: 특별양형인자 dict. key 는 응답의 그룹 헤더 순서와 같은 넷뿐 —
-        special_act_aggravators · special_act_mitigators · special_actor_aggravators ·
-        special_actor_mitigators. 값은 목록의 문장 그대로 넣는다.
-      probation_factors: 집행유예 참작사유 dict. key 는 4분면과 같은 넷뿐 —
-        major_positive · major_negative · general_positive · general_negative.
+      guideline_factor_ids: 특별양형인자 목록에서 사건에 해당하는 id의 정수 배열.
+        guideline_type과 함께 보낸다. 분류는 자동으로 읽으며 같은 id는 한 번만 센다.
+      probation_factor_ids: 집행유예 참작사유 목록에서 사건에 해당하는 id의 정수 배열.
+        guideline_type과 함께 보낸다. 특별양형인자 id와는 별개 목록이다.
       sentence_months: 검증할 선고형(자유형, 월). 지정하면 선고 가능 범위와 대조한다.
       fine_amount: 검증할 선고형(벌금, 원). sentence_months 와 같은 단계로 들어간다.
       act_count: 같은 죄명의 별개 행위 수. 2 이상이면 경합범 가중(§37 전단)을 자동 적용한다.
@@ -691,22 +636,23 @@ def sentencing_analysis(
     if not charge or charge.strip() in ("{}", "None", "null"):
         return ("## status: missing_input\n"
                 "- charge 인자 필요. 판결문 표기의 죄명 하나 (예: 사기, 도로교통법위반(음주운전)).")
+    if unreadable_date(offense_date):
+        return f"## status: bad_offense_date\n- {BAD_DATE_MESSAGE}\n- offense_date: {offense_date}"
 
     narrow = dict(sg_category_id=sg_category_id, offense_date=offense_date,
                   is_attempted=is_attempted, is_accessory=is_accessory,
                   is_solicitor=is_solicitor)
+    # Schema validation (`FactorIds`) runs only for model calls; direct calls
+    # (MCP, tests) get the same normalisation here.
     calc = {k: v for k, v in (("statutory_modifications", statutory_modifications),
                               ("guideline_type", guideline_type),
-                              ("guideline_factors", guideline_factors),
-                              ("probation_factors", probation_factors),
+                              ("guideline_factor_ids", _decode_ids(guideline_factor_ids)),
+                              ("probation_factor_ids", _decode_ids(probation_factor_ids)),
                               ("sentence_months", sentence_months),
                               ("fine_amount", fine_amount)) if v not in (None, "", [], {})}
     act_count = coerce_int(act_count) or 1
     if act_count >= 2:
         calc["act_count"] = act_count
-    if (bad := _bad_factor_keys(calc)) is not None:
-        return bad
-
     cands = sentencing_candidates(
         charge,
         sg_category_id=coerce_int(sg_category_id),
@@ -724,9 +670,9 @@ def sentencing_analysis(
     # distribution when there is one. (A charge that did not resolve at all and an
     # official charge the guideline does not cover part ways here: the former has
     # no distribution either, and the status carries that difference.)
-    guide = compute_sentencing_range(ctx, charge=charge, protocol=False, **narrow)
+    guide = compute_sentencing_range(ctx, charge=charge, protocol=False, **narrow, **calc)
     status = _status_of(guide)
-    if status in ("charge_numeric", "missing_input", "multiple_charges"):
+    if status in ("charge_numeric", "missing_input", "multiple_charges", "bad_factor_id"):
         return guide
     stat_status, stat_md = _stat_section(ctx, charge, coerce_int(reference_year))
     if status in _NOT_IN_CORPUS and stat_status in ("ok", "low_n_grid"):

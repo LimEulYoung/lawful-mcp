@@ -45,6 +45,13 @@ def _case_corpus():
             " VALUES (?,?,?,'대법원','대법원','2011-01-01',2011,2010,?)",
             (cid, number, name, body))
         conn.execute("INSERT INTO prec_meta VALUES (?,'대법원','대법원',2011,2010)", (cid,))
+    # An appellate court, so a court filter can name a real court that excludes the case.
+    conn.execute(
+        "INSERT INTO prec_cases (id, case_number, case_name, court_name, court_level,"
+        " decision_date, decision_year, case_year, content_md)"
+        " VALUES (8,'2015나1234','위자료','서울고등법원','2심','2016-01-01',2016,2015,"
+        "'이혼에 따른 위자료 청구 사건이다.')")
+    conn.execute("INSERT INTO prec_meta VALUES (8,'2심','서울고등법원',2016,2015)")
     conn.execute("INSERT INTO prec_cases_fts(prec_cases_fts) VALUES('rebuild')")
     conn.commit()
     return conn

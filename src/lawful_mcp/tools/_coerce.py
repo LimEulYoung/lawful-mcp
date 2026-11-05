@@ -124,6 +124,11 @@ def coerce_list(v: Any) -> list | None:
             if isinstance(parsed, list):
                 _warn(v, "list")
                 return parsed
+            # An unquoted array ('[9의2, 10, 16]') is not JSON — split it on commas.
+            inner = s.strip("[] ")
+            if "," in inner and "{" not in inner:
+                _warn(v, "list")
+                return [t.strip().strip("'\"") for t in inner.split(",") if t.strip()]
         _warn(v, "list")
         return [s]
     _warn(v, "list")
@@ -196,7 +201,8 @@ def coerce_dict_list(v: Any) -> list[dict] | None:
 
 
 def to_iso_date(s: str | None) -> str | None:
-    """'2013-7-30' / '2013.7.30' / '20130730' -> '20130730'; None if unparseable.
+    """'2013-7-30' / '2013.7.30' / '2013. 7. 30.' / '2013년 7월 30일' / '20130730'
+    -> '20130730'; None if unparseable.
 
     Both ``statute_lookup`` and ``compute_sentencing_range`` normalise their
     ``offense_date`` through this one function, so a date means the same thing
@@ -204,7 +210,8 @@ def to_iso_date(s: str | None) -> str | None:
     """
     if not s:
         return None
-    s = str(s).strip().replace('-', '.').replace('/', '.')
+    s = str(s).strip().replace('년', '.').replace('월', '.').replace('일', '')
+    s = s.replace('-', '.').replace('/', '.').rstrip('. ')
     if '.' in s:
         parts = s.split('.')
         if len(parts) != 3:
@@ -218,3 +225,16 @@ def to_iso_date(s: str | None) -> str | None:
     if len(digits) == 8:
         return digits
     return None
+
+
+BAD_DATE_MESSAGE = "offense_date 를 날짜로 읽지 못했습니다 — '2013.7.30' 또는 '20130730' 형식으로 다시 호출하세요."
+
+
+def unreadable_date(v: Any) -> bool:
+    """True when a date argument was given but `to_iso_date` cannot read it.
+
+    The tool then says so instead of answering as of today. A trailing-period
+    form ('2019. 3. 8.') used to be dropped silently and current text went out
+    in its place (about 1% of the calls in a 40-question research run)."""
+    s = coerce_str(v)
+    return bool(s) and to_iso_date(s) is None

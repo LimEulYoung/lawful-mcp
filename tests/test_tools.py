@@ -896,17 +896,6 @@ def test_json_string_numbers_keep_concurrence_and_sentence_verification(ctx):
     assert "경합" in plain and "## 선고형 검증" in plain
 
 
-def test_sentencing_analysis_hands_back_unknown_factor_keys(ctx):
-    """A group heading used as a dict key computes `ok` with nothing counted, so
-    the keys are checked before any arithmetic runs."""
-    out = tools.sentencing_analysis(
-        ctx, charge="사기", guideline_type="일반사기 1유형",
-        guideline_factors={"감경": ["피해 회복"]})
-    assert out.startswith("## status: bad_factor_key")
-    assert "`감경`" in out
-    assert "[특별/행위/감경] → special_act_mitigators" in out
-
-
 def test_sentencing_analysis_needs_a_charge(ctx):
     assert "missing_input" in tools.sentencing_analysis(ctx, charge="")
     assert "charge_numeric" in tools.sentencing_analysis(ctx, charge="[299,298,297]")

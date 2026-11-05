@@ -249,6 +249,60 @@ def _normalize_court_level(cl: str | None) -> tuple[str | None, str | None]:
     return None, f"court_level '{cl}' 은 인식 못 해 무시함 — 유효값: 1심/2심/대법원/헌재"
 
 
+_COURT_NAMES: dict[str, dict[str, str]] = {}
+_COURT_SHORT = re.compile(r"(고|행|지|가)법(?!원)")
+_COURT_FULL = {"고": "고등법원", "행": "행정법원", "지": "지방법원", "가": "가정법원"}
+_BRANCH = re.compile(r".+지방법원(.+지원)")
+
+
+def _court_key(name: str) -> str:
+    """Court name for comparison — no spaces, abbreviations expanded ('서울고법' -> '서울고등법원')."""
+    return _COURT_SHORT.sub(lambda m: _COURT_FULL[m.group(1)], re.sub(r"\s", "", name))
+
+
+def _check_court_name(conn: sqlite3.Connection, name: str | None) -> tuple[tuple[str, ...] | None, str | None]:
+    """court_name -> (the corpus court names it matches | None, note | None).
+
+    The corpus writes one court several ways ('서울고등법원' and '서울고법',
+    '수원지방법원 성남지원' and '성남지원'), so names are compared through
+    `_court_key`, and a branch named with its main court also matches rows
+    that carry the branch name alone. A plain `LIKE '%name%'` filter missed
+    the 4,394 rows written '서울고법' when asked for '서울고등법원'.
+
+    A name that matches no court drops the filter and says so, as an unknown
+    court_level does — otherwise it is a silent zero (37 of 309 recorded calls
+    in a research run). Court names are read once per database file, so a new
+    court name shows up after a restart; a database without a file (in
+    memory) is read every time."""
+    if not name:
+        return None, None
+    db = conn.execute("PRAGMA database_list").fetchone()[2]
+    known = _COURT_NAMES.get(db) if db else None
+    if known is None:
+        # Read from the body-less slim copy (prec_meta: the same rows and
+        # court_name as prec_cases, see `_filter_table`) when there is one.
+        # prec_cases keeps the judgment text in the same rows, so DISTINCT
+        # reads the whole table — the first court-filtered search after a
+        # restart took 59s on the full corpus (0.16s from prec_meta, same 380
+        # names). This checks the connection's own tables rather than
+        # `_filter_table`'s process cache: names are read once per database
+        # file, and an in-memory test database has no prec_meta.
+        meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='prec_meta'").fetchone()
+        rows = conn.execute(f"SELECT DISTINCT court_name FROM {'prec_meta' if meta else 'prec_cases'}")
+        known = {r[0]: _court_key(r[0]) for r in rows if r[0]}
+        if db:
+            _COURT_NAMES[db] = known
+    key = _court_key(name)
+    branch = _BRANCH.fullmatch(key)
+    names = tuple(sorted(
+        n for n, k in known.items() if key in k or (branch and k == branch.group(1))
+    ))
+    if names:
+        return names, None
+    return None, (f"court_name '{name}' 에 맞는 법원이 코퍼스에 없어 무시함 — 법원 이름·지역 부분 일치"
+                  "(예: '수원', '서울고등')")
+
+
 def _case_no_in_query_hint(query: str | None) -> str | None:
     """Hint for a caller who put a case number in the free-text slot."""
     if _CASE_NO_RE.fullmatch((query or "").replace(" ", "")):
@@ -325,7 +379,7 @@ def _fts_or_rank(
     limit: int,
     *,
     court_level: str | None = None,
-    court_name: str | None = None,
+    court_name: tuple[str, ...] | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
 ) -> list[int]:
@@ -341,7 +395,7 @@ def _fts_or_rank(
     if court_level:
         cond.append("c.court_level = ?"); args.append(court_level)
     if court_name:
-        cond.append("c.court_name LIKE ?"); args.append(f"%{court_name}%")
+        cond.append(f"c.court_name IN ({','.join('?' * len(court_name))})"); args.extend(court_name)
     if year_from is not None:
         cond.append("COALESCE(c.decision_year, c.case_year) >= ?"); args.append(year_from)
     if year_to is not None:
@@ -402,7 +456,7 @@ def _morph_rank(
     limit: int,
     *,
     court_level: str | None = None,
-    court_name: str | None = None,
+    court_name: tuple[str, ...] | None = None,
     year_from: int | None = None,
     year_to: int | None = None,
 ) -> list[int]:
@@ -418,7 +472,7 @@ def _morph_rank(
     if court_level:
         cond.append("c.court_level = ?"); args.append(court_level)
     if court_name:
-        cond.append("c.court_name LIKE ?"); args.append(f"%{court_name}%")
+        cond.append(f"c.court_name IN ({','.join('?' * len(court_name))})"); args.extend(court_name)
     if year_from is not None:
         cond.append("COALESCE(c.decision_year, c.case_year) >= ?"); args.append(year_from)
     if year_to is not None:
@@ -785,14 +839,16 @@ def _hydrate(
     year_from: int | None,
     year_to: int | None,
     cap: int | None = LIMIT,
-    court_name: str | None = None,
+    court_name: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Load metadata for case ids, preserving their ranked order.
 
     ``cap=None`` returns everything, which the rerank and recency paths need.
 
-    court_name: 법원 *이름/지역* 부분매칭(LIKE) — '부산'→부산지방법원·부산고등법원,
-      '특허법원'·'서울행정법원' 등. court_level(심급)과 직교. 웹 search_cases 와 동일 방식.
+    ``court_name`` is the tuple of corpus court names `_check_court_name`
+    picked ('부산' -> 부산지방법원, 부산고등법원, 부산지법, ...;
+    '서울고등법원' -> 서울고등법원, 서울고법). It is independent of
+    ``court_level``.
     """
     if not case_ids:
         return []
@@ -803,8 +859,8 @@ def _hydrate(
         where.append("court_level = ?")
         params.append(court_level)
     if court_name:
-        where.append("court_name LIKE ?")
-        params.append(f"%{court_name}%")
+        where.append(f"court_name IN ({','.join('?' * len(court_name))})")
+        params.extend(court_name)
     if year_from is not None:
         where.append("COALESCE(decision_year, case_year) >= ?")
         params.append(year_from)
@@ -1287,10 +1343,16 @@ def precedent_search(
     # a connection to a large file. The case number is normalised here too,
     # so a valid one wins even when a short query accompanies it.
     cno = _extract_case_number(case_number) if case_number else None
+    # A case_number with no readable number says so — "put it in case_number"
+    # is the wrong hint when it is already there ('2016두',
+    # '2018. 04. 27. 선고 대법원 가산세' in a research pilot).
+    unread = (f"case_number '{case_number}' 에서 사건번호를 읽지 못했습니다(예: 2010다89012)"
+              if case_number and not cno else None)
     if not cno and not query:
         return _format_response_md({
             "status": "error",
             "message": (
+                f"{unread} — 번호를 고치거나 query(사실관계 키워드)로 검색하세요." if unread else
                 "query(사실관계 키워드) 또는 case_number(사건번호) 중 하나는 필요합니다. "
                 "사건번호가 있으면 case_number 인자에 넣으세요."
             ),
@@ -1308,6 +1370,7 @@ def precedent_search(
 
     conn = open_db()
     try:
+        court_name, court_name_note = _check_court_name(conn, court_name)
         # Direct lookup by case number. The number is taken from its own
         # argument only, never mined out of the free-text query — keeping the
         # two arguments' jobs distinct is what makes each of them
@@ -1332,9 +1395,16 @@ def precedent_search(
                     )
                     _set_holding(m, cno_terms)
                     _drop_preview_internals(m)
-                return _format_response_md({"status": "ok", "matches": matches})
-            # A number excluded by filters is different from an absent one.
-            # Neither means the judgment itself does not exist.
+                resp = {"status": "ok", "matches": matches}
+                notes = [n for n in (court_level_note, court_name_note) if n]
+                if notes:
+                    resp["note"] = " / ".join(notes)
+                return _format_response_md(resp)
+            # A number excluded by filters is different from an absent one,
+            # and neither means the judgment does not exist. The number may be
+            # there but fail the level, court or year filter (an appeal given
+            # its first-instance court); an absent number is wrong or not in
+            # the corpus.
             cno_miss = (
                 f"사건번호 '{case_number}' 판례는 있으나 지정한 심급·법원·연도 조건에 맞지 않습니다"
                 if ids else
@@ -1416,9 +1486,11 @@ def precedent_search(
                 "matches": matches,
                 "_debug": {"n_tri": len(tri_ids), "n_morph": len(morph_ids), "mode": "tri+morph_rrf"},
             }
-            # Warn even when a case number in the query returns results:
-            # those judgments may merely cite the requested case.
-            notes = [court_level_note]
+            # Fail-loud notes: an ignored court_level or court_name filter, an
+            # unreadable case_number, a missed case-number lookup, a case number
+            # in the query slot. Warn about the last even when results come
+            # back: those judgments may merely cite the requested case.
+            notes = [court_level_note, court_name_note, unread and f"{unread} — 빼고 query 로만 찾았습니다"]
             if cno_miss:
                 notes.append(f"{cno_miss} — 아래는 query 키워드로 찾은 판례입니다")
             notes.append(_case_no_in_query_hint(query))

@@ -203,26 +203,32 @@ async def precedent_dive(
     # The wait is capped by us, not by the library. pydantic-ai's httpx client
     # allows a 600-second read and the OpenAI SDK retries a timeout twice, so
     # one call could sit here for up to 30 minutes — the whole turn dies with
-    # it. The cap comes from `config.dive_timeout_s()`; the timeout response
-    # below is fail-open, the same shape as a summary that never arrives.
+    # it. The cap comes from `config.dive_timeout_s()`.
+    #
+    # The sub-agent keeps its own usage. Passing the caller's `ctx.usage` would
+    # spend the caller's request limit and fold another model's tokens into the
+    # caller's totals, which then describe neither model.
+    timeout = dive_timeout_s()
+    failure = None
     try:
-        result = await asyncio.wait_for(
-            ctx.deps.dive_subagent.run(user_prompt, usage=ctx.usage),
-            timeout=dive_timeout_s())
+        result = await asyncio.wait_for(ctx.deps.dive_subagent.run(user_prompt), timeout=timeout)
     except asyncio.TimeoutError:
+        failure = ("timeout", f"{timeout:.0f}초 안에 본문 요약이 오지 않았습니다")
+    except Exception as e:  # noqa: BLE001 — provider errors (429, 5xx, bad output) fail open like a timeout
+        failure = ("error", f"본문 요약 요청이 실패했습니다({type(e).__name__})")
+    if failure:
         # Fail open — the summary did not arrive, so the tool did not die, it
         # just could not read the body. Both `status` and `message` say so, so
         # the model can tell it apart from "read it and it was not there".
-        timeout = dive_timeout_s()
         return _format_response_md({
-            "status": "timeout",
+            "status": failure[0],
             "case_id": case_id,
             "case_number": case["case_number"],
             "case_name": case["case_name"],
             "court_level": case["court_level"],
             "year": case["year"],
             "reference_statute": case["reference_statute"],
-            "message": (f"{timeout:.0f}초 안에 본문 요약이 오지 않았습니다 — 이 판례의 "
+            "message": (f"{failure[1]} — 이 판례의 "
                         "본문은 읽지 못한 것으로 취급하고, 판례 검색 발췌로 답하거나 다른 "
                         "판례를 확인하세요."),
         })
