@@ -1,16 +1,19 @@
-"""Corpus paths, citation URLs and dive-model configuration.
+"""Corpus path, dive-model and Jev-key configuration.
+
+``harness_local`` is copied unmodified from the research harness and reads two
+variables of its own: ``HARNESS_DB`` (the corpus) and ``OPENROUTER_API_KEY``
+(the ``issue`` reordering in ``precedent_search``). This module maps this
+package's settings onto them, so the copy stays byte-identical and a
+self-hosted server keeps one documented set of names.
 
 The complete configuration reference is ``.env.example``. HTTP transport
-settings live in ``server.py``; retrieval tuning and optional embedding and
-reranking settings live in ``tools/precedent_search.py`` and ``deps.py``.
-Values come from the process environment; this package does not load .env.
+settings live in ``server.py``. Values come from the process environment;
+this package does not load .env.
 
 Environment variables:
   CORPUS_DB          Path to the corpus SQLite file. Defaults to the sample
-                     fixture shipped in this repository.
-  CASE_URL_BASE      Base URL used to build citation links in tool output.
-                     Defaults to the hosted service, whose case and statute
-                     ids match the published corpus.
+                     fixture shipped in this repository. The harness's own
+                     name, HARNESS_DB, is accepted too; CORPUS_DB wins.
   DIVE_API_KEY       API key for the model behind ``precedent_dive``. Any
                      OpenAI-compatible endpoint works. When unset, the tool
                      is not registered and the other three still run.
@@ -21,14 +24,8 @@ Environment variables:
   JEV_API_KEY        OpenRouter API key for reordering ``precedent_search``
                      results by its ``issue`` argument. When unset, ``issue``
                      is accepted and results keep their BM25 order.
-  USE_JEV            Set to 0 to keep BM25 order even with a key set.
-  USE_DENSE         Set to 1 to enable the embedding + rerank retrieval
-                     path in ``precedent_search``. Off by default: the
-                     lexical path (trigram + morpheme RRF) scored on par in
-                     a known-item A/B and needs no external service.
-  EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL / EMBED_DIM
-  RERANK_BASE_URL / RERANK_API_KEY
-                     Only used when USE_DENSE=1.
+  USE_JEV            Read by the harness itself: 0 keeps BM25 order even with
+                     a key set.
 """
 from __future__ import annotations
 
@@ -40,27 +37,40 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 
 DEFAULT_CORPUS_DB = _ROOT / "data" / "fixture.db"
 
-# Seconds the dive summary waits before the tool answers with the excerpt
-# alone. 15s is 1.5x the measured range (6.6–10.2s) and is a product choice:
-# the call happens mid-turn, where being late is itself the harm.
+# Seconds the dive summary waits before the tool answers with the case
+# metadata alone. 15s is 1.5x the measured range (6.6–10.2s) and is the
+# harness's own bound; a slower self-hosted model may need more.
 DEFAULT_DIVE_TIMEOUT_S = 15.0
-
-# Citation links in tool output point at the hosted corpus browser. Case and
-# statute ids are the published corpus ids, so links resolve for the fixture
-# and for the full hosted corpus alike. Point this elsewhere if you serve
-# your own corpus under different ids.
-DEFAULT_CASE_URL_BASE = "https://lawful.crow-tit.com"
 
 
 def corpus_db_path() -> Path:
     """Path to the corpus database."""
-    raw = os.environ.get("CORPUS_DB")
+    raw = os.environ.get("CORPUS_DB") or os.environ.get("HARNESS_DB")
     return Path(raw) if raw else DEFAULT_CORPUS_DB
 
 
-def case_url_base() -> str:
-    """Base URL for citation links, without a trailing slash."""
-    return os.environ.get("CASE_URL_BASE", DEFAULT_CASE_URL_BASE).rstrip("/")
+def export_corpus_path() -> None:
+    """Point the harness at the corpus: it opens ``HARNESS_DB`` on every call."""
+    os.environ["HARNESS_DB"] = str(corpus_db_path())
+
+
+def jev_api_key() -> str | None:
+    """Key for the ``issue`` reordering in ``precedent_search``, or None.
+
+    None is a supported state: the search runs and keeps its BM25 order.
+    """
+    return os.environ.get("JEV_API_KEY", "").strip() or None
+
+
+def export_jev_key() -> None:
+    """Hand ``JEV_API_KEY`` to the harness, which reads ``OPENROUTER_API_KEY``.
+
+    The variable is cleared when ``JEV_API_KEY`` is unset: an OpenRouter key
+    exported for something else must not start sending search results to
+    OpenRouter. The server calls this; a library user who imports the harness
+    directly sets ``OPENROUTER_API_KEY`` themselves.
+    """
+    os.environ["OPENROUTER_API_KEY"] = jev_api_key() or ""
 
 
 def dive_config() -> tuple[str, str, str] | None:
@@ -79,22 +89,11 @@ def dive_config() -> tuple[str, str, str] | None:
     return (base_url, api_key, model)
 
 
-def jev_api_key() -> str | None:
-    """Key for the ``issue`` reordering in ``precedent_search``, or None.
-
-    Read on each search that carries an ``issue``. None is a supported state:
-    the search runs and keeps its BM25 order.
-    """
-    return os.environ.get("JEV_API_KEY", "").strip() or None
-
-
 def dive_timeout_s() -> float:
     """Seconds ``precedent_dive`` waits for its summary before giving up.
 
-    Without a cap of our own the wait is the library's: pydantic-ai builds an
-    httpx client with a 600-second read timeout and the OpenAI SDK retries a
-    timeout twice, so one call could hang for up to 30 minutes. A malformed
-    value falls back to the default rather than taking the server down.
+    A malformed value falls back to the default rather than taking the server
+    down.
     """
     try:
         value = float(os.environ.get("DIVE_TIMEOUT", "") or DEFAULT_DIVE_TIMEOUT_S)

@@ -4,30 +4,30 @@ No authentication and no metering: this server is meant to run next to the
 client that uses it, against a corpus you hold. (The hosted deployment puts
 those concerns in a separate layer, which is not part of this package.)
 
-Tool descriptions are the contract an external model reads. They are written
-in Korean and carry the operating rules, because a client has no system
-prompt of ours to fall back on — each description has to stand alone.
+Tool descriptions are the harness tools' own docstrings, written in Korean —
+the same text the hosted service gives a model. They say only how to use each
+tool; what may be quoted and which url to cite ride on every response, so a
+client with no system prompt of ours can still use the tools correctly.
 """
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
 import logging
 import os
 import sys
 import threading
 from types import SimpleNamespace
-from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic.json_schema import SkipJsonSchema
 
-from . import tools as _t
-from .config import corpus_db_path, dive_config
+from . import config
 from .deps import build_deps, build_dive_subagent
-from .tools.compute_sentencing_range import ChargeArg
-from .tools.sentencing_factors import FactorIds, retired_factor_args
+from .harness_local.agents import TOOLS
+from .harness_local.tools.sentencing_analysis import ChargesArg, OptStrArg
 
 logger = logging.getLogger("lawful-mcp")
 
@@ -44,7 +44,7 @@ _INSTRUCTIONS = (
     "한국 법률 검색 도구 모음 — 판례·법령·행정규칙(고시·훈령·예규)·양형기준 corpus 기반. "
     "판례 검색(precedent_search) 후 필요할 때 본문 확인(precedent_dive — 법리는 판결문 원문 그대로), "
     "법령·행정규칙 조문(statute_lookup), 양형(sentencing_analysis — 기준·인자·실선고 분포를 "
-    "한 응답에, 인자를 더하면 처단형·권고형·선고형 계산). 판례 출처 표기는 도구가 반환한 url만 사용."
+    "한 응답에). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
 
 mcp = MCPServer("lawful-mcp", instructions=_INSTRUCTIONS)
@@ -97,10 +97,24 @@ def _streamable_app():
         ),
     )
 
+# The harness reads its own variable names; map the public settings onto them
+# before any tool runs. The dive bound is a module constant read at call time.
+config.export_corpus_path()
+config.export_jev_key()
+importlib.import_module(".harness_local.tools.precedent_dive", __package__).DIVE_TIMEOUT_S = (
+    config.dive_timeout_s()
+)
+
 # One sub-agent for the process: building a model client per call would pay
 # connection setup on every dive. None when unconfigured, which is why the
 # dive tool is registered conditionally.
 _dive_subagent = build_dive_subagent()
+
+# The tool list is the harness's (`harness_local.agents.TOOLS`). The wrappers
+# below repeat each tool's arguments because the MCP layer builds its schema
+# from the wrapper's signature; the names and arguments must stay those of the
+# harness tools.
+_T = {f.__name__: f for f in TOOLS}
 
 
 def _ctx() -> SimpleNamespace:
@@ -113,81 +127,18 @@ def _ctx() -> SimpleNamespace:
     return SimpleNamespace(deps=build_deps(_dive_subagent), usage=None)
 
 
-def _tool(desc: str, *, title: str, **hints):
-    """Register a tool with its description and behaviour annotations.
+def _tool(fn, *, title: str, **hints):
+    """Register a tool: description = the harness tool's docstring, plus behaviour annotations.
 
-    Every tool here is read-only, so ``destructiveHint`` is set explicitly:
-    the MCP default is true, and a client that sees no annotation has to
-    assume the worst.
+    Every tool here is read-only, so all four hints are set explicitly: the
+    MCP default for ``destructiveHint`` is true, and a client that sees no
+    annotation has to assume the worst.
     """
-    return mcp.tool(description=desc, annotations=ToolAnnotations(title=title, **hints))
-
-
-_DESC_PRECEDENT_SEARCH = (
-    "판례 검색 — query 또는 case_number 중 하나는 필수. 사건번호로 정확 조회하거나 사실관계 키워드로 유사 판례 검색. "
-    "매치는 짧은 preview와 그 출처를 알리는 preview_kind를 반환합니다. "
-    "본문 확인이 필요하면 가장 관련된 id로 precedent_dive를 이어 호출하세요. "
-    "민·형사·행정·가사 분쟁 질의의 기본 도구이며, 주장·전망의 근거를 유사 판례의 실제 결과로 뒷받침할 때 씁니다.\n"
-    "Args: query=판례를 찾는 검색어 — 사실관계·죄명·법조 키워드(명사 어간 여러 개; 2자 죄명도 지원; 사건번호 제외). "
-    "issue=찾은 판례의 순서를 정하는 질문 — 이 검색으로 답을 찾으려는 법적 질문 한 문장"
-    "(이 사건의 당사자·날짜·금액은 빼고)을 주면 그 질문을 직접 판단한 판례가 앞에 옵니다. "
-    "case_number=특정 사건번호로 바로 찾을 때(예 '2010다89012'; '대법원 … 선고 2010다89012 판결'이면 사건번호 부분만). "
-    "court_level='1심'|'2심'|'대법원'|'헌재'. court_name=법원명·지역 부분매칭(예 '부산','특허법원'). year_from/year_to=사건년도 범위.\n"
-    "url만 인용 링크로 씁니다. preview_kind 이름에 '원문'이 있는 것만 직접인용하고 요약 계열은 바꿔 쓰세요."
-)
-_DESC_STATUTE_LOOKUP = (
-    "법령·행정규칙 조회 — 법령의 요건·효과·기간·절차가 답의 뼈대가 되는 국면의 기본 도구이며, "
-    "죄명·법조 식별 후 조문 본문 확인에도 씁니다. 조문은 개정되므로 현행 본문은 이 도구만 압니다. "
-    "법률·대통령령·부령·규칙과 행정규칙(고시·훈령·예규)을 한 번에 검색합니다 — 종류를 가리는 인자는 없고 "
-    "관련도 순으로 함께 나오며 각 결과에 종류가 붙습니다. "
-    "조세조약(이중과세방지협약·조세정보교환협정과 개정 의정서)도 상대국과 함께 찾으면 나옵니다(예 query='베트남 조세조약'). "
-    "자주 쓰는 법령은 quick-access id로 바로 호출(statute_id+articles): 헌법 468·민법 584·상법 583·민사소송법 581·"
-    "형법 578·형사소송법 574·행정기본법 4953·행정절차법 437·행정소송법 386·헌법재판소법 3629. "
-    "query 또는 statute_id가 필수. 그 외는 two-step — ① query=법령명으로 후보 id를 받고 ② statute_id+articles로 본문 호출"
-    "(조문 번호는 법령마다 달라 법령을 먼저 확정).\n"
-    "Args: query=법령명·행정규칙명 또는 본문 키워드(id 모를 때). "
-    "statute_id=검색이 준 식별자를 글자 그대로 — 법령은 정수(예 584; 위 목록 밖은 추측 금지 — 574는 형사소송법), "
-    "행정규칙은 'admrul-18060', 조세조약은 'trty-1307'. **접두사를 떼면 같은 번호의 다른 법령이 조회됩니다.** "
-    "articles=조문 번호 list[str] 최대 8개('347'/'제347조'=본조+가지, '347의2'=가지만, 범위 ['3','4','5']; 미지정 시 outline; "
-    "8개 초과는 앞 8개만 조회하고 나머지를 message로 알림 — 나눠 재호출). "
-    "limit=검색 모드 최대 결과 수(기본 10·최대 50). "
-    "offense_date=행위 일자(예 '2013.7.30') 지정 시 행위시점 조문, 미지정 시 현행.\n"
-    "url만 인용 링크로 쓰고, `text_kind: 공식 … 원문`인 조문·행정규칙 본문만 직접인용하세요."
-)
-_DESC_SENTENCING_ANALYSIS = (
-    "양형 — 죄명 하나로 판단에 필요한 것을 한 응답에: 법정형, 형법 §56 처단형 계산방법, 대법원 양형기준의 "
-    "범죄유형별 권고 형량범위, 양형인자, 집행유예 참작사유, 근거 조문 원문, 1심 실선고 분포와 비교판례."
-    " 형량·구형·양형 의견을 볼 때 결론 전에 죄명만으로 부르고, "
-    "유형·양형인자가 정해지면 계산 인자를 더해 다시 부르세요 — 두 번째 응답은 그 사건의 처단형·권고형·"
-    "선고 가능 범위·집행유예만 싣고 기준 본문을 반복하지 않습니다. 조항·분기가 여럿이면 되묻지 않고 후보 정량을 전부 싣습니다. 권고범위는 공식 기준의 '범위'이지 예측이 아니고 실선고 분포는 표본의 관측입니다. "
-    "죄명은 판결문 표기로 한 번에 하나씩(형법 '특수상해', 특별법 '도로교통법위반(음주운전)'). 법률명만 주면"
-    "('스토킹처벌법위반') 그 법률의 죄명 후보를 돌려줍니다. 경합 사안은 죄명별로 각각 호출하고 죄명별 분포를 "
-    "합산·평균해 경합범 분포로 만들지 마세요.\n"
-    "Args: charge=죄명 하나(숫자·ID 불가). offense_date=행위 일자(예 '2013.7.30') 지정 시 행위시 조문·정량. "
-    "statute_choice·branch_key·reference_choice·sg_category_id=후보가 여럿일 때 좁히는 값. "
-    "is_attempted·is_accessory·is_solicitor=미수·방조·교사. "
-    "statutory_modifications=형법 §56 가중·감경 list(예 [{\"kind\": \"누범_가중\"}]). "
-    "guideline_type=응답 목록의 따옴표 안 유형 명칭 그대로. "
-    # The argument names and how to pick ids also head the lists in a briefing
-    # response (`sentencing_factors.format_catalog`); one line here suffices. An
-    # MCP client never sees the tool docstring — this description is all it has.
-    "guideline_factor_ids·probation_factor_ids=응답의 특별양형인자·집행유예 참작사유 목록에서 사건에 해당하는 "
-    "id의 정수 배열(guideline_type과 함께) — 가중·감경·주요·일반 분류는 도구가 기준표에서 읽습니다. "
-    "sentence_months·fine_amount=검증할 선고형. act_count=같은 죄명의 별개 행위 수"
-    "(2 이상이면 경합범 가중). reference_year=비교 판례 기준 연도.\n"
-    "판례·조문 url만 인용 링크로 쓰세요."
-)
-_DESC_PRECEDENT_DIVE = (
-    "단건 판결·결정 본문 확인(외부 sub-agent 위임) — precedent_search preview가 부족할 때 case id로 호출하면 question에 답하는 내용을 판결문에서 찾아 1,000자 이내로 반환. "
-    "법리·판단은 `>` 로 시작하는 줄에 판결문 원문 그대로 옮기고 판결이 단 참조 판례 표기('(대법원 … 판결 참조)')를 함께 남기며, 사실관계·결론·형량은 요약합니다. "
-    "text_truncated=true이면 not_in_text도 전체 원문 부재를 확정하지 못합니다.\n"
-    "Args: case_id=precedent_search 결과 id. question=공개 판례에서 추출할 쟁점·항목만(사용자 이름·주소·연락처·계정·사적 첨부사실 등 개인정보 금지).\n"
-    "직접인용은 `>` 줄에만 하고 나머지는 바꿔 쓰세요. 인용 링크는 반환 url만 씁니다 — 참조 판례를 링크로 달려면 그 사건번호로 precedent_search(case_number)를 불러 url을 받으세요."
-)
+    return mcp.tool(description=inspect.getdoc(fn), annotations=ToolAnnotations(title=title, **hints))
 
 
 @_tool(
-    _DESC_PRECEDENT_SEARCH,
+    _T["precedent_search"],
     title="판례 검색",
     readOnlyHint=True,
     destructiveHint=False,
@@ -203,7 +154,7 @@ def precedent_search(
     year_from: int | None = None,
     year_to: int | None = None,
 ) -> str:
-    return _t.precedent_search(
+    return _T["precedent_search"](
         _ctx(),
         query=query,
         issue=issue,
@@ -216,7 +167,7 @@ def precedent_search(
 
 
 @_tool(
-    _DESC_STATUTE_LOOKUP,
+    _T["statute_lookup"],
     title="법령·행정규칙 조회",
     readOnlyHint=True,
     destructiveHint=False,
@@ -230,7 +181,7 @@ def statute_lookup(
     limit: int = 10,
     offense_date: str | None = None,
 ) -> str:
-    return _t.statute_lookup(
+    return _T["statute_lookup"](
         _ctx(),
         query=query,
         statute_id=statute_id,
@@ -241,7 +192,7 @@ def statute_lookup(
 
 
 @_tool(
-    _DESC_SENTENCING_ANALYSIS,
+    _T["sentencing_analysis"],
     title="양형 분석",
     readOnlyHint=True,
     destructiveHint=False,
@@ -249,62 +200,21 @@ def statute_lookup(
     openWorldHint=False,
 )
 def sentencing_analysis(
-    # charge shares the same ChargeArg as the core tool (wire schema `string` and required;
-    # lists are folded by BeforeValidator before schema validation). Sibling string arguments
-    # remain narrow: widening is only beneficial when an answer is prepared for the wide value.
-    charge: ChargeArg,
-    statute_choice: str | None = None,
-    branch_key: str | None = None,
-    reference_choice: str | None = None,
-    sg_category_id: int | None = None,
-    offense_date: str | None = None,
-    is_attempted: bool = False,
-    is_accessory: bool = False,
-    is_solicitor: bool = False,
-    statutory_modifications: list[dict] | None = None,
-    guideline_type: str | None = None,
-    guideline_factor_ids: FactorIds = None,
-    probation_factor_ids: FactorIds = None,
-    sentence_months: int | None = None,
-    fine_amount: int | None = None,
-    act_count: int = 1,
-    reference_year: int | None = None,
-    # The retired dict arguments: accepted but kept out of the schema
-    # (`SkipJsonSchema`). Not accepting them lets the SDK drop an unknown
-    # argument silently (the argument model ignores extras) and compute with
-    # no factors at all. When they arrive, the reply explains the id form.
-    guideline_factors: SkipJsonSchema[Any] = None,
-    probation_factors: SkipJsonSchema[Any] = None,
+    # The harness's own argument types. The MCP layer json-decodes a string
+    # argument before validation unless its annotation is exactly ``str``
+    # (SDK ``pre_parse_json``), so a list sent as a JSON string arrives as a
+    # list; the validators fold a bare string into a one-charge list and a
+    # list given for ``offense_date`` into a string.
+    charges: ChargesArg,
+    offense_date: OptStrArg = None,
 ) -> str:
-    retired = retired_factor_args(guideline_factors=guideline_factors, probation_factors=probation_factors)
-    if retired:
-        return retired
-    return _t.sentencing_analysis(
-        _ctx(),
-        charge=charge,
-        statute_choice=statute_choice,
-        branch_key=branch_key,
-        reference_choice=reference_choice,
-        sg_category_id=sg_category_id,
-        offense_date=offense_date,
-        is_attempted=is_attempted,
-        is_accessory=is_accessory,
-        is_solicitor=is_solicitor,
-        statutory_modifications=statutory_modifications,
-        guideline_type=guideline_type,
-        guideline_factor_ids=guideline_factor_ids,
-        probation_factor_ids=probation_factor_ids,
-        sentence_months=sentence_months,
-        fine_amount=fine_amount,
-        act_count=act_count,
-        reference_year=reference_year,
-    )
+    return _T["sentencing_analysis"](_ctx(), charges=charges, offense_date=offense_date)
 
 
 if _dive_subagent is not None:
 
     @_tool(
-        _DESC_PRECEDENT_DIVE,
+        _T["precedent_dive"],
         title="판례 본문 분석",
         readOnlyHint=True,
         destructiveHint=False,
@@ -312,7 +222,7 @@ if _dive_subagent is not None:
         openWorldHint=False,
     )
     async def precedent_dive(case_id: int, question: str) -> str:
-        return await _t.precedent_dive(_ctx(), case_id=case_id, question=question)
+        return await _T["precedent_dive"](_ctx(), case_id=case_id, question=question)
 
 
 def build_app():
@@ -338,7 +248,7 @@ def _warmup() -> None:
     the work happens at call time anyway.
     """
     try:
-        _t.precedent_search(_ctx(), query="손해배상 계약 해지")
+        _T["precedent_search"](_ctx(), query="손해배상 계약 해지")
         logger.info("warmup done")
     except Exception as e:  # noqa: BLE001
         logger.warning("warmup skipped: %s", e)
@@ -357,9 +267,11 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    logger.info("corpus: %s", corpus_db_path())
-    if dive_config() is None:
+    logger.info("corpus: %s", config.corpus_db_path())
+    if config.dive_config() is None:
         logger.info("precedent_dive disabled (set DIVE_API_KEY, DIVE_BASE_URL, DIVE_MODEL)")
+    if config.jev_api_key() is None:
+        logger.info("issue reordering off (set JEV_API_KEY); results keep their BM25 order")
 
     if args.transport == "stdio":
         mcp.run()

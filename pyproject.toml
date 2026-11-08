@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lawful-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Korean case law, statutes and sentencing data"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,8 +30,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Embedding + rerank retrieval path (USE_DENSE=1). Off by default.
-dense = ["openai>=1.0", "sqlite-vec>=0.1"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

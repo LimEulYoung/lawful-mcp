@@ -1,17 +1,19 @@
-"""System prompt for the ``precedent_dive`` sub-agent.
+"""System prompts.
 
-Written in Korean because it governs extraction from Korean judgments; the
-instruction and the material are in the same language on purpose.
+  DIVE_PROMPT — precedent_dive sub-agent
 """
 
 
-# No untrusted-data fence. The sub-agent has no tools and no secrets, so an
-# instruction inside the judgment or the question has nothing to act on — and
-# whoever can steer `question` can already steer the calling model directly.
-# Treating the result as data is the caller's job.
-# The length (1,000 characters) is also quoted by the `DiveResult.summary`
-# description, the `precedent_dive` docstring and
-# `server._DESC_PRECEDENT_DIVE`; change them together.
+# ============================================================
+# DIVE_PROMPT — precedent_dive sub-agent
+# ============================================================
+# No untrusted-data fence lines here — the sub-agent has neither tools nor secrets, so even if there are
+# instructions to follow there is nothing for them to harm, and whoever can steer `question` can steer the
+# main answer directly anyway. The rule to treat the result as data only belongs to the main prompt that
+# receives it (eval/prompts/agent_system.txt).
+# If you change the length (1,000 characters), change the `DiveResult.summary` description and the
+# `precedent_dive` docstring in the same change.
+
 DIVE_PROMPT = """당신은 한국 판결문·결정문에서 정보를 추출하는 보조 에이전트입니다.
 
 주어진 판례 본문을 읽고 사용자 질문에 답하는 내용만 추출하세요.

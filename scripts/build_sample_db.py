@@ -5,37 +5,47 @@ The full corpus behind the hosted service is not distributed with this
 repository. This script carves a self-consistent subset that keeps every
 table the MCP tools read, so a clone of the repo can run and be tested
 against real data. It is also the reference for the corpus schema if you
-want to build your own database from public sources.
+want to build your own database from public sources: every table is created
+from the source's own definition.
+
+The tools read the data as written and do not repair it, so the source has to
+follow the data rules the tools rely on (one row per judgment, one row per
+article number in a version, an effective date on every article, and so on),
+and hold every table they read: there is no fallback for a missing one, and
+the build stops on it. The sample inherits the rules by copying rows
+unchanged.
 
 Three tiers:
   1. Reference tables copied in full (small): sentencing guidelines
-     (``sg_*``), charge taxonomy (``charge_*``), statutory-penalty history
-     (``clm_versions``).
+     (``sg_*``), charge taxonomy (``charge_*``, ``official_*``),
+     statutory-penalty history (``clm_versions``), statute aliases.
   2. Statutes: a core-law whitelist or everything (``--statutes``). Version
-     rows are cheap metadata and come along for whitelisted laws; article
-     bodies are the weight. ``core-current`` ships only each law's current
-     snapshot (picked the same way the lookup tool does) and drops later
-     full-text versions whose articles it does not ship, ``core`` ships every
-     version's articles, ``all`` ships the lot.
+     rows are cheap metadata and come along for whitelisted laws, with the
+     addenda (부칙), the annexed-table index and the lapse register of those
+     laws; article bodies are the weight. ``core-current`` ships the articles
+     of each law's current whole text (picked by the lookup tool's own rule)
+     and of every version after it, ``core`` ships every version's articles,
+     ``all`` ships the lot.
      Tax treaties: a few partners' documents plus the multilateral ones
      (``--treaty-countries``).
   3. Precedents: a bounded selection (``--cases N``). Cases that carry the
-     sentencing sample (``prec_defendants``) are preferred so
-     ``sentence_statistics`` stays meaningful, then cases carrying the
-     court's own issue summary (``holdings``), then recent decisions.
+     sentencing sample (``prec_defendants``) are preferred so the actual
+     sentences stay meaningful, then cases carrying the court's own issue
+     summary (``holdings``), then recent decisions.
 
 Full-text indexes:
   - The trigram FTS tables are external-content FTS5: base rows are copied,
     then each index is rebuilt with the ``'rebuild'`` special command.
   - ``prec_cases_morph_fts`` is contentless: it is re-tokenized with Kiwi
-    using the same recipe as the production indexer (content morphemes
+    using the same recipe as the search tool's query side (content morphemes
     only: N*, SL, SN, SH, XR and VV/VA lemmas, whitespace-joined).
 
 Usage:
-    python build_sample_db.py --source /path/to/harness.db --dest fixture.db \
-        --cases 500 --statutes core --notices 20
+    python build_sample_db.py --source /path/to/corpus.db --dest fixture.db \
+        --cases 700 --statutes core-current --notices 20
 
-Requires: Python 3.11+, kiwipiepy (for the morpheme index).
+Requires: Python 3.11+ and this package installed (the statute version pick
+is imported from the lookup tool), kiwipiepy for the morpheme index.
 """
 from __future__ import annotations
 
@@ -53,7 +63,6 @@ FULL_TABLES = [
     "sg_subtypes",
     "sg_factors",
     "sg_probation_factors",
-    "sg_fine_conditions",
     "sg_ranges",
     "charge_legal_map",
     "clm_versions",
@@ -62,10 +71,22 @@ FULL_TABLES = [
     "charge_aliases",
     "charge_norm_map",
     "official_guideline_map",
+    "statute_aliases",
 ]
 
+# Columns that record when or how a loader or an extraction ran, not what the
+# law or the judgment says. No tool reads them; they are NULL in the sample.
+LOADER_COLUMNS = {
+    "clm_versions": ("extracted_at",),
+    "prec_defendants": ("label_audit_at",),
+    "prec_sentences": ("extraction_model", "extracted_at"),
+    "st_byeolpyo": ("listed_at",),
+    "st_lapsed": ("note", "noted_at"),
+    "st_treaties": ("listed_at",),
+}
+
 # Statute whitelist for --statutes core. Matched against both ``name`` and
-# ``short_name``; every historical version of a matched law is kept.
+# ``short_name``; every historical version row of a matched law is kept.
 CORE_STATUTES = [
     "대한민국헌법",
     "형법",
@@ -104,8 +125,15 @@ CORE_STATUTES = [
 # too: every treaty lookup lists them beside the partner's documents.
 SAMPLE_TREATY_COUNTRIES = ("베트남", "미국", "나이지리아")
 
-# Tokenizer recipe for the contentless morpheme index. Mirrors the production
-# indexer: content morphemes only, verbs/adjectives as lemma form.
+# Cases the harness tests (tests/harness) read by id: a judgment with a body
+# for the dive failure path (2016구합95) and an appellate case number joined
+# with its court name (의정부지방법원 2025나204080). Neither tier reaches them
+# on its own — the first has no decision date.
+PINNED_CASES = (205021, 234954)
+
+# Tokenizer recipe for the contentless morpheme index. Mirrors the query side
+# (``precedent_search._MORPH_KEEP_TAGS``): content morphemes only,
+# verbs/adjectives as lemma form.
 MORPH_KEEP_TAGS = ("NNG", "NNP", "NNB", "NR", "NP", "SL", "SN", "SH", "XR", "VV", "VA")
 MORPH_SOURCE_COLUMNS = (
     "case_name",
@@ -156,166 +184,124 @@ def copy_indexes(dest: sqlite3.Connection, table: str) -> None:
         dest.execute(sql)
 
 
+def copy_rows(dest: sqlite3.Connection, table: str, where: str = "1", params=()) -> None:
+    """Copy the rows of ``table`` matching ``where``, writing NULL into loader columns.
+
+    NULL is written, not left to the column default: a run-stamp column may
+    default to the current time, which would stamp the build instead.
+    """
+    omit = LOADER_COLUMNS.get(table, ())
+    cols = [r[1] for r in dest.execute(f"PRAGMA src.table_info({table})")]
+    names = ", ".join(f'"{c}"' for c in cols)
+    values = ", ".join("NULL" if c in omit else f'"{c}"' for c in cols)
+    dest.execute(
+        f"INSERT INTO main.{table} ({names}) SELECT {values} FROM src.{table} WHERE {where}",
+        params,
+    )
+
+
+def copy_table(dest: sqlite3.Connection, table: str, where: str = "1", params=()) -> None:
+    """Create ``table`` from the source definition and copy the matching rows."""
+    copy_ddl(dest, table)
+    copy_rows(dest, table, where, params)
+    copy_indexes(dest, table)
+
+
 def count(dest: sqlite3.Connection, table: str) -> int:
     return dest.execute(f"SELECT COUNT(*) FROM main.{table}").fetchone()[0]
 
 
-def copy_statute_status_tables(dest: sqlite3.Connection) -> None:
-    """Copy optional repeal/lapse facts for sampled laws, without load logs.
+# --- statutes -----------------------------------------------------------------
 
-    Only the fields consumed by the tools belong in the sample. Operational
-    notes and timestamps can exist in the source but are not published.
-    Older sources without these tables remain supported.
+
+def plan_versions(dest: sqlite3.Connection, law_id: str, as_of_iso: str) -> tuple[list[int], list[int]]:
+    """(versions of ``law_id`` whose articles ``core-current`` ships, versions it leaves out).
+
+    The lookup tool reads a law on a date as the latest whole text in force by
+    then plus the amendments after it (``statutes._articles_in_force``). The
+    sample ships that whole text and the amendments after it: those in force
+    by ``as_of_iso`` and those not yet in force that hold only the articles
+    they change. A version not yet in force that is stored whole is left out,
+    row and all: the tool picks the current version by date, not by label, so
+    a whole text shipped without its articles would read as an empty law once
+    its date passed, and shipped with them it doubles the law (measured over
+    the 27 sample laws: 13,636 articles against 6,695). The sample then keeps
+    serving the text current at build time. Earlier versions keep their rows,
+    so the version timeline stays whole, but not their articles.
     """
-    tables = (
-        ("st_backfill_log", "statute_id INTEGER, status TEXT",
-         "statute_id, status", "statute_id IN (SELECT id FROM main.st_statutes)"),
-        ("st_lapsed", "law_id TEXT PRIMARY KEY, lapsed_on TEXT NOT NULL, reason TEXT NOT NULL",
-         "law_id, lapsed_on, reason", "law_id IN (SELECT law_id FROM main.st_statutes)"),
-    )
-    for table, schema, columns, scope in tables:
-        if not dest.execute(
-            "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name=?", (table,),
-        ).fetchone():
-            continue
-        dest.execute(f"CREATE TABLE main.{table} ({schema})")
-        dest.execute(
-            f"INSERT INTO main.{table} ({columns}) "
-            f"SELECT {columns} FROM src.{table} WHERE {scope}"
+    from lawful_mcp.harness_local.tools.statutes import _is_whole, _pick_current_version
+
+    group = [
+        dict(zip(("id", "effective_date", "change_kind", "serial_id"), r))
+        for r in dest.execute(
+            "SELECT id, effective_date, change_kind, serial_id FROM src.st_statutes WHERE law_id=?",
+            (law_id,),
         )
+    ]
+    base = _pick_current_version([r for r in group if _is_whole(r)], as_of_iso)
+    if base is None:
+        return [r["id"] for r in group], []
+    pending_whole = [
+        r["id"] for r in group
+        if r["effective_date"] > max(as_of_iso, base["effective_date"]) and _is_whole(r)
+    ]
+    ship = [
+        r["id"] for r in group
+        if r["effective_date"] >= base["effective_date"] and r["id"] not in pending_whole
+    ]
+    return ship, pending_whole
 
 
-def _is_repeal_kind(change_kind) -> bool:
-    ck = str(change_kind or "")
-    return "폐지" in ck and "제정" not in ck
-
-
-def _is_full_text_kind(change_kind) -> bool:
-    ck = str(change_kind or "")
-    return "제정" in ck or "전부개정" in ck
-
-
-def _carries_full_text(row) -> bool:
-    """Would the tool treat this version row as a full text on its own?
-
-    An enactment or full revision, a consolidated snapshot (mst NULL), or a
-    row loaded whole (a serial number). Rows are (id, effective_date,
-    history_status, change_kind, mst, serial_id).
-    """
-    return _is_full_text_kind(row[3]) or row[4] is None or bool(row[5])
-
-
-def pick_current_snapshot(dest: sqlite3.Connection, law_id: str, as_of_iso: str) -> int | None:
-    """Pick the version of a law current on ``as_of_iso`` — mirror of the tool.
-
-    Same rule as ``statutes._pick_current_version``: versions in force by
-    date (not by label), repeals passed over, then the most recent full text —
-    an enactment or full revision, or a snapshot (mst NULL, loaded whole, or a
-    label other than '연혁'). A labelled row not loaded whole with under 90% of
-    the largest snapshot's article count holds only its amendment's articles
-    and is skipped. ``tests/test_sample_builder.py`` checks the two agree.
-    """
-    group = dest.execute(
-        "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
-        "FROM src.st_statutes WHERE law_id=?",
-        (law_id,),
-    ).fetchall()
-    if not group:
-        return None
-
-    def snapshot(r) -> bool:
-        return r[4] is None or bool(r[5]) or r[2] != "연혁"
-
-    in_force = [r for r in group if (r[1] or "") <= as_of_iso] or list(group)
-    non_repealed = [r for r in in_force if not _is_repeal_kind(r[3])] or in_force
-    full = [r for r in non_repealed if _is_full_text_kind(r[3]) or snapshot(r)]
-    pool = full or non_repealed
-    if len(pool) == 1:
-        return pool[0][0]
-    ids = [r[0] for r in pool]
-    counts = dict.fromkeys(ids, 0)
-    q = (
-        "SELECT statute_id, COUNT(*) FROM src.st_articles WHERE statute_id IN (%s) "
-        "GROUP BY statute_id" % ",".join("?" * len(ids))
+def copy_statute_status_tables(dest: sqlite3.Connection) -> None:
+    """Copy the lapse register of the sampled laws and the addenda of the laws whose articles ship."""
+    copy_table(dest, "st_lapsed", "law_id IN (SELECT law_id FROM main.st_statutes)")
+    copy_table(
+        dest, "st_addenda",
+        "law_id IN (SELECT s.law_id FROM main.st_statutes s "
+        "WHERE s.id IN (SELECT statute_id FROM main.st_articles))",
     )
-    for sid, c in dest.execute(q, ids):
-        counts[sid] = c
-    if not full:
-        return max(pool, key=lambda r: (counts[r[0]], r[4] is None, r[1] or ""))[0]
-    most = max((counts[r[0]] for r in pool if snapshot(r)), default=0)
-    texts = [r for r in pool if _carries_full_text(r) or counts[r[0]] >= 0.9 * most]
-    return max(texts, key=lambda r: (r[1] or "", counts[r[0]], r[4] is None))[0]
 
 
-def drop_unshipped_full_texts(dest: sqlite3.Connection, snap_ids: list[int]) -> int:
-    """Drop version rows dated after a shipped snapshot that carry a full text of their own.
-
-    ``core-current`` ships one snapshot's articles per law, but every version
-    row comes along. The tool decides the current version by date, so a
-    later version that counts as a full text (in practice a future amendment
-    loaded whole) takes over once its date passes — and in the sample it has
-    no articles, so the law turns up empty. Measured on the committed sample:
-    16 such rows across 8 laws, taking over one by one from the build date
-    on. Repeal rows stay (they carry no text, and they are how a repealed
-    law is known), so do delta rows (never chosen without their articles)
-    and rows the charge map points at (foreign keys). Returns the count.
-    """
-    dropped = 0
-    for sid in snap_ids:
-        law_id, eff = dest.execute(
-            "SELECT law_id, effective_date FROM main.st_statutes WHERE id=?", (sid,)).fetchone()
-        rows = dest.execute(
-            "SELECT id, effective_date, history_status, change_kind, mst, serial_id "
-            "FROM main.st_statutes WHERE law_id=? AND effective_date>? "
-            "AND id NOT IN (SELECT statute_id FROM main.charge_legal_map WHERE statute_id IS NOT NULL)",
-            (law_id, eff),
-        ).fetchall()
-        doomed = [r[0] for r in rows if not _is_repeal_kind(r[3]) and _carries_full_text(r)]
-        if doomed:
-            dest.execute(
-                "DELETE FROM main.st_statutes WHERE id IN (%s)" % ",".join("?" * len(doomed)), doomed)
-            dropped += len(doomed)
-    return dropped
+def copy_annex_index(dest: sqlite3.Connection) -> None:
+    """Copy the annexed-table index (별표·서식) of the sampled laws and rules."""
+    copy_table(
+        dest, "st_byeolpyo",
+        "(scope='law' AND owner_id IN (SELECT law_id FROM main.st_statutes)) "
+        "OR (scope='admrul' AND owner_id IN (SELECT notice_id FROM main.st_notices))",
+    )
 
 
-def copy_treaty_tables(dest: sqlite3.Connection, countries: tuple[str, ...] | None) -> int | None:
+def copy_treaty_tables(dest: sqlite3.Connection, countries: tuple[str, ...] | None) -> int:
     """Copy the tax treaties of ``countries`` (None = all) and the multilateral ones, with their index.
 
-    Only published facts: the loader's run stamp (``listed_at``) stays out.
     The country-name table comes along whole (a few hundred short rows), so a
-    query naming any partner is read as that partner rather than searched
-    as text. Older sources without the tables remain supported (None).
+    query naming any partner is read as that partner rather than searched as
+    text.
     """
-    if not dest.execute(
-        "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name='st_treaties'"
-    ).fetchone():
-        return None
-    columns = "id, treaty_no, name, name_en, country, role, signed_date, effective_date, attachment_url"
-    dest.execute(
-        "CREATE TABLE main.st_treaties (id INTEGER PRIMARY KEY, treaty_no TEXT, name TEXT NOT NULL, "
-        "name_en TEXT, country TEXT, role TEXT NOT NULL, signed_date TEXT, effective_date TEXT, "
-        "attachment_url TEXT)"
-    )
     if countries is None:
-        dest.execute(f"INSERT INTO main.st_treaties ({columns}) SELECT {columns} FROM src.st_treaties")
+        copy_table(dest, "st_treaties")
     else:
         marks = ",".join("?" * len(countries))
-        dest.execute(
-            f"INSERT INTO main.st_treaties ({columns}) SELECT {columns} FROM src.st_treaties "
-            f"WHERE country IS NULL OR country IN ({marks})",
-            countries,
-        )
-    for table, scope in (
-        ("st_treaty_articles", "treaty_id IN (SELECT id FROM main.st_treaties)"),
-        ("st_treaty_country_names", "1"),
-    ):
-        copy_ddl(dest, table)
-        dest.execute(f"INSERT INTO main.{table} SELECT * FROM src.{table} WHERE {scope}")
-    for table in ("st_treaties", "st_treaty_articles", "st_treaty_country_names"):
-        copy_indexes(dest, table)
+        copy_table(dest, "st_treaties", f"country IS NULL OR country IN ({marks})", countries)
+    copy_table(dest, "st_treaty_articles", "treaty_id IN (SELECT id FROM main.st_treaties)")
+    copy_table(dest, "st_treaty_country_names")
     copy_ddl(dest, "st_treaty_articles_fts")
     dest.execute("INSERT INTO main.st_treaty_articles_fts(st_treaty_articles_fts) VALUES('rebuild')")
     return count(dest, "st_treaties")
+
+
+def copy_triggers(dest: sqlite3.Connection) -> None:
+    """Copy the source's triggers on the sample's tables, once the rows are in.
+
+    They keep ``prec_meta`` and the trigram index in step with ``prec_cases``
+    for anyone who writes to the sample; the tools only read.
+    """
+    tables = {r[0] for r in dest.execute("SELECT name FROM main.sqlite_master WHERE type='table'")}
+    for name, tbl, sql in dest.execute(
+        "SELECT name, tbl_name, sql FROM src.sqlite_master WHERE type='trigger' ORDER BY name"
+    ).fetchall():
+        if tbl in tables:
+            dest.execute(sql)
 
 
 # --- build --------------------------------------------------------------------
@@ -323,7 +309,7 @@ def copy_treaty_tables(dest: sqlite3.Connection, countries: tuple[str, ...] | No
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--source", default=os.environ.get("HARNESS_DB"), help="full corpus db")
+    ap.add_argument("--source", default=os.environ.get("CORPUS_DB"), help="full corpus db")
     ap.add_argument("--dest", required=True, help="sample db to create")
     ap.add_argument("--cases", type=int, default=500, help="max precedent cases")
     ap.add_argument(
@@ -343,12 +329,12 @@ def main() -> None:
         "--statutes",
         choices=["core-current", "core", "all"],
         default="core-current",
-        help="core-current: whitelist laws, current-snapshot articles only; "
-        "core: whitelist laws with every version's articles; all: everything",
+        help="core-current: whitelist laws, articles of the current whole text and later "
+        "versions; core: whitelist laws with every version's articles; all: everything",
     )
     ap.add_argument(
         "--notices", type=int, default=20,
-        help="recent current-edition notices to keep",
+        help="recent current-edition administrative rules to keep",
     )
     ap.add_argument(
         "--treaty-countries",
@@ -359,11 +345,13 @@ def main() -> None:
     args = ap.parse_args()
 
     if not args.source:
-        raise SystemExit("--source (or HARNESS_DB) is required")
+        raise SystemExit("--source (or CORPUS_DB) is required")
     if os.path.exists(args.dest):
         if not args.force:
             raise SystemExit(f"{args.dest} exists (use --force)")
         os.remove(args.dest)
+
+    from lawful_mcp.harness_local.tools.statutes import _NOTICE_CURRENT, _today_iso
 
     t0 = time.time()
     # uri=True so the read-only file: URI in ATTACH is honored.
@@ -378,19 +366,18 @@ def main() -> None:
 
     # 1. reference tables, complete.
     for t in FULL_TABLES:
-        copy_ddl(dest, t)
-        dest.execute(f"INSERT INTO main.{t} SELECT * FROM src.{t}")
-        copy_indexes(dest, t)
+        copy_table(dest, t)
     log(f"reference tables: {', '.join(f'{t}={count(dest, t)}' for t in FULL_TABLES[:3])}, ...")
 
-    # 2. statutes (+ all historical versions of selected laws), notices.
-    for t in ("st_statutes", "st_articles", "st_notices", "st_notice_articles"):
+    # 2. statutes (+ all historical version rows of selected laws), notices.
+    for t in ("st_statutes", "st_articles"):
         copy_ddl(dest, t)
     # Effective dates are stored compact (YYYYMMDD); compare in kind.
-    as_of = time.strftime("%Y%m%d")
-    snap_ids: list[int] = []
+    as_of = _today_iso()
+    shipped: list[int] = []
+    left_out: list[int] = []
     if args.statutes == "all":
-        dest.execute("INSERT INTO main.st_statutes SELECT * FROM src.st_statutes")
+        copy_rows(dest, "st_statutes")
     else:
         marks = ",".join("?" for _ in CORE_STATUTES)
         law_ids = [
@@ -402,80 +389,70 @@ def main() -> None:
             ).fetchall()
         ]
         # Every version row of a selected law comes along: the rows are cheap
-        # metadata and old-law resolution walks the version timeline.
+        # metadata, and repeal and point-in-time answers walk the timeline.
+        plans = [plan_versions(dest, lid, as_of) for lid in law_ids]
+        shipped = [sid for ship, _ in plans for sid in ship]
+        left_out = ([sid for _, drop in plans for sid in drop]
+                    if args.statutes == "core-current" else [])
         lmarks = ",".join("?" for _ in law_ids)
-        dest.execute(
-            f"INSERT INTO main.st_statutes SELECT * FROM src.st_statutes "
-            f"WHERE law_id IN ({lmarks})",
-            law_ids,
-        )
-        snap_ids = [
-            s for s in (pick_current_snapshot(dest, lid, as_of) for lid in law_ids) if s
-        ]
+        dmarks = ",".join("?" for _ in left_out)
+        copy_rows(dest, "st_statutes", f"law_id IN ({lmarks}) AND id NOT IN ({dmarks})",
+                  [*law_ids, *left_out])
     # Statutes referenced by the charge->penalty map must exist for FK
     # integrity. Penalty bounds live in charge_legal_map itself, so these
     # closure laws keep their row; article bodies only come along outside
     # core-current mode.
-    dest.execute(
-        "INSERT INTO main.st_statutes SELECT * FROM src.st_statutes "
-        "WHERE id IN (SELECT statute_id FROM main.charge_legal_map "
-        "             WHERE statute_id IS NOT NULL) "
-        "AND id NOT IN (SELECT id FROM main.st_statutes)"
+    copy_rows(
+        dest, "st_statutes",
+        "id IN (SELECT statute_id FROM main.charge_legal_map WHERE statute_id IS NOT NULL) "
+        "AND id NOT IN (SELECT id FROM main.st_statutes)",
     )
+    if left_out:
+        back = dest.execute(
+            f"SELECT COUNT(*) FROM main.st_statutes WHERE id IN ({dmarks})", left_out).fetchone()[0]
+        log(f"statutes: left out {len(left_out) - back} versions not yet in force"
+            + (f" ({back} kept for the charge map, without articles)" if back else ""))
     if args.statutes == "core-current":
-        # Version rows carry delta article sets (changed articles only); the
-        # full text of a law as it stands lives in its consolidated snapshot.
-        # Ship only that snapshot per law — the pick mirrors the tool — and
-        # drop the later full-text rows whose articles are not shipped.
-        smarks = ",".join("?" for _ in snap_ids)
-        dest.execute(
-            f"INSERT INTO main.st_articles SELECT * FROM src.st_articles "
-            f"WHERE statute_id IN ({smarks})",
-            snap_ids,
-        )
-        log(f"statutes: dropped {drop_unshipped_full_texts(dest, snap_ids)} later full-text "
-            "versions whose articles are not shipped")
+        smarks = ",".join("?" for _ in shipped)
+        copy_rows(dest, "st_articles", f"statute_id IN ({smarks})", shipped)
     else:
-        dest.execute(
-            "INSERT INTO main.st_articles SELECT * FROM src.st_articles "
-            "WHERE statute_id IN (SELECT id FROM main.st_statutes)"
-        )
+        copy_rows(dest, "st_articles", "statute_id IN (SELECT id FROM main.st_statutes)")
     # Only rules the tool would actually surface. An administrative rule is
-    # re-issued as a *new row* on amendment, so the corpus holds superseded
-    # editions ('구판') and future ones ('시행예정') alongside the current text;
-    # ``statute_lookup`` searches the current edition with a readable body, and
-    # a sample drawn without that filter fills up with rows no search can reach.
-    dest.execute(
-        "INSERT INTO main.st_notices SELECT * FROM src.st_notices "
-        "WHERE has_text_content=1 AND COALESCE(history_status,'현행')='현행' "
-        "ORDER BY issued_date DESC, id DESC LIMIT ?",
+    # re-issued as a *new row* on amendment, so the corpus holds superseded and
+    # future editions alongside the current one; ``statute_lookup`` searches
+    # the current edition with a readable body, and a sample drawn without that
+    # filter fills up with rows no search can reach.
+    copy_table(
+        dest, "st_notices",
+        f"id IN (SELECT n.id FROM src.st_notices n WHERE n.has_text_content=1 AND {_NOTICE_CURRENT} "
+        "ORDER BY n.effective_date DESC, n.id DESC LIMIT ?)",
         (args.notices,),
     )
-    dest.execute(
-        "INSERT INTO main.st_notice_articles SELECT * FROM src.st_notice_articles "
-        "WHERE notice_id IN (SELECT id FROM main.st_notices)"
-    )
+    copy_table(dest, "st_notice_articles", "notice_id IN (SELECT id FROM main.st_notices)")
     copy_statute_status_tables(dest)
-    for t in ("st_statutes", "st_articles", "st_notices", "st_notice_articles"):
+    copy_annex_index(dest)
+    for t in ("st_statutes", "st_articles"):
         copy_indexes(dest, t)
     log(
-        f"statutes: {count(dest, 'st_statutes')} laws, {count(dest, 'st_articles')} articles, "
-        f"{count(dest, 'st_notices')} notices"
+        f"statutes: {count(dest, 'st_statutes')} versions, {count(dest, 'st_articles')} articles, "
+        f"{count(dest, 'st_notices')} rules"
     )
     partners = None if args.treaty_countries == "all" else tuple(
         c.strip() for c in args.treaty_countries.split(",") if c.strip())
-    n_treaties = copy_treaty_tables(dest, partners)
-    log("treaties: source has none" if n_treaties is None else f"treaties: {n_treaties} documents")
+    log(f"treaties: {copy_treaty_tables(dest, partners)} documents")
 
-    # 3. precedent selection: sentencing-sample cases first, then recent.
-    linked_cap = int(args.cases * args.linked_share)
+    # 3. precedent selection: sentencing-sample cases first, then holdings, then recent.
     dest.execute("CREATE TEMP TABLE pick(id INTEGER PRIMARY KEY)")
+    pmarks = ",".join("?" * len(PINNED_CASES))
+    dest.execute(f"INSERT INTO pick SELECT id FROM src.prec_cases WHERE id IN ({pmarks})", PINNED_CASES)
+    n_pinned = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0]
+    linked_cap = int(args.cases * args.linked_share)
     dest.execute(
         "INSERT OR IGNORE INTO pick "
         "SELECT DISTINCT case_id FROM src.prec_defendants ORDER BY case_id DESC LIMIT ?",
         (linked_cap,),
     )
-    n_linked = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0]
+    n_linked = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0] - n_pinned
     # Cases carrying the court's own issue summary (``holdings``), which
     # precedent_search prints for every result it returns. These need a quota
     # of their own because neither other tier reaches them. Only the Supreme
@@ -500,7 +477,7 @@ def main() -> None:
         "ORDER BY decision_year DESC, decision_date DESC, id DESC LIMIT ?",
         (holdings_cap,),
     )
-    n_holdings = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0] - n_linked
+    n_holdings = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0] - n_pinned - n_linked
     # Restrict the recency scan to the last few years so the indexed year
     # column narrows it; decision_date itself carries no index.
     recent_floor = time.localtime().tm_year - 4
@@ -509,27 +486,16 @@ def main() -> None:
         "SELECT id FROM src.prec_cases "
         "WHERE decision_year >= ? AND id NOT IN (SELECT id FROM pick) "
         "ORDER BY decision_date DESC, id DESC LIMIT ?",
-        (recent_floor, max(args.cases - n_linked - n_holdings, 0)),
+        (recent_floor, max(args.cases - n_pinned - n_linked - n_holdings, 0)),
     )
-    log(
-        f"case selection: {n_linked} sentencing-linked + {n_holdings} with holdings + "
-        f"{dest.execute('SELECT COUNT(*) FROM pick').fetchone()[0] - n_linked - n_holdings}"
-        " recent"
-    )
+    n_recent = dest.execute("SELECT COUNT(*) FROM pick").fetchone()[0] - n_pinned - n_linked - n_holdings
+    log(f"case selection: {n_pinned} pinned + {n_linked} sentencing-linked + "
+        f"{n_holdings} with holdings + {n_recent} recent")
 
-    copy_ddl(dest, "prec_cases")
-    dest.execute(
-        "INSERT INTO main.prec_cases SELECT * FROM src.prec_cases "
-        "WHERE id IN (SELECT id FROM pick)"
-    )
-    copy_indexes(dest, "prec_cases")
-    for t in ("prec_defendants", "prec_defendant_charges", "prec_sentences"):
-        copy_ddl(dest, t)
-        dest.execute(
-            f"INSERT INTO main.{t} SELECT * FROM src.{t} "
-            "WHERE case_id IN (SELECT id FROM pick)"
-        )
-        copy_indexes(dest, t)
+    copy_table(dest, "prec_cases", "id IN (SELECT id FROM pick)")
+    copy_table(dest, "prec_meta", "id IN (SELECT id FROM pick)")
+    for t in ("prec_case_numbers", "prec_sentences", "prec_defendants", "prec_defendant_charges"):
+        copy_table(dest, t, "case_id IN (SELECT id FROM pick)")
     log(
         f"prec_cases: {count(dest, 'prec_cases')} rows "
         f"(+{count(dest, 'prec_defendants')} defendants, "
@@ -554,6 +520,7 @@ def main() -> None:
         )
         n_morph += 1
     log(f"prec_cases_morph_fts: tokenized {n_morph} cases with Kiwi")
+    copy_triggers(dest)
 
     # 5. finalize: integrity, stats, compact.
     violations = dest.execute("PRAGMA foreign_key_check").fetchall()
@@ -568,7 +535,7 @@ def main() -> None:
     dest.execute("VACUUM")
     dest.commit()
 
-    log(f"done: {args.dest} = {os.path.getsize(args.dest) / 1048576:.1f} MB")
+    log(f"done: {args.dest} = {os.path.getsize(args.dest) / 1048576:.2f} MiB")
     names = [
         r[0]
         for r in dest.execute(

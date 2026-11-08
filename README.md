@@ -4,8 +4,8 @@ English | [한국어](README.ko.md)
 
 Korean case law, statutes and sentencing data as [MCP](https://modelcontextprotocol.io)
 tools. Connect an AI client to find judgments, look up statutes as of a date,
-check what a judgment held in its own words and calculate statutory and guideline
-sentencing ranges.
+check what a judgment held in its own words and gather the statutory penalties,
+guideline ranges and actual sentences for a case's charges.
 
 Four read-only tools:
 
@@ -14,11 +14,14 @@ Four read-only tools:
 | `precedent_search` | Find judgments by facts, charge, court, year or case number |
 | `precedent_dive` | Read one judgment body and answer a question about it |
 | `statute_lookup` | Statute and administrative-rule articles, current or as of a date, and tax treaties |
-| `sentencing_analysis` | Statutory ranges, guidelines, factors and observed sentences for one charge; calculate ranges from supplied findings |
+| `sentencing_analysis` | Statutory penalties, guideline ranges and factors, and first-instance sentences for one charge or several |
 
 This repository publishes the MCP tools used by
 [로풀 (Lawful)](https://lawful.crow-tit.com), a free Korean legal-AI service.
-The web application and hosted Agent API are maintained separately. The
+The tools in `src/lawful_mcp/harness_local` are the code the hosted service
+runs, copied unchanged; this repository adds a server you can run yourself and
+a sample corpus. The web application and hosted Agent API are maintained
+separately. The
 research prototype and benchmark archive live in
 [`legal_mcp`](https://github.com/LimEulYoung/legal_mcp) — see [Paper](#paper).
 
@@ -99,7 +102,7 @@ Settings are listed in [`.env.example`](.env.example). The server reads process
 environment variables; it does **not** load `.env` automatically. Export values
 in the launching shell or set them in your MCP client's `env` configuration.
 
-With the defaults, three tools search and calculate locally.
+With the defaults, three tools run locally against the corpus.
 `precedent_dive` additionally sends the selected public judgment text, case
 metadata and the supplied question to your configured model endpoint. Keep
 that question limited to issues in the public judgment.
@@ -120,11 +123,6 @@ and that question to OpenRouter's Jev endpoint, and returns the cases that
 decided the question first. Without the key, or when a request fails or takes
 longer than 1.5 seconds, results keep their keyword order.
 
-Optional dense search (`USE_DENSE=1`) sends search queries to an embedding
-endpoint and, when reranking is enabled, queries and candidate excerpts to a
-reranking endpoint. It requires the `dense` extra and corpus vectors, which
-the bundled sample does not contain.
-
 ### Check the installation
 
 The tests use the bundled sample and constructed test data; no network or
@@ -141,8 +139,8 @@ The tools read one SQLite file. The bundled sample is about 49 MiB:
 
 | | Sample (`data/fixture.db`) | Hosted |
 |---|---|---|
-| Judgments | 700 | 220,000+ |
-| Statutes | 27 core laws, current text | All, with amendment history |
+| Judgments | 600 | 220,000+ |
+| Statutes | 27 core laws, current text and addenda | All, with amendment history |
 | Administrative rules | 20 | All |
 | Tax treaties | 3 partners and the multilateral conventions, 7 documents | All |
 | Sentencing guidelines | Complete | Complete |
@@ -151,9 +149,13 @@ The tools read one SQLite file. The bundled sample is about 49 MiB:
 The sample supports local trials and testing. Use the hosted service for the
 full corpus, or set `CORPUS_DB` to a compatible database you maintain.
 
+The sample holds each law as in force on the day it was built: amendments
+taking effect later and earlier wordings are left out, so lookups as of
+another date need the hosted corpus.
+
 Statute lookups distinguish repeal from loss of effect, such as expiry, when
-the corpus supplies that information. The sample's lapse register is currently
-empty; expiry and reinstatement are covered by separate test data.
+the corpus supplies that information. The sample's lapse register is empty;
+those rules are covered by constructed test data.
 
 A tax treaty comes with every document of the same partner and the
 multilateral conventions, in order of entry into force. The official source
@@ -171,7 +173,9 @@ Court and case-number provenance is preserved in the data.
 
 [`scripts/build_sample_db.py`](scripts/build_sample_db.py) extracts a sample
 from an existing compatible corpus and rebuilds its search indexes. It also
-documents the schema; it does not download the hosted corpus:
+documents the schema: every table is created from the source's definition, and
+the build stops if one the tools read is missing. It does not download the
+hosted corpus:
 
 ```bash
 .venv/bin/python scripts/build_sample_db.py --source /path/to/corpus.db \
