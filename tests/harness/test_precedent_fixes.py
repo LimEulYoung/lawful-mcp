@@ -72,3 +72,16 @@ def test_the_judgment_reader_gives_the_court_and_date_to_the_model_and_the_sub_a
     out = asyncio.run(dive.precedent_dive(Ctx(), case_id=4, question="법리"))
     assert "- court: 대법원 2012-02-16" in out
     assert "(사건번호: 2011다52727, 대법원 2012-02-16)" in prompts[0]
+
+
+def test_a_preview_anchors_on_the_longest_word_and_shows_no_images():
+    head = "![](/case-img/1/p1_1.png#w=50&px=525x81)\n\n【사건】 2008고정7012 폭행\n【판결선고】 2008년 12월\n\n"
+    body = ("이유\n피고인은 2008. 10. 1. 22:00경 서울 종로구에 있는 공원 앞 도로에서 지나가는 사람들이 보는 가운데 "
+            "공연히 음란한 행위를 하였다. ![](/case-img/1/p2_1.png#h=12)이에 처벌한다.")
+    seg = ps._excerpt_around(head + body, ["음란한", "음란", "년"])
+    assert seg.startswith("…") and "음란한 행위를 하였다. 이에 처벌한다." in seg and "case-img" not in seg
+    assert ps._excerpt_around(head, ["년"]) is None
+    # A snippet that starts or ends inside an image notation keeps none of it.
+    raw = "…256/p2_2.png#w=19&px=252x74) 이유 ⟦사기⟧ 피해 ![](/case-img/2/p3_1.png#h=9) 금액 ![](/case-img/…"
+    assert ps._drop_images(raw) == "…256/p2_2.png#w=19&px=252x74) 이유 ⟦사기⟧ 피해  금액 ![](/case-img/…"
+    assert ps._IMAGE_PIECE.sub("…", ps._drop_images(raw)) == "… 이유 ⟦사기⟧ 피해  금액 …"

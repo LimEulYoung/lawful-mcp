@@ -1,4 +1,4 @@
-"""MCP application — four read-only corpus tools over stdio or HTTP.
+"""MCP application — five read-only corpus tools over stdio or HTTP.
 
 No authentication and no metering: this server is meant to run next to the
 client that uses it, against a corpus you hold. (The hosted deployment puts
@@ -43,8 +43,8 @@ _EXTRA_HOSTS = [
 _INSTRUCTIONS = (
     "한국 법률 검색 도구 모음 — 판례·법령·행정규칙(고시·훈령·예규)·양형기준 corpus 기반. "
     "판례 검색(precedent_search) 후 필요할 때 본문 확인(precedent_dive — 법리는 판결문 원문 그대로), "
-    "법령·행정규칙 조문(statute_lookup), 양형(sentencing_analysis — 기준·인자·실선고 분포를 "
-    "한 응답에). 판례 출처 표기는 도구가 반환한 url만 사용."
+    "법령·행정규칙 찾기(statute_search)와 조문 본문(statute_read), 양형(sentencing_analysis — "
+    "기준·인자·실선고 분포를 한 응답에). 판례 출처 표기는 도구가 반환한 url만 사용."
 )
 
 mcp = MCPServer("lawful-mcp", instructions=_INSTRUCTIONS)
@@ -167,27 +167,35 @@ def precedent_search(
 
 
 @_tool(
-    _T["statute_lookup"],
-    title="법령·행정규칙 조회",
+    _T["statute_search"],
+    title="법령 찾기",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
 )
-def statute_lookup(
+def statute_search(
     query: str | None = None,
-    statute_id: int | str | None = None,
-    articles: list[str] | None = None,
-    limit: int = 10,
     offense_date: str | None = None,
 ) -> str:
-    return _T["statute_lookup"](
-        _ctx(),
-        query=query,
-        statute_id=statute_id,
-        articles=articles,
-        limit=limit,
-        offense_date=offense_date,
+    return _T["statute_search"](_ctx(), query=query, offense_date=offense_date)
+
+
+@_tool(
+    _T["statute_read"],
+    title="법령 본문",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+def statute_read(
+    statute_id: int | str | None = None,
+    articles: list[str] | None = None,
+    offense_date: str | None = None,
+) -> str:
+    return _T["statute_read"](
+        _ctx(), statute_id=statute_id, articles=articles, offense_date=offense_date
     )
 
 

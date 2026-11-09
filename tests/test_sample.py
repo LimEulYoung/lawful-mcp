@@ -77,22 +77,22 @@ def test_a_holding_from_the_sample_reaches_the_response():
 def test_search_syntax_typed_by_a_caller_does_not_break_the_tools():
     out = call("precedent_search", query="사기 AND")
     assert out.startswith("## status: ok") and "- id: " in out
-    assert call("statute_lookup", query="개인정보 AND (보호법 OR)").startswith("## status: ok")
+    assert call("statute_search", query="개인정보 AND (보호법 OR)").startswith("## status: ok")
 
 
 def test_addenda_of_a_sampled_law():
-    out = call("statute_lookup", statute_id=584, articles=["부칙 1"])
+    out = call("statute_read", statute_id=584, articles=["부칙 1"])
     assert "## 부칙 (" in out and "제1조(시행일)" in out
 
 
 def test_the_sample_answers_a_partner_query_with_its_treaties():
-    out = call("statute_lookup", query="베트남 조세조약", limit=5)
+    out = call("statute_search", query="베트남 조세조약")
     first = next(line for line in out.split("## matches", 1)[1].splitlines() if line.startswith("- "))
     assert first.startswith("- trty-1307 ")
-    detail = call("statute_lookup", statute_id="trty-1307", articles=["4"])
+    detail = call("statute_read", statute_id="trty-1307", articles=["4"])
     assert "text_kind: 공식 조약 원문" in detail and "- trty-15611 · " in detail
     assert "다자 조세조약" in detail                               # multilateral conventions listed beside
-    unsplit = call("statute_lookup", statute_id="trty-17985")      # a document not split into articles
+    unsplit = call("statute_read", statute_id="trty-17985")      # a document not split into articles
     assert "## body" in unsplit and "## 첨부 원문: " in unsplit
 
 

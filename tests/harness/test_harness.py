@@ -25,19 +25,21 @@ def call(name, **args):
     return asyncio.run(out) if inspect.isawaitable(out) else out
 
 
-def test_tools_are_the_four_database_tools():
+def test_tools_are_the_five_database_tools():
     assert sorted(TOOL) == [
         "precedent_dive",
         "precedent_search",
         "sentencing_analysis",
-        "statute_lookup",
+        "statute_read",
+        "statute_search",
     ]
 
 
 @pytest.mark.parametrize(
     "name, args",
     [
-        ("statute_lookup", {"query": "형법", "articles": ["347"]}),
+        ("statute_search", {"query": "형법 제347조"}),
+        ("statute_read", {"statute_id": 468, "articles": ["1"]}),
         ("precedent_search", {"query": "불법행위 손해배상 책임"}),
         ("precedent_search", {"query": "사기죄 기망행위", "court_level": "대법원"}),
         ("sentencing_analysis", {"charges": ["사기"]}),
@@ -274,18 +276,18 @@ def test_a_court_name_takes_the_courts_short_and_spaced_spellings():
 
 def test_a_statute_search_of_only_short_words_says_the_text_was_not_searched():
     # The article index is trigram: two-character words match no text, so the list comes from names alone.
-    assert "'절도': 두 글자 이하 낱말은 조문 본문에서 찾지 못합니다" in call("statute_lookup", query="절도")
-    assert "'간통': 두 글자 이하" in call("statute_lookup", query="형법 간통")
+    assert "'절도': 두 글자 이하 낱말은 조문 본문에서 찾지 못합니다" in call("statute_search", query="절도")
+    assert "'간통': 두 글자 이하" in call("statute_search", query="형법 간통")
     for query in ("민법", "상습범", "국세기본법 가산세"):  # a statute name, or a word the text index can match
-        assert "두 글자 이하" not in call("statute_lookup", query=query), query
+        assert "두 글자 이하" not in call("statute_search", query=query), query
 
 
 def test_a_statute_search_whose_words_no_article_holds_says_the_list_is_by_name():
     by_name = "조문 본문에서 맞는 조문을 찾지 못해, 법령 이름으로만 찾았습니다."
-    out = call("statute_lookup", query="민법 없는낱말이다")
+    out = call("statute_search", query="민법 없는낱말이다")
     assert by_name in out and "- 584 민법" in out
-    assert by_name in call("statute_lookup", query="없는낱말이다 없는말이에요")  # an empty list says it too
-    assert "- message:" not in call("statute_lookup", query="상습범")  # found in the text
+    assert by_name in call("statute_search", query="없는낱말이다 없는말이에요")  # an empty list says it too
+    assert "- message:" not in call("statute_search", query="상습범")  # found in the text
 
 
 def test_source_crimes_are_listed_in_the_penalty_table():
@@ -307,7 +309,8 @@ def test_offense_dates_in_korean_forms_and_unreadable_dates():
 
     assert {to_iso_date(d) for d in ("2019. 3. 8.", "2019.3.8.", "2019년 3월 8일", "2019-03-08")} == {"20190308"}
     for name, args in (
-        ("statute_lookup", {"statute_id": 468, "articles": ["1"]}),
+        ("statute_read", {"statute_id": 468, "articles": ["1"]}),
+        ("statute_search", {"query": "대한민국헌법 제1조"}),
         ("sentencing_analysis", {"charges": ["사기"]}),
     ):
         assert call(name, offense_date="작년 봄", **args).startswith("## status: bad_offense_date")
@@ -473,7 +476,7 @@ def test_point_in_time_outline_lists_unamended_articles():
     def numbers(out):
         return {n for n in re.findall(r"^- (\d+):", out, re.M) if n != "0"}
 
-    then = call("statute_lookup", statute_id=468, offense_date="2000.1.1")
-    assert "시점 조회: 2000-01-01" in then and numbers(then) == numbers(call("statute_lookup", statute_id=468))
+    then = call("statute_read", statute_id=468, offense_date="2000.1.1")
+    assert "시점 조회: 2000-01-01" in then and numbers(then) == numbers(call("statute_read", statute_id=468))
 
 

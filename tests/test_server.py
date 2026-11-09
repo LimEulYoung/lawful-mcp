@@ -6,6 +6,7 @@ with what description, and how arguments arrive through the MCP layer.
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import os
@@ -100,11 +101,12 @@ def test_dive_timeout_reaches_the_harness(fresh_server):
 
 # ---------- registration ----------
 
-def test_without_a_dive_model_three_tools_are_registered(fresh_server):
-    assert sorted(_tools(fresh_server())) == ["precedent_search", "sentencing_analysis", "statute_lookup"]
+def test_without_a_dive_model_every_tool_but_the_dive_is_registered(fresh_server):
+    assert sorted(_tools(fresh_server())) == ["precedent_search", "sentencing_analysis", "statute_read",
+                                              "statute_search"]
 
 
-def test_with_a_dive_model_all_four_harness_tools_are_registered(fresh_server):
+def test_with_a_dive_model_every_harness_tool_is_registered(fresh_server):
     server = fresh_server(DIVE_API_KEY="k", DIVE_BASE_URL="https://example.test/v1", DIVE_MODEL="m")
     assert sorted(_tools(server)) == sorted(HARNESS)
 
@@ -127,10 +129,12 @@ def test_wrapper_arguments_are_the_harness_arguments(fresh_server):
 
 def test_model_facing_text_names_no_tool_this_server_lacks():
     """The server registers no web tools; a response pointing the model at one sends it looking for a call it
-    cannot make."""
+    cannot make. Every string literal is checked (descriptions, messages, prompts); comments, which reach no
+    model, may name the API's web tools."""
     for path in HARNESS_DIR.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        assert "web_fetch" not in text and "web_search" not in text, path
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert "web_fetch" not in node.value and "web_search" not in node.value, f"{path}:{node.lineno}"
 
 
 # ---------- the MCP argument layer ----------
@@ -142,7 +146,7 @@ def test_charges_is_a_required_list_and_the_other_strings_stay_narrow(fresh_serv
     assert schema["required"] == ["charges"]
     for tool, field in (("precedent_search", "query"), ("precedent_search", "issue"),
                         ("precedent_search", "case_number"), ("precedent_search", "court_name"),
-                        ("statute_lookup", "query"), ("sentencing_analysis", "offense_date")):
+                        ("statute_search", "query"), ("sentencing_analysis", "offense_date")):
         assert "array" not in _types(_schema(tools[tool])["properties"][field]), f"{tool}.{field}"
 
 

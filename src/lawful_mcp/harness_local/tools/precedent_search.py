@@ -277,6 +277,17 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
+# Images in the judgment text ('![](/case-img/19679/p1_1.png#w=50&px=525x81)' on its own line or mid-sentence, a few
+# '<img src=…></img>'): a preview has nothing to show of them, so they are taken out before it is cut.
+_IMAGE = re.compile(r"!\[[^\]\n]*\]\([^)\n]*\)\n*|<img\b[^>]*>(?:</img>)?")
+# The piece left where a snippet starts or ends inside one ('…256/p2_2.png#w=19&px=252x74)', '![](/case-img/…').
+_IMAGE_PIECE = re.compile(r"^…[\x21-\x7e]*[/#=&][\x21-\x7e]*\)|!\[[^\]\n]*(?:\]\([^)\n]*)?…?$")
+
+
+def _drop_images(text: str) -> str:
+    return _IMAGE.sub("", text)
+
+
 def _fts_snippets(
     conn: sqlite3.Connection, ids: Sequence[int], match: str
 ) -> dict[int, tuple[str, str]]:
@@ -312,7 +323,7 @@ def _fts_snippets(
     )
     for row in rows:
         for key, source in columns:
-            raw = row[key] or ""
+            raw = _IMAGE_PIECE.sub("…", _drop_images(row[key] or ""))
             if "⟦" not in raw:  # no actual query hit in this column
                 continue
             clean = _strip_markup(re.sub(r"[⟦⟧]", "", raw))
@@ -329,18 +340,16 @@ def _fts_snippets(
 
 
 def _excerpt_around(text: str, terms: Sequence[str]) -> str | None:
-    """Plain-text excerpt: EXCERPT_HALF characters on each side of the *earliest* occurrence of any of terms in
-    text (None if there is none)."""
+    """Plain-text excerpt: EXCERPT_HALF characters on each side of the first occurrence of the *longest* of terms
+    found in text, the earliest of equal length (None if there is none). One-character terms ('년', '가') are
+    not anchors: they hit the judgment's heading first."""
     if not text or not terms:
         return None
-    clean = _BR.sub(" ", text)
-    pos, hit = -1, None
-    for t in terms:  # terms come longest first — at the same position the longer word wins
-        i = clean.find(t)
-        if i != -1 and (pos == -1 or i < pos):
-            pos, hit = i, t
-    if pos == -1:
+    clean = _drop_images(_BR.sub(" ", text))
+    found = [(-len(t), i, t) for t in terms if len(t) >= 2 for i in [clean.find(t)] if i != -1]
+    if not found:
         return None
+    _, pos, hit = min(found)
     start = max(0, pos - EXCERPT_HALF)
     end = min(len(clean), pos + len(hit) + EXCERPT_HALF)
     seg = " ".join(clean[start:end].split())
@@ -556,7 +565,7 @@ def _hydrate(
         if cid not in by_id:
             continue
         r = by_id[cid]
-        full_summary = (r["display_summary"] or "").strip()
+        full_summary = _drop_images(r["display_summary"] or "").strip()
         out.append(
             {
                 "id": r["id"],

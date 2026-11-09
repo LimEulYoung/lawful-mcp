@@ -1,12 +1,12 @@
 """Lawful MCP — Korean case law, statutes and sentencing data as MCP tools.
 
-Four read-only tools over a SQLite corpus of Korean court judgments,
+Five read-only tools over a SQLite corpus of Korean court judgments,
 statutes, administrative rules, tax treaties and sentencing-guideline data:
 
   precedent_search     find judgments by facts, charge or case number
   precedent_dive       read one judgment body and answer a question
-  statute_lookup       statute, administrative-rule and tax-treaty articles,
-                       current or as of a date
+  statute_search       find statutes, administrative rules and tax treaties
+  statute_read         one statute's articles, current or as of a date
   sentencing_analysis  statutory penalties, guidelines, factors and
                        first-instance sentences for a case's charges
 
@@ -24,4 +24,4 @@ from . import config as _config
 
 _config.export_corpus_path()
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -1,4 +1,4 @@
-"""Tax treaties for statute_lookup — a third corpus beside statutes and administrative rules.
+"""Tax treaties for statute_search and statute_read — a third corpus beside statutes and administrative rules.
 
 Only tax treaties are loaded (double-taxation conventions, tax-information-exchange agreements, their amending
 instruments and the multilateral conventions). This module reads `st_treaties`, `st_treaty_articles`,

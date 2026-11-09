@@ -54,7 +54,7 @@ class Provision:
                               "article_branch": self.branch, "paragraph": self.paragraph})
 
     @property
-    def article_no(self) -> str:   # for statute_lookup: "347", "148의2"
+    def article_no(self) -> str:   # for statute_read: "347", "148의2"
         return f"{self.article_num}" + (f"의{self.branch}" if self.branch else "")
 
 

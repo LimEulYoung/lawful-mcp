@@ -135,11 +135,12 @@ def test_statistics_answer_for_several_charges_on_the_sample():
 
 
 def test_each_provision_is_read_once_per_guideline():
-    # 강도상해: one article, mapped under two guideline categories — one provision each, never the same twice.
+    # 아동학대처벌법 §7 aggravates the crime it is committed with, so the name is mapped under the guideline of each
+    # such crime (here 손괴 and 주거침입): one article, two categories — one provision each, never the same twice.
     from lawful_mcp.harness_local.deps import open_db
 
     with open_db() as conn:
-        reading = penalty.read_charge(conn, "강도상해")
+        reading = penalty.read_charge(conn, "아동학대범죄의처벌등에관한특례법위반(신고의무자의아동학대)")
     assert reading.kind == "ok" and len(reading.provisions) == len(set(reading.provisions))
     assert len({p.article for p in reading.provisions}) == 1 and len({p.category_id for p in reading.provisions}) == 2
     assert all(p.penalty is not None for p in reading.provisions)

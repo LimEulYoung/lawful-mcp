@@ -4,7 +4,7 @@ For a list of charges it shows, without computing anything for the case:
   - the rules of the judgement (the decision flow, the adjusted statutory range, several charges) — once;
   - for each charge, how its name was read, its statutory penalty per provision, branch or source crime
     (`statutory_penalty`), and the guideline of each category those provisions fall under (`sentencing_guideline`);
-  - the articles' text (`statute_lookup`);
+  - the articles' text (`statute_read`);
   - the first-instance sentences of the judgments holding the charges, grouped by how close their charges are
     (`sentence_statistics`).
 The model applies the rules to the facts. Each part is read as data and written here, once; nothing is parsed back.
@@ -267,18 +267,18 @@ def _guidance(conn, r: Reading, exclude: frozenset[int]) -> list[str]:
     if r.kind == "no_guideline":
         if res.law_repealed:
             return [f"- '{res.key}' 의 법률은 폐지되었다 — 이 이름으로는 양형기준이 없다. 후속 법률의 현행 명칭은 "
-                    "`statute_lookup` 으로 확인한다."]
+                    "`statute_search` 로 확인한다."]
         if res.status == "구법":
             return [f"- '{res.key}' 은 옛 죄명표 표기라 양형기준이 없다"
                     + (f" — 현행 죄명 '{res.successor}' 으로 다시 부른다." if res.successor
-                       else " — 현행 죄명은 `statute_lookup` 으로 확인한다.")]
+                       else " — 현행 죄명은 `statute_search` 로 확인한다.")]
         return [f"- '{res.key}' 은 공식 죄명(대검 죄명표)이지만 양형기준(48개 범죄군)에 없다 — 권고형 없음. "
-                "법정형·조문은 `statute_lookup` 으로 조회한다. 실선고는 아래에 싣는다."]
+                "법정형·조문은 `statute_search` 로 조회한다. 실선고는 아래에 싣는다."]
     return [f"- '{r.asked}' 은 공식 죄명(대검 죄명표)에 없는 표기다. 판결문 죄명 표기(예: 특수상해, "
             "도로교통법위반(음주운전))로 다시 부르고, 법률명만 알면 '<법률명>위반' 으로 그 법률의 죄명 후보를 받는다. "
             "형법·군형법의 죄명에는 '위반'이 붙지 않는다(형법위반 → 사기, 공무집행방해). "
             "죄가 여럿이면 죄명마다 목록의 원소로 나눠 넣는다.",
-            "- 양형기준이 없는 죄일 수 있다. 법정형은 `statute_lookup` 으로 조회한다."]
+            "- 양형기준이 없는 죄일 수 있다. 법정형은 `statute_search` 로 조회한다."]
 
 
 def _charge_head(conn, r: Reading, offense_date: str | None, exclude: frozenset[int]) -> list[tuple[str, str]]:

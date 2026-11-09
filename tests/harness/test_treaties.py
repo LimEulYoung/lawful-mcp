@@ -1,4 +1,4 @@
-"""Tax treaties in statute_lookup — a copy of the sample database (its treaty tables are empty) with a few treaty
+"""Tax treaties in statute_search and statute_read — a copy of the sample database (its treaty tables are empty) with a few treaty
 rows added; only the columns read here are filled. No network, no model calls."""
 
 import os
@@ -57,14 +57,14 @@ def treaty_db(treaty_copy, monkeypatch):
 @pytest.mark.parametrize("query", ["한-베트남 조세조약", "대한민국-베트남 조세협정 제4조", "월남과의 이중과세방지협정",
                                    "한·베 조세협정 제4조"])
 def test_partner_and_tax_treaty_word_find_the_treaty_first(treaty_db, query):
-    out = call("statute_lookup", query=query, limit=5)
+    out = call("statute_search", query=query)
     first = next(line for line in out.splitlines() if line.startswith("- ") and not line.startswith("- message:"))
     assert first.startswith(f"- trty-1307 {VN}")
     assert "trty-15611" in out and "/statutes/trty-1307" in out
 
 
 def test_one_letter_partner_and_territory(treaty_db):
-    out = call("statute_lookup", query="한중 조세조약", limit=5)
+    out = call("statute_search", query="한중 조세조약")
     assert "trty-1304" in out and "trty-12279" not in out      # 홍콩 협정은 '한중'이 아니다
 
 
@@ -76,11 +76,11 @@ def test_one_letter_partner_and_territory(treaty_db):
     "조세협정 제4조",
 ])
 def test_queries_not_about_a_tax_treaty_list_no_treaty(treaty_db, query):
-    assert "trty-" not in call("statute_lookup", query=query, limit=10)
+    assert "trty-" not in call("statute_search", query=query)
 
 
 def test_article_lookup_shows_the_text_and_every_document_of_the_partner(treaty_db):
-    out = call("statute_lookup", statute_id="trty-1307", articles=["제4조"])
+    out = call("statute_read", statute_id="trty-1307", articles=["제4조"])
     assert out.startswith("## status: ok")
     assert "text_kind: 공식 조약 원문" in out and "중대한 이해관계의 중심지" in out
     assert "제9조 특수관계기업" not in out
@@ -89,10 +89,10 @@ def test_article_lookup_shows_the_text_and_every_document_of_the_partner(treaty_
 
 
 def test_preamble_by_name_missing_article_and_unsplit_document(treaty_db):
-    assert "합의하였다" in call("statute_lookup", statute_id="trty-1307", articles=["전문"])
-    assert "## 없는 조문: 30" in call("statute_lookup", statute_id="trty-1307", articles=["30"])
-    whole = call("statute_lookup", statute_id="TRTY-5735")
+    assert "합의하였다" in call("statute_read", statute_id="trty-1307", articles=["전문"])
+    assert "## 없는 조문: 30" in call("statute_read", statute_id="trty-1307", articles=["30"])
+    whole = call("statute_read", statute_id="TRTY-5735")
     assert "## body" in whole and "조세정보 교환을 제의" in whole
-    assert call("statute_lookup", statute_id="trty-99999").startswith("## status: missing")
-    assert call("statute_lookup", statute_id="https://lawful.crow-tit.com/statutes/trty-1307/4").startswith(
+    assert call("statute_read", statute_id="trty-99999").startswith("## status: missing")
+    assert call("statute_read", statute_id="https://lawful.crow-tit.com/statutes/trty-1307/4").startswith(
         "## status: ok")

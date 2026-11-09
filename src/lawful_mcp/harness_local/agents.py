@@ -1,6 +1,6 @@
 """Tool list + dive sub-agent.
 
-  TOOLS              — the 4 tools the Agent API registers.
+  TOOLS              — the 5 tools the Agent API registers.
   make_dive_subagent — the sub-agent precedent_dive delegates to; the caller supplies the model and settings.
 """
 from __future__ import annotations
@@ -12,11 +12,12 @@ from .schemas import DiveResult
 from .tools.precedent_dive import precedent_dive
 from .tools.precedent_search import precedent_search
 from .tools.sentencing_analysis import sentencing_analysis
-from .tools.statutes import statute_lookup
+from .tools.statutes import statute_read, statute_search
 
 TOOLS = [
     sentencing_analysis,
-    statute_lookup,
+    statute_search,
+    statute_read,
     precedent_search,
     precedent_dive,
 ]

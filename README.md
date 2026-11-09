@@ -7,13 +7,14 @@ tools. Connect an AI client to find judgments, look up statutes as of a date,
 check what a judgment held in its own words and gather the statutory penalties,
 guideline ranges and actual sentences for a case's charges.
 
-Four read-only tools:
+Five read-only tools:
 
 | Tool | What it does |
 |---|---|
 | `precedent_search` | Find judgments by facts, charge, court, year or case number |
 | `precedent_dive` | Read one judgment body and answer a question about it |
-| `statute_lookup` | Statute and administrative-rule articles, current or as of a date, and tax treaties |
+| `statute_search` | Find statutes, administrative rules and tax treaties by name or keywords; a statute named with article numbers returns those articles |
+| `statute_read` | Read a found statute's articles, current or as of a date, or list its article titles |
 | `sentencing_analysis` | Statutory penalties, guideline ranges and factors, and first-instance sentences for one charge or several |
 
 This repository publishes the MCP tools used by
@@ -31,7 +32,7 @@ The hosted service provides the full corpus, including statute amendment
 history, with no rate limits. Three ways to connect:
 
 **Claude / ChatGPT on the web — no code.** Add a custom connector with this
-URL, sign in with OAuth when asked, and the four tools appear. No API key
+URL, sign in with OAuth when asked, and the five tools appear. No API key
 needed:
 
 ```
@@ -102,7 +103,7 @@ Settings are listed in [`.env.example`](.env.example). The server reads process
 environment variables; it does **not** load `.env` automatically. Export values
 in the launching shell or set them in your MCP client's `env` configuration.
 
-With the defaults, three tools run locally against the corpus.
+With the defaults, four tools run locally against the corpus.
 `precedent_dive` additionally sends the selected public judgment text, case
 metadata and the supplied question to your configured model endpoint. Keep
 that question limited to issues in the public judgment.
@@ -114,7 +115,7 @@ export DIVE_MODEL=...
 ```
 
 All three values are required to register `precedent_dive`. Without them,
-the other three tools still work. Restart the server after changing settings.
+the other four tools still work. Restart the server after changing settings.
 
 `precedent_search` also takes an optional `issue`: the legal question the
 search is meant to answer. With `JEV_API_KEY` (an OpenRouter key) set, it sends

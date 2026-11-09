@@ -66,7 +66,6 @@ FULL_TABLES = [
     "sg_ranges",
     "charge_legal_map",
     "clm_versions",
-    "official_charges_meta",
     "official_charges",
     "charge_aliases",
     "charge_norm_map",
@@ -419,7 +418,7 @@ def main() -> None:
         copy_rows(dest, "st_articles", "statute_id IN (SELECT id FROM main.st_statutes)")
     # Only rules the tool would actually surface. An administrative rule is
     # re-issued as a *new row* on amendment, so the corpus holds superseded and
-    # future editions alongside the current one; ``statute_lookup`` searches
+    # future editions alongside the current one; ``statute_search`` searches
     # the current edition with a readable body, and a sample drawn without that
     # filter fills up with rows no search can reach.
     copy_table(

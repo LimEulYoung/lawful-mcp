@@ -1,8 +1,9 @@
 """Tools — RunContext[HarnessDeps] signature.
 
-The 4 registered tools (`agents.TOOLS`):
+The 5 registered tools (`agents.TOOLS`):
   sentencing_analysis     (the one sentencing surface — rules, guideline, factors, articles, actual sentences; a list of charges)
-  statute_lookup          (deterministic SQL; statute and administrative-rule text)
+  statute_search          (deterministic SQL; finds statutes, administrative rules and tax treaties)
+  statute_read            (deterministic SQL; the articles of the statute an id names)
   precedent_search        (trigram + morpheme FTS; optional Jev issue reordering)
   precedent_dive          (the sub-agent extracts and summarizes the body of a selected public judgment)
 

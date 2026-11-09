@@ -1,16 +1,18 @@
-"""statute_lookup — statutes (`st_statutes`), administrative rules (`st_notices`) and tax treaties (`treaties`).
+"""statute_search and statute_read — statutes (`st_statutes`), administrative rules (`st_notices`) and tax treaties
+(`treaties`). Search finds, read reads: the two take no common argument but offense_date, so a call cannot mix them.
 
-Modes:
-  A) `query` only                → list (one line per statute + the article the query's words matched)
-  B) `statute_id` only           → article outline (article_no + title)
+statute_search(query):
+  A) a query                     → list (one line per statute + the article the query's words matched)
+  D) a query naming one statute and article numbers ('민법 제750조 제751조') → that statute's article text
+statute_read(statute_id):
+  B) `statute_id` only           → article outline (article_no + title; over OUTLINE_TOC_CHARS, the 편·장·절 contents)
   C) `statute_id` + `articles`   → article text (also `articles=['부칙 N']` → addenda articles, `st_addenda`)
-  D) `query` naming one statute + article numbers (`articles` or '제N조' in the query) → that statute's article text
-  E) `statute_id` + `query`      → the statute's articles holding the most of the query's words
 
 Search matches statute names (morpheme tokens, and names the query writes whole) and article text (FTS5 trigram).
 """
 from __future__ import annotations
 
+import bisect
 import datetime
 import functools
 import itertools
@@ -21,7 +23,7 @@ from typing import Any
 from pydantic_ai import RunContext
 
 from ..deps import HarnessDeps, open_db
-from ._coerce import BAD_DATE_MESSAGE, coerce_int, coerce_list, coerce_str, to_iso_date, unreadable_date
+from ._coerce import BAD_DATE_MESSAGE, coerce_list, coerce_str, to_iso_date, unreadable_date
 from ._morph import kiwi as _kiwi
 from . import treaties
 from ._fts import query_tokens as _query_tokens, quoted_and as _quoted_and
@@ -40,9 +42,9 @@ ARTICLES_MAX = 8
 # then the response says what was left out (`_bounded_response_md`).
 RESPONSE_MAX_CHARS = 53_000
 
-# Cap on the number of search results. The caller's value must not reach SQL as is: `_search_statutes` reads
-# `max(limit * 8, 80)` rows and then runs a few queries per law.
-LIMIT_MAX = 50
+# Statutes one search lists. Fixed, not the model's choice: in the recorded runs, the id a model went on to read was
+# in the first 10 of its list in 99.7% of reads (6th to 10th: 5%), and a longer list only lengthened the answer.
+SEARCH_LIMIT = 10
 
 # Lawful statute page urls, so the model can link the original: statute /statutes/{law_id}, article
 # /statutes/{law_id}/{jo}, administrative rule /statutes/admrul-{st_notices.id}.
@@ -250,8 +252,7 @@ def _short_words_message(words: list[str], matches: list[dict[str, Any]]) -> str
     found = "아래는 법령 이름에 낱말이 든 것뿐입니다" if matches else "이름에 이 낱말이 든 법령도 없습니다"
     return (
         f"{'·'.join(repr(w) for w in unmatched)}: 두 글자 이하 낱말은 조문 본문에서 찾지 못합니다"
-        f"(본문 검색은 세 글자부터) — {found}. 본문은 조문에 나올 세 글자 이상 문구로 찾고, "
-        "법령을 알면 statute_id 와 query 를 함께 주어 그 법령 안에서 찾으세요(두 글자 낱말도 찾습니다)."
+        f"(본문 검색은 세 글자부터) — {found}. 본문은 조문에 나올 세 글자 이상 문구로 찾으세요."
     )
 
 
@@ -259,7 +260,6 @@ def _short_words_message(words: list[str], matches: list[dict[str, Any]]) -> str
 
 _BODY_WORDS_MAX = 6           # topic words searched in article text; combinations are tried when no article has all
 _NO_BODY_MATCH = "x" * 1000   # an expression no article matches (an empty one makes FTS5 raise an error)
-IN_STATUTE_MAX = 3            # articles returned for statute_id + query
 _QUERY_ARTICLE_RE = re.compile(r"(부\s*칙\s*)?제?\s*(\d+)\s*조(?![원억])(?:\s*의\s*(\d+))?")
 
 
@@ -319,12 +319,6 @@ def _body_message(held: int, words: list[str]) -> str | None:
             "조문으로 찾았습니다.")
 
 
-def _nouns(words: list[str]) -> list[str]:
-    """Nouns (2+ characters) of the words, interpuncts stripped."""
-    nouns = [_strip_dots(t.form) for t in _kiwi().tokenize(" ".join(words)) if t.tag in ("NNG", "NNP")]
-    return list(dict.fromkeys(n for n in nouns if len(n) >= 2))
-
-
 def _named_law(matches: list[dict[str, Any]], named: set[str]) -> dict[str, Any] | None:
     """The one statute the query names: the longest name it writes, when every other name it writes is part of
     that one (a statute and its decree) and a single law in the list holds it."""
@@ -335,46 +329,6 @@ def _named_law(matches: list[dict[str, Any]], named: set[str]) -> dict[str, Any]
         return None
     laws = {m["law_id"]: m for m in matches if m["name_in_query"] == len(longest)}
     return next(iter(laws.values())) if len(laws) == 1 else None
-
-
-def _names_statute(meta: dict[str, Any], named: set[str]) -> bool:
-    """Whether a statute name the query writes is (part of) this statute's name."""
-    own = {_strip_dots((meta.get(k) or "").replace(" ", "")) for k in ("name", "short_name")} - {""}
-    return any(s in n for s in named for n in own)
-
-
-def _search_in_statute(
-    conn: sqlite3.Connection, sid: int, words: list[str], offense_date: str | None,
-) -> dict[str, Any] | None:
-    """The statute's articles (at offense_date, or current) holding the most of the query's nouns, in its own
-    text — up to IN_STATUTE_MAX, ranked by nouns held, then nouns in the title, then article order. None when the
-    statute has no article outline (missing, or a single-body regulation)."""
-    outline = _outline_statute(conn, sid, offense_date=offense_date)
-    if not outline or outline.get("mode") != "outline":
-        return None
-    nouns = _nouns(words)
-    keys = [(a["no_num"], a["branch"]) for a in outline["articles"]]
-    full = _detail_statute(conn, sid, keys, offense_date=offense_date) if keys and nouns else {"articles": []}
-
-    def bare(s):
-        return _strip_dots(re.sub(r"\s+", "", s or ""))
-
-    ranked = []
-    for i, a in enumerate(full["articles"]):
-        title, text = bare(a.get("title")), bare(a.get("text"))
-        held = sum(n in text or n in title for n in nouns)
-        if held:
-            ranked.append((-held, -sum(n in title for n in nouns), i, (a["no_num"], a["branch"]), held))
-    ranked.sort()
-    if not ranked:
-        outline["message"] = (f"이 법령 조문에 {'·'.join(repr(n) for n in nouns) or 'query 낱말'}이(가) 든 곳이 "
-                              "없습니다 — 아래 조문 개요에서 고르거나, 다른 법령이면 statute_id 없이 query 로 찾으세요.")
-        return outline
-    top = ranked[:IN_STATUTE_MAX]
-    res = _detail_statute(conn, sid, [r[3] for r in top], offense_date=offense_date)
-    res["message"] = (f"query 낱말({'·'.join(repr(n) for n in nouns)})이 많이 든 조문 {len(top)}개입니다 — "
-                      f"첫 조문에 {len(nouns)}개 중 {top[0][4]}개가 있습니다.")
-    return res
 
 
 # ---------- addenda (부칙, `st_addenda`) ----------
@@ -515,6 +469,12 @@ def _today_iso() -> str:
 # defer one article, 공공감사에 관한 법률 §22 — version 2010-07-01, article 2011-07-02).
 _IN_FORCE_FROM = "MAX(s.effective_date, a.article_eff_date)"
 
+# The per-article queries below start from the law's versions (`st_statutes s CROSS JOIN st_articles a`). Joined the
+# other way, the planner (no ANALYZE statistics) starts from the article-number index `idx_st_articles_no` and walks
+# that number in every law and version — article 1 is 28,307 rows of 1.67M after the history backfill. Looking up
+# every article of a law that way read 8.6 GB per call (산지관리법), 1–4 minutes on the production box, against 24 MB
+# along the law.
+
 
 def _get_historic_article(
     conn: sqlite3.Connection,
@@ -527,7 +487,7 @@ def _get_historic_article(
     force on the date* — a changed row or a whole text alike. A deleted article yields its '제N조 삭제 <…>' marker."""
     r = conn.execute(
         f"""SELECT s.effective_date, a.article_text, a.title, a.article_no, a.article_no_num, a.article_branch
-           FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id
+           FROM st_statutes s CROSS JOIN st_articles a ON s.id=a.statute_id
            WHERE s.law_id=? AND a.article_no_num=? AND a.article_branch=? AND {_IN_FORCE_FROM} <= ?
            ORDER BY s.effective_date DESC LIMIT 1""",
         (law_id, art_no, art_br, offense_iso),
@@ -541,8 +501,8 @@ def _pending_article(
     """If the article number comes into force only after both as_of and today, the {effective_date, title, branch}
     of the earliest such row, else None. If `art_br` is None any branch matches (main article first). Decided by
     date, not by the '시행예정' label, which can lag behind the effective date."""
-    q = (f"SELECT {_IN_FORCE_FROM} AS eff, a.title, a.article_branch FROM st_articles a "
-         "JOIN st_statutes s ON s.id=a.statute_id "
+    q = (f"SELECT {_IN_FORCE_FROM} AS eff, a.title, a.article_branch FROM st_statutes s "
+         "CROSS JOIN st_articles a ON s.id=a.statute_id "
          f"WHERE s.law_id=? AND {_IN_FORCE_FROM}>? AND a.article_no_num=?")
     params: list[Any] = [law_id, max(as_of_iso, _today_iso()), art_no]
     if art_br is not None:
@@ -558,7 +518,7 @@ def _added_article(
     """The date the article number came into force after as_of, if it is in force by today — a number added after
     the asked date (a new article, or a full amendment that renumbered), else None. If `art_br` is None any branch
     matches."""
-    q = (f"SELECT {_IN_FORCE_FROM} AS eff FROM st_articles a JOIN st_statutes s ON s.id=a.statute_id "
+    q = (f"SELECT {_IN_FORCE_FROM} AS eff FROM st_statutes s CROSS JOIN st_articles a ON s.id=a.statute_id "
          f"WHERE s.law_id=? AND {_IN_FORCE_FROM}>? AND {_IN_FORCE_FROM}<=? AND a.article_no_num=?")
     params: list[Any] = [law_id, as_of_iso, _today_iso(), art_no]
     if art_br is not None:
@@ -1155,6 +1115,79 @@ def _merge_law_notice_matches(conn: sqlite3.Connection, matches, query, limit):
 
 # ---------- mode B: article outline ----------
 
+OUTLINE_TOC_CHARS = 15_000    # an outline listing more than this comes as its 편·장·절 table of contents (민법, 상법)
+_HEADING_RE = re.compile(r"제\s*\d+\s*(편|장|절|관)(?:의\s*\d+)?(?=\s|$)")
+_HEADING_LEVEL = {"편": 1, "장": 2, "절": 3, "관": 4}
+
+
+def _toc(conn: sqlite3.Connection, law_id: str, on_iso: str, articles: list[dict[str, Any]]) -> list[dict] | None:
+    """The 편·장·절·관 headings of the last version by the date that has them (heading rows have no article number;
+    only whole-text versions carry them), each with the range of the listed articles under it. None when no version
+    has headings. The source drops the first sub-heading under a heading (민법 제1편 has no '제1장 통칙'), so a
+    heading's range can begin before its first sub-heading's."""
+    row = conn.execute(
+        """SELECT s.id FROM st_statutes s WHERE s.law_id=? AND s.effective_date<=?
+           AND EXISTS (SELECT 1 FROM st_articles a WHERE a.statute_id=s.id AND a.article_no IS NULL)
+           ORDER BY s.effective_date DESC LIMIT 1""",
+        (law_id, on_iso),
+    ).fetchone()
+    if row is None:
+        return None
+    heads: list[dict[str, Any]] = []
+    for no, num, branch, text in conn.execute(
+        "SELECT article_no, article_no_num, article_branch, article_text FROM st_articles WHERE statute_id=? "
+        "ORDER BY id", (row[0],),
+    ):
+        if no is None:
+            line = re.sub(r"\s*<[^>]*>", "", (text or "").strip().split("\n")[0])
+            m = _HEADING_RE.match(line)
+            if m:
+                heads.append({"level": _HEADING_LEVEL[m[1]], "title": " ".join(line.split()), "start": None})
+        elif num is not None:
+            for h in reversed(heads):   # the headings just above this article start at it
+                if h["start"] is not None:
+                    break
+                h["start"] = (num, branch or 0)
+    heads = [h for h in heads if h["start"] is not None]
+    if not heads:
+        return None
+    def key(a):
+        return a["no_num"], a["branch"] or 0
+
+    # Each listed article goes under the last heading starting at or before it.
+    owned: list[list[dict[str, Any]]] = [[] for _ in heads]
+    before = []
+    starts = [h["start"] for h in heads]
+    for a in articles:
+        i = bisect.bisect_right(starts, key(a)) - 1
+        (owned[i] if i >= 0 else before).append(a)
+    out = []
+    if before:
+        out.append({"level": heads[0]["level"], "title": "", "first": key(before[0]), "last": key(before[-1])})
+    for i, h in enumerate(heads):
+        j = i + 1
+        while j < len(heads) and heads[j]["level"] > h["level"]:
+            j += 1
+        under = [a for o in owned[i:j] for a in o]
+        if under:
+            out.append({"level": h["level"], "title": h["title"], "first": key(under[0]), "last": key(under[-1])})
+    top = min(t["level"] for t in out)   # a law with no 편 starts at 장
+    for t in out:
+        t["level"] -= top - 1
+    return out
+
+
+def _as_toc(conn: sqlite3.Connection, out: dict[str, Any], law_id: str, on_iso: str) -> None:
+    """An outline listing more than OUTLINE_TOC_CHARS gives its table of contents in place of the article titles."""
+    articles = out["articles"]
+    if sum(len(f"- {a['no']}: {a['title']}") + 1 for a in articles) <= OUTLINE_TOC_CHARS:
+        return
+    toc = _toc(conn, law_id, on_iso, articles)
+    if toc:
+        out["toc"], out["article_count"] = toc, len(articles)
+        del out["articles"]
+
+
 def _articles_on(conn: sqlite3.Connection, law_id: str, on_iso: str) -> list[dict[str, Any]]:
     """The law's article list on the date: each number alive then (`_articles_in_force`) with the row an article
     lookup reads (`_get_historic_article`) — title, text and the date of its version. Articles without a title
@@ -1204,6 +1237,7 @@ def _outline_statute(
             'offense_date': offense_iso,
             'articles': _titles(_articles_on(conn, law_id, offense_iso)),
         }
+        _as_toc(conn, out, law_id, offense_iso)
         cur_ref = None if gone else _current_version_ref(conn, law_id, meta['id'], meta.get('name'))
         if cur_ref:
             out['current_version'] = cur_ref
@@ -1238,6 +1272,7 @@ def _outline_statute(
         "statute": _outline_head(meta),
         "articles": _titles(articles),
     }
+    _as_toc(conn, out, law_id, on)
     if asked:
         out["asked_name"] = asked
     if earliest:
@@ -1391,6 +1426,7 @@ def _detail_statute_at_date(
     in_force = _articles_in_force(conn, law_id, offense_iso)
 
     articles: list[dict] = []
+    branch_lists: list[dict] = []   # branch articles listed rather than given in full (over BRANCHES_IN_FULL)
     missing: list[str] = []
     missing_specs: list[tuple[int, int | None]] = []   # for the nearby-article hint (`missing_neighbors`)
     # Numbers that existed only in old versions → effective date of the last version that had them. Unlike "exists
@@ -1422,6 +1458,13 @@ def _detail_statute_at_date(
                 if old_effs:
                     vanished[f"{num}"] = max(old_effs)
                 continue
+            twigs = [r for r in found if r['article_branch']]
+            if len(twigs) > BRANCHES_IN_FULL:
+                # Many branch articles: the main article's text, and the branches by number, title and opening words.
+                found = [r for r in found if not r['article_branch']]
+                branch_lists.append({"of": num, "articles": [
+                    {"no": r['article_no'], "title": r['title'], "head": _text_head(r['article_text'], r['title'])}
+                    for r in twigs]})
             articles += [_format_historic_article_row(r) for r in found]
         else:
             r = _get_historic_article(conn, law_id, num, branch, offense_iso)
@@ -1477,6 +1520,8 @@ def _detail_statute_at_date(
         "articles": articles,
         "missing": missing,
     }
+    if branch_lists:
+        out["branch_lists"] = branch_lists
     if asked_iso:
         out["offense_date"] = asked_iso
     if vanished:
@@ -1514,6 +1559,20 @@ def _detail_statute_at_date(
                 "count": len(newer),
             }
     return out
+
+
+BRANCHES_IN_FULL = 3          # branch articles given in full with their main article ('76' → 76의2 …); more are listed
+BRANCH_HEAD_CHARS = 40        # opening characters of each listed branch article
+_ARTICLE_LABEL_RE = re.compile(r"^\s*제\s*\d+\s*조(?:\s*의\s*\d+)?")
+
+
+def _text_head(text: str | None, title: str | None) -> str:
+    """The article's opening words after its own '제N조의M(제목)' heading, on one line, cut at BRANCH_HEAD_CHARS."""
+    body = _ARTICLE_LABEL_RE.sub("", text or "", count=1).lstrip()
+    if title and body.startswith(f"({title})"):
+        body = body[len(title) + 2:]
+    body = " ".join(body.split())
+    return body if len(body) <= BRANCH_HEAD_CHARS else body[:BRANCH_HEAD_CHARS].rstrip() + "…"
 
 
 def _format_historic_article_row(r: dict) -> dict:
@@ -1669,7 +1728,7 @@ def _statute_article_url(stt: dict[str, Any] | None, art: dict[str, Any]) -> str
 def _version_lines(resp: dict[str, Any], mode: str | None) -> list[str]:
     """The lines on which wording a detail or outline response carries: a former name asked, the offense date,
     no version at that date, not the current law, the wording's basis, repeal, not yet in force, or the current
-    version — shared by `statute_lookup` and the articles `sentencing_analysis` embeds."""
+    version — shared by `statute_read` and the articles `sentencing_analysis` embeds."""
     lines: list[str] = []
     # "폐지" (repealed) is said only of a repeal: a renamed law still exists.
     rep = resp.get("repealed")
@@ -1760,7 +1819,7 @@ def _missing_lines(resp: dict[str, Any]) -> list[str]:
             else:
                 lines.append(
                     f"- {old}: 현행에는 없는 옛 번호입니다 — 개정으로 조문이 옮겨졌거나 사라졌습니다. "
-                    "찾는 내용의 지금 번호는 statute_id 만으로 조문 개요(번호·제목)를 받아 확인하고, "
+                    "찾는 내용의 지금 번호는 statute_read 에 statute_id 만 넣어 조문 개요(번호·제목)를 받아 확인하고, "
                     "옛 판례가 인용한 그때 문언이 필요하면 offense_date 를 주세요.")
         if added:
             new = ", ".join(f"{k}({_fmt_eff_iso(v)}판부터)" for k, v in added.items())
@@ -1798,7 +1857,7 @@ def article_sections(conn: sqlite3.Connection, statute_id: int, wanted: list[tup
     wording version once, each asked article with its link and text, and the asked articles the version lacks.
     Branch articles the lookup adds (asked 347, it also gives 347의2) are left out."""
     resp = _statute_lookup_impl(conn, None, _parse_statute_ref(statute_id), [_jo(n, b) for n, b in wanted],
-                                LIMIT_MAX, offense_date=offense_date)
+                                SEARCH_LIMIT, offense_date=offense_date)
     if resp.get("status") != "ok" or resp.get("mode") != "detail":
         return []
     stt = resp.get("statute") or {}
@@ -1817,7 +1876,7 @@ def article_sections(conn: sqlite3.Connection, statute_id: int, wanted: list[tup
 
 
 def _format_response_md(resp: dict[str, Any]) -> str:
-    """statute_lookup response dict → markdown-KV string."""
+    """statute_search / statute_read response dict → markdown-KV string."""
     status = resp.get("status", "ok")
     mode = resp.get("mode")
     lines: list[str] = [f"## status: {status}"]
@@ -1890,7 +1949,14 @@ def _format_response_md(resp: dict[str, Any]) -> str:
     if resp.get("note"):
         lines.append(f"## note: {resp['note']}")
 
-    if mode == "outline":
+    if mode == "outline" and resp.get("toc"):
+        name = (resp.get("statute") or {}).get("name") or ""
+        lines.append(f"## 목차 — 조문 {resp['article_count']}개는 목록이 길어 편·장·절과 조문 범위만 보입니다. 본문은 "
+                     f"articles로(최대 8개), 조문 찾기는 statute_search(query='{name} 낱말')로 부르세요.")
+        for t in resp["toc"]:
+            span = _article_label(*t["first"]) + ("" if t["first"] == t["last"] else f"~{_article_label(*t['last'])}")
+            lines.append(f"{'  ' * (t['level'] - 1)}- " + (f"{t['title']} ({span})" if t["title"] else span))
+    elif mode == "outline":
         arts = resp.get("articles", [])
         lines.append(f"## articles ({len(arts)})")
         for a in arts:
@@ -1912,6 +1978,11 @@ def _format_response_md(resp: dict[str, Any]) -> str:
                 if a.get("text"):
                     lines.append(f"- text_kind: {resp.get('text_kind') or '공식 조문 원문'}")
                     lines.append(a["text"])
+        for bl in resp.get("branch_lists") or []:
+            twigs = bl["articles"]
+            lines.append(f"## 제{bl['of']}조의 가지 조문 {len(twigs)}개 — 많아서 제목과 본문 앞부분만 보입니다. "
+                         f"본문은 articles로 부르세요(예: [\"{twigs[0]['no']}\"])")
+            lines += [f"- {a['no']}: " + " — ".join(filter(None, [a.get("title"), a["head"]])) for a in twigs]
         if resp.get("body"):  # notice of category other
             lines.append("## body")
             lines.append(f"- text_kind: {resp.get('body_kind') or '공식 고시 원문'}")
@@ -1979,45 +2050,57 @@ def _bounded_response_md(resp: dict[str, Any]) -> str:
 # ---------- public tool ----------
 
 
-def statute_lookup(
+def statute_search(
     ctx: RunContext[HarnessDeps],
     query: str | None = None,
-    statute_id: int | str | None = None,
-    articles: list[str | int] | str | int | None = None,
-    limit: int = 10,
     offense_date: str | None = None,
 ) -> str:
-    """법령 조회 — 헌법·법률·대통령령·부령·행정규칙(고시·훈령·예규)·조세조약을 찾고 조문 본문을 돌려줍니다.
+    """법령 찾기 — 헌법·법률·대통령령·부령·행정규칙(고시·훈령·예규)·조세조약을 찾습니다. 본문은 statute_read로 봅니다.
 
-    - 검색: query에 법령명이나 키워드를 넣으면 맞는 법령 목록이 옵니다. 조세조약은 '상대국 이름 + 조세조약'으로
-      찾습니다.
-    - 조문 본문: 법령명과 조문 번호를 함께 쓰거나(예: query='민법 제750조'), statute_id와 articles를 넣습니다.
-    - 조문 번호를 모르면 statute_id와 query를 함께 넣어 그 법령 안에서 낱말이 든 조문을 찾습니다.
-      statute_id만 넣으면 조문 제목 목록이 옵니다.
-    - 판본: 기본은 오늘 시행 중인 판본이고, offense_date를 주면 그날 시행 중이던 판본입니다.
+    - 법령명이나 키워드를 넣으면 맞는 법령(최대 10개)과 낱말이 든 조문이 옵니다. 법령명과 함께 쓰면 그 법령의
+      조문을 찾기 쉽습니다(예: '형사소송법 공소취소'; 낱말은 조문에 나올 세 글자 이상 문구로).
+    - 법령명과 조문 번호를 함께 쓰면 그 조문 본문이 바로 옵니다. 여러 조문은 한 번에 씁니다(예: '민법 제750조 제751조').
+    - 조세조약은 '상대국 이름 + 조세조약'으로 찾습니다.
 
     Args:
-      query: 법령명·조문 번호·키워드.
-      statute_id: 검색 결과의 id를 그대로(예: 584, 'admrul-18060', 'trty-1307'). 행정규칙·조약은 접두사까지
-        넣습니다.
-      articles: 조문 번호 목록, 최대 8개(예: ["347"], "제347조의2", "347-2"). "347"은 가지 조문(347조의2 등)까지
-        함께 옵니다. 부칙은 '부칙' 또는 '부칙 3'. 별표·서식은 없습니다.
-      limit: 검색 결과 수(기본 10, 최대 50).
-      offense_date: 판본 기준 날짜(예: '2013.7.30'). 없으면 오늘.
+      query: 법령명·키워드·조문 번호.
+      offense_date: 조문 본문의 판본 기준 날짜(예: '2013.7.30'). 없으면 오늘 시행 중인 판본.
     """
     query = coerce_str(query)
-    limit = min(max(coerce_int(limit) or 10, 1), LIMIT_MAX)
+    if unreadable_date(offense_date):
+        return _bounded_response_md(_bad_date_response(offense_date))
+    if not query:
+        return _bounded_response_md({
+            "status": "missing_input",
+            "message": "query(법령명·키워드)가 필요합니다. 받은 statute_id 의 본문은 statute_read 로 보세요.",
+        })
+    return _lookup(query, None, None, offense_date)
+
+
+def statute_read(
+    ctx: RunContext[HarnessDeps],
+    statute_id: int | str | None = None,
+    articles: list[str | int] | str | int | None = None,
+    offense_date: str | None = None,
+) -> str:
+    """법령 본문 — statute_search가 준 statute_id로 조문 본문을 봅니다.
+
+    - articles를 넣으면 그 조문 본문이 옵니다. 없으면 조문 제목 목록이 옵니다(민법·상법처럼 아주 큰 법령은
+      편·장·절 목차와 조문 범위).
+
+    Args:
+      statute_id: statute_search 결과의 id를 그대로(예: 584, 'admrul-18060', 'trty-1307'). 행정규칙·조약은
+        접두사까지 넣습니다.
+      articles: 조문 번호 목록, 최대 8개(예: ["347"], "제347조의2", "347-2"). "347"은 가지 조문(347조의2 등)까지
+        함께 옵니다. 부칙은 '부칙' 또는 '부칙 3'. 별표는 '별표 5'처럼 따로 넣으면 본문 대신 제목과 파일 주소가
+        옵니다. 서식·별지는 받지 않습니다.
+      offense_date: 판본 기준 날짜(예: '2013.7.30'). 주면 그날 시행 중이던 판본, 없으면 오늘 시행 중인 판본.
+    """
     articles = coerce_list(articles)
     ref = _parse_statute_ref(statute_id)
-
     if unreadable_date(offense_date):
-        return _bounded_response_md({
-            "status": "bad_offense_date",
-            "message": BAD_DATE_MESSAGE,
-            "input": {"offense_date": offense_date},
-        })
-
-    if ref is None and not query:
+        return _bounded_response_md(_bad_date_response(offense_date))
+    if ref is None:
         # An unreadable statute_id is told apart from none, or the model resends the same misspelling.
         if statute_id is not None:
             return _bounded_response_md({
@@ -2025,18 +2108,24 @@ def statute_lookup(
                 "input": {"statute_id": statute_id},
                 "message": (
                     "statute_id 를 읽지 못했습니다 — 법령은 정수(예: 584), "
-                    "행정규칙은 'admrul-18060' 형태입니다. 검색 결과가 준 식별자를 "
-                    "글자 그대로 넘기거나, query 로 다시 검색하세요."
+                    "행정규칙은 'admrul-18060' 형태입니다. statute_search 결과가 준 식별자를 "
+                    "글자 그대로 넘기거나, statute_search 로 다시 찾으세요."
                 ),
             })
         return _bounded_response_md({
             "status": "missing_input",
-            "message": (
-                "query(법령명·키워드) 또는 statute_id(검색이 준 식별자) 중 하나는 필요합니다. "
-                "법령을 모르면 query로 검색한 뒤 받은 statute_id로 재호출하세요."
-            ),
+            "message": "statute_id(statute_search 가 준 식별자)가 필요합니다. 법령을 모르면 statute_search 로 찾으세요.",
         })
+    return _lookup(None, ref, articles, offense_date)
 
+
+def _bad_date_response(offense_date: Any) -> dict[str, Any]:
+    return {"status": "bad_offense_date", "message": BAD_DATE_MESSAGE, "input": {"offense_date": offense_date}}
+
+
+def _lookup(query: str | None, ref: tuple | None, articles: list[str | int] | None, offense_date: str | None) -> str:
+    """A search (query) or a read (ref, articles) through `_statute_lookup_impl`, with the notes on what was left
+    out: articles over ARTICLES_MAX and annexed tables asked among the articles."""
     # Over the cap, the first ARTICLES_MAX are looked up and the rest named, rather than the call refused.
     dropped_articles: list = []
     if articles is not None and len(articles) > ARTICLES_MAX:
@@ -2045,9 +2134,7 @@ def statute_lookup(
 
     conn = open_db()
     try:
-        resp = _statute_lookup_impl(
-            conn, query, ref, articles, limit, offense_date=offense_date,
-        )
+        resp = _statute_lookup_impl(conn, query, ref, articles, SEARCH_LIMIT, offense_date=offense_date)
         if dropped_articles:
             preview = ", ".join(str(a) for a in dropped_articles[:12])
             if len(dropped_articles) > 12:
@@ -2064,6 +2151,8 @@ def statute_lookup(
         unsupported = _unsupported_units(articles) if resp.get("status") == "ok" else []
         if unsupported:
             note = f"{', '.join(unsupported)} 는 제외했습니다. {_UNSUPPORTED_UNIT_HINT}"
+            if _requested_byeolpyo_numbers(unsupported):
+                note += f" {_BYEOLPYO_ALONE_HINT}"
             prev = resp.get("message")
             resp["message"] = note if not prev else f"{prev} · {note}"
         return _bounded_response_md(resp)
@@ -2156,10 +2245,11 @@ def _requested_byeolpyo_numbers(articles: list[str | int] | None) -> list[tuple[
     return out
 
 
-# Annexed tables and forms are not in the corpus; without this hint the model repeats the call in other formats.
-_UNSUPPORTED_UNIT_HINT = (
-    "별표·별지·서식은 조문 조회 대상이 아니고 본문이 코퍼스에 없습니다."
-)
+# Annexed tables and forms are not in the corpus; without this hint the model repeats the call in other formats. An
+# annexed table asked alone comes as its title and file address (`_byeolpyo_rows`): the API reads that address with
+# web_fetch, so no hint may say there is no annexed table.
+_UNSUPPORTED_UNIT_HINT = "별표·별지·서식은 조문으로 오지 않습니다(본문이 코퍼스에 없습니다)."
+_BYEOLPYO_ALONE_HINT = "별표는 그것만 따로 부르면(예: articles=['별표 5']) 제목과 파일 주소가 옵니다."
 
 
 def _bad_articles_response(statute_id: int | str | None, articles: list[str | int]) -> dict[str, Any]:
@@ -2169,7 +2259,11 @@ def _bad_articles_response(statute_id: int | str | None, articles: list[str | in
         "'76'(76조 본조+가지), '76-2'(제76조의2만). "
         "예: articles=['76-2','76-3']"
     )
-    if _unsupported_units(articles):
+    if _requested_byeolpyo_numbers(articles):
+        # Reached only when the index has none of the asked annexed tables (those it has are answered).
+        message = ("요청한 번호의 별표가 이 법령의 별표 목록에 없습니다 — statute_id 만 넣으면 별표 목록(제목과 파일 "
+                   "주소)이 함께 옵니다.")
+    elif _unsupported_units(articles):
         message = f"{_UNSUPPORTED_UNIT_HINT} {message}"
     return {
         "status": "bad_articles",
@@ -2188,18 +2282,12 @@ def _statute_lookup_impl(
     offense_date: str | None = None,
 ) -> dict[str, Any]:
     """ref = result of `_parse_statute_ref`: `(is administrative rule, id)` or `("law", law_id)`.
-    None means search mode. A query that names one statute reaches its articles in the same call (article numbers
-    from `articles` or written in the query); with a statute_id, the query finds that statute's articles."""
+    None means search mode: a query that names one statute and article numbers ('민법 제750조') reaches those articles
+    in the same call. A search passes no articles and a read no query (`statute_search`, `statute_read`); other
+    callers (`article_sections`) read with a ref and articles."""
     named = _named_spans(conn, query) if query else set()
-    asked_articles = articles
     if not articles and query:
         articles = _articles_in_query(query) or None
-    note = None
-    if named and ref is not None and ref[0] is False:
-        meta = _statute_meta(conn, ref[1])
-        if meta and not _names_statute(meta, named):
-            note = f"statute_id={ref[1]}(「{meta['name']}」)는 query 가 쓴 법령이 아니어서 query 로 찾았습니다."
-            ref = None
 
     if ref is None:
         # Statutes, administrative rules and tax treaties, interleaved by name relevance (_merge_law_notice_matches)
@@ -2222,7 +2310,7 @@ def _statute_lookup_impl(
             res = _statute_lookup_impl(conn, None, (False, law["statute_id"]), articles, limit,
                                        offense_date=offense_date)
             said = f"query 가 쓴 「{law['name']}」(statute_id={law['statute_id']})의 조문입니다."
-            res["message"] = " · ".join(filter(None, [note, said, res.get("message")]))
+            res["message"] = " · ".join(filter(None, [said, res.get("message")]))
             return res
         notice_body, notice_held, _ = body_for("st_notice_articles_fts")
         notice_matches = _search_notices(conn, query, limit, body=notice_body)
@@ -2236,15 +2324,9 @@ def _statute_lookup_impl(
         held = max(held, notice_held)
         if not held and any(m["fts_hits"] for m in treaty_matches):
             held = len(searched)  # a tax treaty found by its text: the list is not by name only
-        messages = [note, _short_words_message(words, matches), _body_message(held, searched)]
+        messages = [_short_words_message(words, matches), _body_message(held, searched)]
         if any(messages):
             out["message"] = " · ".join(filter(None, messages))
-        # Articles asked for without a statute the query names: say so rather than ignore them.
-        if asked_articles:
-            out["note"] = (
-                "query 가 법령 하나를 이름으로 대지 않아 조문 본문을 줄 수 없습니다 — 아래 matches 에서 맞는 법령의 "
-                "id 를 골라 statute_id+articles 로 다시 부르세요."
-            )
         return out
 
     if ref[0] == "law":
@@ -2256,7 +2338,7 @@ def _statute_lookup_impl(
                 "input": {"law_id": ref[1]},
                 "message": (
                     "웹 경로의 법령 id(law_id)를 코퍼스에서 찾지 못했습니다 — "
-                    "query 로 법령명을 검색해 statute_id 를 받아 재호출하세요."
+                    "statute_search 로 법령명을 찾아 statute_id 를 받아 다시 부르세요."
                 ),
             }
         ref = (False, resolved)
@@ -2271,11 +2353,6 @@ def _statute_lookup_impl(
 
     is_notice, sid = ref
     shown_id = f"{NOTICE_URL_PREFIX}{sid}" if is_notice else sid
-    if query and not articles and not is_notice:
-        words = _topic_words(query, named)
-        res = _search_in_statute(conn, sid, words, offense_date) if words else None
-        if res is not None:
-            return {"status": "ok", **res}
     specs = _parse_articles(articles)
     addenda = [] if is_notice else _addenda_specs(articles)
 
