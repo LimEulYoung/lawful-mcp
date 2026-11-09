@@ -289,9 +289,45 @@ def _topic_words(query: str | None, named: set[str]) -> list[str]:
 
 
 def _articles_in_query(query: str | None) -> list[str]:
-    """Article numbers written in the query ('제48조', '160조의5', '부칙 제2조') as `articles` tokens."""
+    """Article numbers written in the query ('제48조', '160조의5', '부칙 제2조') as `articles` tokens, all of them: the
+    search reads the first ARTICLES_MAX and names the rest."""
     return [("부칙 " if m[1] else "") + m[2] + (f"의{m[3]}" if m[3] else "")
-            for m in _QUERY_ARTICLE_RE.finditer(query or "")][:ARTICLES_MAX]
+            for m in _QUERY_ARTICLE_RE.finditer(query or "")]
+
+
+def _over_cap_note(source: str, dropped: list, statute_id: int | str | None = None) -> str:
+    """The note for articles over ARTICLES_MAX, naming the ones left out so the model can ask for them."""
+    preview = ", ".join(str(a) for a in dropped[:12])
+    if len(dropped) > 12:
+        preview += f" 외 {len(dropped) - 12}개"
+    then = (f"statute_read(statute_id={statute_id}, articles=[…]) 로 부르세요" if statute_id is not None
+            else "같은 statute_id 로 나눠 재호출하세요")
+    return (f"{source} {ARTICLES_MAX + len(dropped)}개 중 앞 {ARTICLES_MAX}개만 조회했습니다(호출당 최대 {ARTICLES_MAX}개). "
+            f"나머지({preview})는 {then}.")
+
+
+# Articles joined in one string that `coerce_list` keeps as one token: without brackets ('185,188' — 38 of 5,418
+# `articles` in 7 days of production chats to 11/9), with quotes ("'185','188'"), or a JSON list behind a stray '='
+# ('=["462", "463", …]' — 3 of 20,533 in 30 days). `_parse_articles` reads the first number only, so the rest went
+# missing unsaid. Split when every part, without the quotes, brackets and '=' around it, is an article, addendum or
+# annexed-table token; anything else ('750조 제1항, 제2항') stays as it was.
+_ARTICLE_TOKEN_RE = re.compile(
+    r"(제\s*)?\d+\s*(조)?(\s*(의|-)\s*\d+)?|부\s*칙(\s*제?\s*\d+\s*조?(\s*의\s*\d+)?)?|별\s*표\s*\d+(\s*의\s*\d+)?")
+_JOINED_WRAPPING = " \t'\"‘’“”[]="
+
+
+def _split_joined_articles(articles: list | None) -> list | None:
+    if not articles:
+        return articles
+    out: list = []
+    for a in articles:
+        parts = [p.strip(_JOINED_WRAPPING) for p in re.split(r"[,，、]", a)] if isinstance(a, str) else []
+        kept = [p for p in parts if p]
+        if len(parts) > 1 and kept and all(_ARTICLE_TOKEN_RE.fullmatch(p) for p in kept):
+            out.extend(kept)
+        else:
+            out.append(a)
+    return out
 
 
 def _body_match(conn: sqlite3.Connection, fts_table: str, words: list[str]) -> tuple[str, int, list[str]]:
@@ -2096,7 +2132,7 @@ def statute_read(
         옵니다. 서식·별지는 받지 않습니다.
       offense_date: 판본 기준 날짜(예: '2013.7.30'). 주면 그날 시행 중이던 판본, 없으면 오늘 시행 중인 판본.
     """
-    articles = coerce_list(articles)
+    articles = _split_joined_articles(coerce_list(articles))
     ref = _parse_statute_ref(statute_id)
     if unreadable_date(offense_date):
         return _bounded_response_md(_bad_date_response(offense_date))
@@ -2136,14 +2172,7 @@ def _lookup(query: str | None, ref: tuple | None, articles: list[str | int] | No
     try:
         resp = _statute_lookup_impl(conn, query, ref, articles, SEARCH_LIMIT, offense_date=offense_date)
         if dropped_articles:
-            preview = ", ".join(str(a) for a in dropped_articles[:12])
-            if len(dropped_articles) > 12:
-                preview += f" 외 {len(dropped_articles) - 12}개"
-            note = (
-                f"articles {ARTICLES_MAX + len(dropped_articles)}개 중 앞 "
-                f"{ARTICLES_MAX}개만 조회했습니다(호출당 최대 {ARTICLES_MAX}개). "
-                f"나머지({preview})는 같은 statute_id 로 나눠 재호출하세요."
-            )
+            note = _over_cap_note("articles", dropped_articles)
             prev = resp.get("message")
             resp["message"] = note if not prev else f"{note} · {prev}"
         # Articles read and an annexed table dropped (`["13","별표5"]`): name what was dropped, or the model may take the
@@ -2307,10 +2336,12 @@ def _statute_lookup_impl(
         stat_matches = _search_statutes(conn, query, max(limit, 10), offense_date=offense_date, body=body)
         law = _named_law(stat_matches, named) if articles else None
         if law:
-            res = _statute_lookup_impl(conn, None, (False, law["statute_id"]), articles, limit,
+            res = _statute_lookup_impl(conn, None, (False, law["statute_id"]), articles[:ARTICLES_MAX], limit,
                                        offense_date=offense_date)
             said = f"query 가 쓴 「{law['name']}」(statute_id={law['statute_id']})의 조문입니다."
-            res["message"] = " · ".join(filter(None, [said, res.get("message")]))
+            over = (_over_cap_note("query 의 조문", articles[ARTICLES_MAX:], law["statute_id"])
+                    if len(articles) > ARTICLES_MAX else None)
+            res["message"] = " · ".join(filter(None, [said, over, res.get("message")]))
             return res
         notice_body, notice_held, _ = body_for("st_notice_articles_fts")
         notice_matches = _search_notices(conn, query, limit, body=notice_body)

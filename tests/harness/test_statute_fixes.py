@@ -1,5 +1,6 @@
 """statute_search and statute_read on the sample database: matched articles in the list, partial matches, one call to
-articles, arguments kept apart, version dates, addenda and repealed laws."""
+articles, articles past the cap or joined in one string, arguments kept apart, version dates, addenda and repealed
+laws."""
 
 import os
 import sqlite3
@@ -36,6 +37,29 @@ def test_a_query_naming_one_statute_with_article_numbers_reaches_the_text():
     assert "## mode: detail" in out and "query 가 쓴 「근로기준법」" in out and "제26조(해고의 예고)" in out
     both = search(query="근로기준법 제26조 제27조")
     assert "제26조(해고의 예고)" in both and "제27조(해고사유 등의 서면통지)" in both
+
+
+def test_articles_past_the_eighth_in_a_query_are_named():
+    out = search(query="민법 " + " ".join(f"제{n}조" for n in range(750, 761)))
+    assert [line[4:7] for line in out.splitlines() if line.startswith("### ")] == [str(n) for n in range(750, 758)]
+    assert ("query 의 조문 11개 중 앞 8개만 조회했습니다(호출당 최대 8개). 나머지(758, 759, 760)는 "
+            "statute_read(statute_id=584, articles=[…]) 로 부르세요.") in out
+
+
+def test_articles_joined_in_one_string_are_all_read():
+    joined = read(statute_id=578, articles="185,188")
+    assert "### 185 일반교통방해" in joined and "### 188 교통방해치사상" in joined
+    assert joined == read(statute_id=578, articles=["185", "188"])
+    mixed = read(statute_id=578, articles=["제185조, 제188조", "250"])
+    assert all(f"### {n} " in mixed for n in (185, 188, 250))
+    # A JSON list behind a stray '=' (seen in production) and quoted parts read as the same articles.
+    assert read(statute_id=578, articles='=["185", "188"]') == joined
+    assert read(statute_id=578, articles="'185','188'") == joined
+    # Not every part an article (a paragraph): left as one token, as before.
+    assert statutes._split_joined_articles(["750조 제1항, 제2항"]) == ["750조 제1항, 제2항"]
+    assert statutes._split_joined_articles(["347의2, 부칙 3, 별표 5"]) == ["347의2", "부칙 3", "별표 5"]
+    assert statutes._split_joined_articles(["1, 부칙 제3조의2"]) == ["1", "부칙 제3조의2"]
+    assert statutes._split_joined_articles([",", " , "]) == [",", " , "]
 
 
 def test_search_and_read_take_no_argument_of_the_other():

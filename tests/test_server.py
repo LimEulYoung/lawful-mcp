@@ -120,11 +120,28 @@ def test_descriptions_are_the_harness_docstrings_and_every_hint_is_explicit(fres
         assert hints.idempotent_hint is not None and hints.open_world_hint is not None, name
 
 
+def _accepted(schema):
+    """What an argument schema accepts: descriptions, titles and defaults left out."""
+    if isinstance(schema, dict):
+        return {k: _accepted(v) for k, v in schema.items() if k not in ("description", "title", "default")}
+    if isinstance(schema, list):
+        return [_accepted(v) for v in schema]
+    return schema
+
+
 def test_wrapper_arguments_are_the_harness_arguments(fresh_server):
+    """Same names, same required set and the same accepted types as the harness tool. A wrapper narrower than the
+    harness sends a call the harness would take back with a validation error before the tool sees it."""
+    from pydantic_ai.tools import Tool
+
     server = fresh_server(DIVE_API_KEY="k", DIVE_BASE_URL="https://example.test/v1", DIVE_MODEL="m")
     for name, tool in _tools(server).items():
         params = [p for p in inspect.signature(HARNESS[name]).parameters if p != "ctx"]
-        assert list(_schema(tool)["properties"]) == params, name
+        ours, theirs = _schema(tool), Tool(HARNESS[name]).function_schema.json_schema
+        assert list(ours["properties"]) == params, name
+        assert ours.get("required", []) == theirs.get("required", []), name
+        for param in params:
+            assert _accepted(ours["properties"][param]) == _accepted(theirs["properties"][param]), f"{name}.{param}"
 
 
 def test_model_facing_text_names_no_tool_this_server_lacks():
@@ -162,6 +179,18 @@ def test_charges_arrive_as_a_list_however_the_client_sends_them(fresh_server):
     assert "## status: ok" in as_list
     assert text({"charges": '["사기", "폭행"]'}) == as_list
     assert text({"charges": "사기"}) == text({"charges": ["사기"]})
+
+
+def test_articles_reach_the_harness_in_every_form_it_takes(fresh_server, monkeypatch):
+    """A single string ('제347조의2', '185,188'), a number or a list goes through as given; a list sent as a JSON
+    string arrives decoded (SDK ``pre_parse_json``). Folding each into a list is the harness's job."""
+    server = fresh_server()
+    passed = []
+    monkeypatch.setitem(server._T, "statute_read",
+                        lambda ctx, **kw: passed.append(kw["articles"]) or "## status: ok")
+    for articles in ("제347조의2", "185,188", 347, [347, "348"], '["393", "750"]', ["750"]):
+        anyio.run(server.mcp.call_tool, "statute_read", {"statute_id": 34292, "articles": articles})
+    assert passed == ["제347조의2", "185,188", 347, [347, "348"], ["393", "750"], ["750"]]
 
 
 def test_a_list_given_for_a_search_query_is_refused_not_searched(fresh_server):

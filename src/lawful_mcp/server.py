@@ -191,7 +191,10 @@ def statute_search(
 )
 def statute_read(
     statute_id: int | str | None = None,
-    articles: list[str] | None = None,
+    # The harness's own type. A list alone would send a single string
+    # ('제347조의2', '185,188') or a number back with a validation error
+    # before the tool sees it; the harness folds each form into a list.
+    articles: list[str | int] | str | int | None = None,
     offense_date: str | None = None,
 ) -> str:
     return _T["statute_read"](
